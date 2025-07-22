@@ -1,0 +1,95 @@
+# .dockerignore for RunPod Dockerfile
+# Ignore development and build artifacts
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+build
+develop-eggs
+dist
+downloads
+eggs
+.eggs
+lib
+lib64
+parts
+sdist
+var
+wheels
+*.egg-info
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv
+env
+ENV
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+*.out
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov
+.tox
+
+# Documentation
+docs/
+*.md
+!README.md
+!README_RUNPOD.md
+
+# Local development files
+test_*.mp3
+test_*.wav
+test_*.osu
+*.osz
+output/
+temp/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Jupyter
+.ipynb_checkpoints
+
+# Wandb
+wandb/
+
+# Model checkpoints (will be downloaded during build)
+checkpoints/
+models/
+*.ckpt
+*.pt
+*.pth
+*.bin
+
+# Hydra outputs
+outputs/
+multirun/
+
+# Local config overrides
+local_config.yaml

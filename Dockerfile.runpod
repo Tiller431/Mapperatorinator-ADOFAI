@@ -1,0 +1,50 @@
+# RunPod Dockerfile for Mapperatorinator V30
+FROM python:3.10-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    curl \
+    ffmpeg \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir runpod huggingface_hub
+
+# Copy essential project files needed for model loading
+COPY osuT5/ ./osuT5/
+COPY osu_diffusion/ ./osu_diffusion/
+COPY config.py .
+COPY routed_pickle.py .
+
+# Copy model downloading script 
+COPY download_models.py .
+
+# Create necessary directories
+RUN mkdir -p /app/logs
+RUN mkdir -p /app/output
+RUN mkdir -p /root/.cache/huggingface
+RUN mkdir -p /root/.cache/torch
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV HYDRA_FULL_ERROR=1
+ENV HF_HOME=/root/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/root/.cache/huggingface
+ENV HF_HUB_CACHE=/root/.cache/huggingface
+
+# Pre-download and cache the models to reduce cold start time
+RUN python download_models.py
+
+# Copy the rest of the application code (after model caching for better layer caching)
+COPY . .
+
+# Set the handler
+CMD ["python", "-u", "runpod_start.py"]

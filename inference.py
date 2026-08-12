@@ -428,19 +428,51 @@ def generate(
 
     result_path = None
     osz_path = None
-    if args.add_to_beatmap:
-        result_path = postprocessor.add_to_beatmap(result, beatmap_path)
-        if verbose:
-            print(f"Added generated content to {result_path}")
-    elif output_path is not None and output_path != "":
-        result_path = postprocessor.write_result(result, output_path)
-        if verbose:
-            print(f"Generated beatmap saved to {result_path}")
+    
+    # Handle ADOFAI format export
+    if args.format == "adofai":
+        if output_path is not None and output_path != "":
+            # Import ADOFAI export functionality
+            from adofai.inference import create_stub_adofai
+            
+            # Extract metadata
+            audio_filename = Path(audio_path).name
+            title = args.title or beatmap_config.title or "Generated Song"
+            artist = args.artist or beatmap_config.artist or "Unknown Artist"
+            creator = args.creator or beatmap_config.creator or "Mapperatorinator ADOFAI"
+            bpm = args.bpm if hasattr(args, 'bpm') else beatmap_config.bpm
+            offset = args.offset if hasattr(args, 'offset') else beatmap_config.offset
+            
+            # For v1, use stub generation (model not trained on ADOFAI yet)
+            # TODO: Replace with actual event-to-ADOFAI conversion when model is retrained
+            result_path = create_stub_adofai(
+                output_path=output_path,
+                audio_filename=audio_filename,
+                bpm=bpm,
+                offset=offset,
+                title=title,
+                artist=artist,
+                creator=creator,
+            )
+            
+            if verbose:
+                print(f"Generated ADOFAI chart saved to {result_path}")
+                print("Note: This is a stub/placeholder chart. Train on ADOFAI dataset for quality generation.")
+    else:
+        # Original osu! export path
+        if args.add_to_beatmap:
+            result_path = postprocessor.add_to_beatmap(result, beatmap_path)
+            if verbose:
+                print(f"Added generated content to {result_path}")
+        elif output_path is not None and output_path != "":
+            result_path = postprocessor.write_result(result, output_path)
+            if verbose:
+                print(f"Generated beatmap saved to {result_path}")
 
-    if args.export_osz:
-        osz_path = postprocessor.export_osz(result_path, audio_path, output_path)
-        if verbose:
-            print(f"Generated .osz saved to {osz_path}")
+        if args.export_osz:
+            osz_path = postprocessor.export_osz(result_path, audio_path, output_path)
+            if verbose:
+                print(f"Generated .osz saved to {osz_path}")
 
     return result, result_path, osz_path
 

@@ -17,6 +17,9 @@ class InferenceConfig:
     audio_path: str = ''  # Path to input audio
     output_path: str = ''  # Path to output directory
     beatmap_path: str = ''  # Path to .osu file to autofill metadata and use as reference
+    
+    # Format settings
+    format: str = 'adofai'  # Output format: 'adofai' or 'osu'
 
     # Conditional generation settings
     gamemode: Optional[int] = None  # Gamemode of the beatmap

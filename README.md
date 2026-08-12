@@ -1,23 +1,39 @@
-# Mapperatorinator
+# Mapperatorinator-ADOFAI
 
-Try the generative model [here](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mapperatorinator_inference.ipynb), or MaiMod [here](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mai_mod_inference.ipynb). Check out a video showcase [here](https://youtu.be/FEr7t1L2EoA).
+**AI-powered chart generation for A Dance of Fire and Ice (ADOFAI)**
 
-Mapperatorinator is multi-model framework that uses spectrogram inputs to generate fully featured osu! beatmaps for all gamemodes and [assist modding beatmaps](#maimod-the-ai-driven-modding-tool).
-The goal of this project is to automatically generate rankable quality osu! beatmaps from any song with a high degree of customizability.
+This is a fork of [Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) adapted to generate ADOFAI charts instead of osu! beatmaps. The project uses spectrogram-based neural networks (Whisper-style encoder-decoder) to generate rhythm game charts from audio.
 
-This project is built upon [osuT5](https://github.com/gyataro/osuT5) and [osu-diffusion](https://github.com/OliBomby/osu-diffusion). In developing this, I spent about 2500 hours of GPU compute across 142 runs on my 4060 Ti and rented 4090 instances on vast.ai.
+## Project Status
 
-#### Use this tool responsibly. Always disclose the use of AI in your beatmaps.
+**⚠️ Foundation Phase:** This repository currently provides:
+- ✅ ADOFAI file format I/O (`.adofai` parsing and writing)
+- ✅ Event representation for ADOFAI charts (tiles, speed changes, twirls, holds, etc.)
+- ✅ Export pipeline that can generate valid `.adofai` files
+- ❌ **Model NOT yet trained on ADOFAI data** — pretrained weights are for osu! and will not produce quality ADOFAI charts
+
+To generate quality ADOFAI charts, the model must be retrained on a dataset of ADOFAI levels. See [`docs/ADOFAI.md`](docs/ADOFAI.md) for details on dataset requirements and next steps.
+
+## Credits
+
+This project is built upon:
+- [Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) by OliBomby — the foundational osu! beatmap generator
+- [osuT5](https://github.com/gyataro/osuT5) — transformer architecture and training code
+- [osu-diffusion](https://github.com/OliBomby/osu-diffusion) — positional refinement with diffusion
+
+Special thanks to OliBomby for the extensive research and development that made this adaptation possible (~2500 GPU hours across 142 training runs).
+
+#### Use this tool responsibly. Always disclose the use of AI in your charts.
 
 ## Installation
 
-The instruction below allows you to generate beatmaps on your local machine, alternatively you can run it in the cloud with the [colab notebook](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mapperatorinator_inference.ipynb).
+These instructions allow you to run the project locally and explore the ADOFAI format support.
 
 ### 1. Clone the repository
 
 ```sh
-git clone https://github.com/OliBomby/Mapperatorinator.git
-cd Mapperatorinator
+git clone https://github.com/Tiller431/Mapperatorinator-ADOFAI.git
+cd Mapperatorinator-ADOFAI
 ```
 
 ### 2. (Optional) Create virtual environment
@@ -48,34 +64,70 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Web GUI (Recommended)
+## Quick Start: Testing ADOFAI Export
 
-For a more user-friendly experience, consider using the Web UI. It provides a graphical interface to configure generation parameters, start the process, and monitor the output.
+To verify the ADOFAI export works, you can generate a stub chart (placeholder, not AI-generated):
 
-### Launch the GUI
+```sh
+python3 -c "
+from adofai.inference import create_stub_adofai
+create_stub_adofai(
+    output_path='output',
+    audio_filename='your_song.ogg',
+    bpm=140,
+    title='Test Chart',
+    artist='Test Artist'
+)
+print('Stub chart created in output/ directory')
+"
+```
 
-Navigate to the cloned `Mapperatorinator` directory in your terminal and run:
+To test round-trip parsing:
+
+```sh
+python3 test_adofai.py
+```
+
+## ADOFAI Format Support
+
+The `adofai/` module provides:
+- **Parser** (`adofai/parser.py`): Read and write `.adofai` files with trailing-comma tolerance
+- **Event representation** (`adofai/event.py`): Intermediate format for tiles, speed changes, twirls, holds
+- **Converter** (`adofai/converter.py`): Convert between `.adofai` structure and event sequences
+- **Export** (`adofai/inference.py`): Generate `.adofai` files from the pipeline
+
+See [`docs/ADOFAI.md`](docs/ADOFAI.md) for detailed format documentation and training requirements.
+
+## Web GUI and Command-Line (osu! mode still available)
+
+The original Web UI and CLI are preserved for osu! beatmap generation. To use them:
 
 ```sh
 python web-ui.py
 ```
 
-This will start a local web server and automatically open the UI in a new window.
-
-### Using the GUI
-
-- **Configure:** Set input/output paths using the form fields and "Browse" buttons. Adjust generation parameters like gamemode, difficulty, style (year, mapper ID, descriptors), timing, specific features (hitsounds, super timing), and more, mirroring the command-line options. (Note: If you provide a `beatmap_path`, the UI will automatically determine the `audio_path` and `output_path` from it, so you can leave those fields blank)
-- **Start:** Click the "Start Inference" button to begin the beatmap generation.
-- **Cancel:** You can stop the ongoing process using the "Cancel Inference" button.
-- **Open Output:** Once finished, use the "Open Output Folder" button for quick access to the generated files.
-
-The Web UI acts as a convenient wrapper around the `inference.py` script. For advanced options or troubleshooting, refer to the command-line instructions.
-
-![python_u3zyW0S3Vs](https://github.com/user-attachments/assets/5312a45f-d51c-4b37-9389-da3258ddd0a1)
+For ADOFAI generation, use `format=adofai` parameter (see Command-Line Inference below).
 
 ## Command-Line Inference
 
-For users who prefer the command line or need access to advanced configurations, follow the steps below. **Note:** For a simpler graphical interface, please see the [Web UI (Recommended)](#web-ui-recommended) section above.
+### ADOFAI Generation
+
+To generate an ADOFAI chart (currently stub/placeholder until model is retrained):
+
+```sh
+python inference.py \
+  format=adofai \
+  audio_path=/path/to/song.ogg \
+  output_path=./output \
+  title="Your Song Title" \
+  artist="Artist Name" \
+  bpm=140 \
+  offset=0
+```
+
+### osu! Generation (Original)
+
+For users who prefer the command line or need access to advanced configurations for osu! beatmaps, follow the steps below.
 
 Run `inference.py` and pass in some arguments to generate beatmaps. For this use [Hydra override syntax](https://hydra.cc/docs/advanced/override_grammar/basic/). See `configs/inference_v29.yaml` for all available parameters.
 ```

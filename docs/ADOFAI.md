@@ -171,7 +171,28 @@ The training pipeline expects charts in Workshop-style folders:
    - Remove broken/corrupted files
    - Ensure charts parse correctly with `adofai.parser`
 
-### Running Smoke Training
+### Training Options
+
+**Option 1: Google Colab (Recommended for beginners)**
+
+Use the provided Colab notebook for easy cloud training:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Tiller431/Mapperatorinator-ADOFAI/blob/cursor/adofai-foundation-5317/colab/adofai_train_v1.ipynb)
+
+**Features**:
+- Free GPU (T4) or upgrade to Colab Pro
+- No local setup required
+- Stores data and checkpoints on Google Drive
+- Step-by-step guided cells
+- Automatic checkpoint saving
+
+**Requirements**:
+- Google account
+- ADOFAI charts organized in Drive: `MyDrive/adofai-dataset/charts-top100/<id>__<name>/level.adofai` + audio
+
+---
+
+**Option 2: Local Training**
 
 Test the training pipeline with minimal data:
 

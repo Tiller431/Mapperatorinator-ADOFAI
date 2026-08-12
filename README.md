@@ -312,7 +312,20 @@ This is useful for songs with variable BPM, or songs with BPM changes. The resul
 
 ### ADOFAI Training (v1)
 
-Train a chart generation model on your own ADOFAI dataset:
+Train a chart generation model on your own ADOFAI dataset.
+
+#### Option 1: Google Colab (Recommended)
+
+Use the provided Colab notebook for easy cloud training with free GPU:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Tiller431/Mapperatorinator-ADOFAI/blob/cursor/adofai-foundation-5317/colab/adofai_train_v1.ipynb)
+
+- Free GPU (T4) or Colab Pro
+- No local setup needed
+- Saves to Google Drive
+- Guided step-by-step
+
+#### Option 2: Local Training
 
 **1. Prepare Dataset**
 

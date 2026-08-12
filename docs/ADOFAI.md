@@ -123,39 +123,109 @@ The `AdofaiConverter` class handles this calculation when converting between `.a
 
 To generate quality ADOFAI charts, the model must be retrained. The current pretrained weights are for osu! and will not work well for ADOFAI.
 
+### Dataset Layout
+
+The training pipeline expects charts in Workshop-style folders:
+
+```
+<data_root>/
+  <workshopId>__<chartName>/
+    level.adofai
+    <audio>.ogg|.mp3|.wav|.flac
+  
+  another_workshop_id__ChartName/
+    level.adofai
+    song.ogg
+  
+  ...
+```
+
+**Optional:** Create an index JSON with metadata:
+```json
+[
+  {
+    "workshop_id": "1234567890",
+    "chart_dir": "1234567890__MyChart",
+    "audio": "1234567890__MyChart/song.ogg",
+    "has_audio": true
+  },
+  ...
+]
+```
+
 ### Dataset Needs
 
 1. **ADOFAI charts + audio pairs**:
    - Collect `.adofai` files with corresponding audio (`.ogg`, `.mp3`, etc.)
-   - Recommended: 500+ charts covering variety of styles, BPMs, difficulties
+   - Recommended: 100+ charts for initial training, 500+ for quality
+   - Cover variety of styles, BPMs, difficulties
    - Sources: ADOFAI Workshop, community chart collections, custom levels
 
-2. **Metadata**:
-   - BPM, offset, difficulty rating (if available)
-   - Chart style descriptors (fast, slow, twirl-heavy, etc.) — optional but helpful
+2. **Metadata** (extracted from `level.adofai`):
+   - BPM, offset (from settings)
+   - Tile angles, actions (from angleData/actions)
+   - No additional metadata files required
 
 3. **Quality filtering**:
-   - Ensure charts are playable and well-timed
+   - Charts must have audio present
    - Remove broken/corrupted files
-   - Consider difficulty distribution (easy, medium, hard)
+   - Ensure charts parse correctly with `adofai.parser`
 
-### Data Preparation
+### Running Smoke Training
 
-Create a dataset using a script similar to osu!'s `Mapperator.ConsoleApp`:
-- Parse `.adofai` files → extract events
-- Generate spectrograms from audio
-- Pair events with audio windows
-- Create train/val/test splits
+Test the training pipeline with minimal data:
+
+```bash
+# Create a small test dataset (3-5 charts)
+mkdir -p test_data/test1__SimpleChart
+cp your_chart.adofai test_data/test1__SimpleChart/level.adofai
+cp your_audio.ogg test_data/test1__SimpleChart/audio.ogg
+
+# Run smoke training (tiny model, few steps)
+python3 -m adofai.train \
+  --data_dir test_data \
+  --output_dir adofai_smoke \
+  --smoke \
+  --device cpu
+```
+
+This will:
+- Load 5 samples max
+- Train tiny model (64 hidden dim, 1 layer)
+- Run 2 epochs with batch size 2
+- Save checkpoint to `adofai_smoke/`
+
+### Running Full Training
+
+For real training on a larger dataset:
+
+```bash
+python3 -m adofai.train \
+  --data_dir /path/to/workshop_charts \
+  --output_dir adofai_checkpoints \
+  --batch_size 8 \
+  --lr 1e-4 \
+  --epochs 50 \
+  --device cuda  # or cpu/mps
+```
+
+**Note:** The current training script uses a simple LSTM model for proof-of-concept. For production quality:
+1. Integrate with osuT5 Whisper encoder architecture
+2. Use spectrogram features instead of raw audio
+3. Train on 100+ charts minimum
+4. Expected compute: 100-500 GPU hours depending on dataset size
 
 ### Model Retraining
 
-Adapt the osuT5 training pipeline:
-1. Replace osu! parser with ADOFAI parser
-2. Update tokenizer vocabulary for ADOFAI events
-3. Adjust conditioning tokens (BPM, difficulty, style)
-4. Train encoder-decoder on audio → ADOFAI events
+The v1 training script (`adofai/train.py`) provides:
+- ✅ Dataset loading from Workshop folders
+- ✅ Event tokenization (vocab size ~2000)
+- ✅ Simple LSTM model for testing
+- ❌ **TODO:** Full Whisper encoder integration (like osuT5)
+- ❌ **TODO:** Spectrogram preprocessing
+- ❌ **TODO:** Advanced training features (checkpointing, distributed, etc.)
 
-Expected compute: Similar to osu! training (~2500 GPU hours for full quality, but smaller datasets may suffice for initial results).
+For full-scale training, integrate with `osuT5/train.py` infrastructure.
 
 ## Evaluation Ideas
 

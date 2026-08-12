@@ -64,9 +64,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Quick Start: Testing ADOFAI Export
+## Quick Start: Testing ADOFAI
 
-To verify the ADOFAI export works, you can generate a stub chart (placeholder, not AI-generated):
+### Test ADOFAI Export
+
+Generate a stub chart (placeholder, not AI-generated):
 
 ```sh
 python3 -c "
@@ -82,11 +84,19 @@ print('Stub chart created in output/ directory')
 "
 ```
 
-To test round-trip parsing:
+### Test ADOFAI Parsing
 
 ```sh
 python3 test_adofai.py
 ```
+
+### Test Training Pipeline
+
+```sh
+python3 test_adofai_training.py
+```
+
+This creates synthetic charts and tests dataset loading + tokenization.
 
 ## ADOFAI Format Support
 
@@ -95,8 +105,11 @@ The `adofai/` module provides:
 - **Event representation** (`adofai/event.py`): Intermediate format for tiles, speed changes, twirls, holds
 - **Converter** (`adofai/converter.py`): Convert between `.adofai` structure and event sequences
 - **Export** (`adofai/inference.py`): Generate `.adofai` files from the pipeline
+- **Dataset** (`adofai/dataset.py`): Load ADOFAI charts from Workshop-style directories
+- **Tokenizer** (`adofai/tokenizer.py`): Convert events to/from tokens for training
+- **Training** (`adofai/train.py`): Train chart generation model on ADOFAI data
 
-See [`docs/ADOFAI.md`](docs/ADOFAI.md) for detailed format documentation and training requirements.
+See [`docs/ADOFAI.md`](docs/ADOFAI.md) for detailed format documentation and training guide.
 
 ## Web GUI and Command-Line (osu! mode still available)
 
@@ -297,16 +310,66 @@ This is useful for songs with variable BPM, or songs with BPM changes. The resul
 
 ## Training
 
-The instruction below creates a training environment on your local machine.
+### ADOFAI Training (v1)
 
-### 1. Clone the repository
+Train a chart generation model on your own ADOFAI dataset:
+
+**1. Prepare Dataset**
+
+Organize your charts in Workshop-style folders:
+```
+data/
+  workshop1__ChartName/
+    level.adofai
+    song.ogg
+  workshop2__AnotherChart/
+    level.adofai
+    music.mp3
+  ...
+```
+
+**2. Smoke Test (Recommended First)**
+
+Test the training pipeline with minimal data:
+```sh
+python3 -m adofai.train \
+  --data_dir path/to/small_dataset \
+  --output_dir adofai_smoke \
+  --smoke \
+  --device cpu
+```
+
+This trains a tiny model on 5 samples for 2 epochs to verify everything works.
+
+**3. Full Training**
+
+Train on your full dataset:
+```sh
+python3 -m adofai.train \
+  --data_dir path/to/workshop_charts \
+  --output_dir adofai_checkpoints \
+  --batch_size 8 \
+  --lr 1e-4 \
+  --epochs 50 \
+  --device cuda  # or cpu/mps
+```
+
+**Note:** Current training uses a simple LSTM for proof-of-concept. For production quality, integrate with the osuT5 Whisper architecture. See [`docs/ADOFAI.md`](docs/ADOFAI.md) for details.
+
+---
+
+### osu! Training (Original)
+
+The instructions below create a training environment for osu! beatmap generation (original Mapperatorinator).
+
+**1. Clone the repository**
 
 ```sh
 git clone https://github.com/OliBomby/Mapperatorinator.git
 cd Mapperatorinator
 ```
 
-### 2. Create dataset
+**2. Create dataset**
 
 Create your own dataset using the [Mapperator console app](https://github.com/mappingtools/Mapperator/blob/master/README.md#create-a-high-quality-dataset). It requires an [osu! OAuth client token](https://osu.ppy.sh/home/account/edit) to verify beatmaps and get additional metadata. Place the dataset in a `datasets` directory next to the `Mapperatorinator` directory.
 
@@ -314,14 +377,15 @@ Create your own dataset using the [Mapperator console app](https://github.com/ma
 Mapperator.ConsoleApp.exe dataset2 -t "/Mapperatorinator/datasets/beatmap_descriptors.csv" -i "path/to/osz/files" -o "/datasets/cool_dataset"
 ```
 
-### 3. Create docker container
+**3. Create docker container**
+
 Training in your venv is also possible, but we recommend using Docker on WSL for better performance.
 ```sh
 docker compose up -d --force-recreate
 docker attach mapperatorinator_space
 ```
 
-### 4. Configure parameters and begin training
+**4. Configure parameters and begin training**
 
 All configurations are located in `./configs/osut5/train.yaml`. Begin training by calling `osuT5/train.py`.
 

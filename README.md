@@ -1,37 +1,62 @@
-# Mapperatorinator
+# Mapperatorinator-ADOFAI
 
-Try the generative model [here](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mapperatorinator_inference.ipynb), or MaiMod [here](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mai_mod_inference.ipynb). Check out a video showcase [here](https://youtu.be/FEr7t1L2EoA).
+**AI-powered chart generation for A Dance of Fire and Ice**
 
-Mapperatorinator is multi-model framework that uses spectrogram inputs to generate fully featured osu! beatmaps for all gamemodes and [assist modding beatmaps](#maimod-the-ai-driven-modding-tool).
-The goal of this project is to automatically generate rankable quality osu! beatmaps from any song with a high degree of customizability.
+This is a fork of [Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) by OliBomby, adapted to generate charts for [A Dance of Fire and Ice](https://store.steampowered.com/app/977950/A_Dance_of_Fire_and_Ice/) instead of osu! beatmaps.
 
-This project is built upon [osuT5](https://github.com/gyataro/osuT5) and [osu-diffusion](https://github.com/OliBomby/osu-diffusion). In developing this, I spent about 2500 hours of GPU compute across 142 runs on my 4060 Ti and rented 4090 instances on vast.ai.
+## Current Status
 
-#### Use this tool responsibly. Always disclose the use of AI in your beatmaps.
+**The `main` branch still contains the upstream osu! Mapperatorinator code and README.** ADOFAI-specific work is under development in pull requests:
 
-## Installation
+- **[PR #1: ADOFAI Foundation](https://github.com/Tiller431/Mapperatorinator-ADOFAI/pull/1)** (`cursor/adofai-foundation-5317`)  
+  LSTM-based proof-of-concept with `.adofai` parser, event representation, dataset pipeline, and training/inference scripts. Trains on log-mel spectrograms. **Not the production path.**
 
-The instruction below allows you to generate beatmaps on your local machine, alternatively you can run it in the cloud with the [colab notebook](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mapperatorinator_inference.ipynb).
+- **[PR #2: Whisper Training Path](https://github.com/Tiller431/Mapperatorinator-ADOFAI/pull/2)** (`cursor/adofai-whisper-training-1075`)  
+  Production training using Whisper-small encoder-decoder (`Tiger14n/ropewhisper-small`) via the `osuT5` infrastructure. Implements ADOFAI vocabulary, lossless augmentations, and full event coverage (tiles, speed, camera, VFX). **This is the real training path.**
+
+**Training command (lives on PR #2, not yet on `main`):**
+```bash
+python osuT5/train.py -cn adofai_v31 data.train_dataset_path=/path/to/adofai-charts
+```
+
+**Inference/export:** Generation pipeline is implemented but model checkpoints trained on ADOFAI data do not yet exist. The inference path uses the trained Whisper checkpoint to generate ADOFAI events, which are then exported via the `.adofai` converter.
+
+**What works today:**
+- `.adofai` file I/O (UTF-8 BOM handling, trailing commas, `pathData`/`angleData`)
+- Event vocabulary: tiles (angles 0-359°, midspin 999), SetSpeed, Twirl, Pause, Hold, MultiPlanet, camera (MoveCamera with `LastPositionNoRotation`), MoveTrack (`positionOffset`), VFX (Flash, Bloom, ShakeScreen, SetFilter)
+- Training config: `configs/train/adofai_v31.yaml` (Whisper-small, difficulty conditioning ON, style/mapper/year/descriptors OFF, lossless rotate/reflect/pitch/rate augmentations, staged context: timing first, then map)
+- Dataset: 126 Workshop charts archived at [Google Drive](https://drive.google.com/drive/folders/1lATJxQI8P3uLsRtiC7ay5u3SrFhH1cfd) (`adofai-top100.tar.gz`). Enough to smoke-test, not enough for quality generalization.
+
+**What does not work:**
+- No trained ADOFAI checkpoint exists yet. Inference will only generate meaningful charts after training on a large ADOFAI dataset.
+- Decorations, editor-only actions, and tag/descriptor conditioning are deferred.
+- `adofai/converter.py` timing calculations have known bugs; do not rely on its timestamp math as ground truth.
+
+Once the PRs merge, this README will be updated to reflect the unified state.
+
+## Installation (from `main` branch — osu! Mapperatorinator)
+
+The instructions below are for the **upstream osu! Mapperatorinator** currently on `main`. For ADOFAI-specific setup, see the PR branches above.
 
 ### 1. Clone the repository
 
 ```sh
-git clone https://github.com/OliBomby/Mapperatorinator.git
-cd Mapperatorinator
+git clone https://github.com/Tiller431/Mapperatorinator-ADOFAI.git
+cd Mapperatorinator-ADOFAI
 ```
 
 ### 2. (Optional) Create virtual environment
 
-Use Python 3.10, later versions will might not be compatible with the dependencies.
+Use Python 3.10; later versions may not be compatible with dependencies.
 
 ```sh
 python -m venv .venv
 
-# In cmd.exe
+# Windows cmd.exe
 .venv\Scripts\activate.bat
-# In PowerShell
+# Windows PowerShell
 .venv\Scripts\Activate.ps1
-# In Linux or MacOS
+# Linux or macOS
 source .venv/bin/activate
 ```
 
@@ -40,257 +65,149 @@ source .venv/bin/activate
 - Python 3.10
 - [Git](https://git-scm.com/downloads)
 - [ffmpeg](http://www.ffmpeg.org/)
-- [PyTorch](https://pytorch.org/get-started/locally/): Make sure to follow the Get Started guide so you install `torch` and `torchaudio` with GPU support.
+- [PyTorch](https://pytorch.org/get-started/locally/): Follow the Get Started guide to install `torch` and `torchaudio` with GPU support.
 
-- and the remaining Python dependencies:
+Then install remaining Python dependencies:
 
 ```sh
 pip install -r requirements.txt
 ```
 
-## Web GUI (Recommended)
+---
 
-For a more user-friendly experience, consider using the Web UI. It provides a graphical interface to configure generation parameters, start the process, and monitor the output.
+## Upstream osu! Mapperatorinator Reference
 
-### Launch the GUI
+The sections below describe the **original osu! beatmap generator** on the `main` branch. They are kept for reference and will be replaced once ADOFAI work merges.
 
-Navigate to the cloned `Mapperatorinator` directory in your terminal and run:
+### Web GUI (osu! — Recommended for upstream)
+
+For osu! beatmap generation, the Web UI provides a graphical interface.
 
 ```sh
 python web-ui.py
 ```
 
-This will start a local web server and automatically open the UI in a new window.
+- **Configure:** Set paths, gamemode, difficulty, style (year, mapper ID, descriptors), timing, hitsounds, etc.
+- **Start/Cancel/Open Output:** Standard workflow controls.
 
-### Using the GUI
+The Web UI wraps `inference.py`.
 
-- **Configure:** Set input/output paths using the form fields and "Browse" buttons. Adjust generation parameters like gamemode, difficulty, style (year, mapper ID, descriptors), timing, specific features (hitsounds, super timing), and more, mirroring the command-line options. (Note: If you provide a `beatmap_path`, the UI will automatically determine the `audio_path` and `output_path` from it, so you can leave those fields blank)
-- **Start:** Click the "Start Inference" button to begin the beatmap generation.
-- **Cancel:** You can stop the ongoing process using the "Cancel Inference" button.
-- **Open Output:** Once finished, use the "Open Output Folder" button for quick access to the generated files.
+### Command-Line Inference (osu!)
 
-The Web UI acts as a convenient wrapper around the `inference.py` script. For advanced options or troubleshooting, refer to the command-line instructions.
+Run `inference.py` with [Hydra override syntax](https://hydra.cc/docs/advanced/override_grammar/basic/). See `configs/inference_v29.yaml` for parameters.
 
-![python_u3zyW0S3Vs](https://github.com/user-attachments/assets/5312a45f-d51c-4b37-9389-da3258ddd0a1)
-
-## Command-Line Inference
-
-For users who prefer the command line or need access to advanced configurations, follow the steps below. **Note:** For a simpler graphical interface, please see the [Web UI (Recommended)](#web-ui-recommended) section above.
-
-Run `inference.py` and pass in some arguments to generate beatmaps. For this use [Hydra override syntax](https://hydra.cc/docs/advanced/override_grammar/basic/). See `configs/inference_v29.yaml` for all available parameters.
-```
+```sh
 python inference.py \
-  audio_path           [Path to input audio] \
-  output_path          [Path to output directory] \
-  beatmap_path         [Path to .osu file to autofill metadata, and output_path, or use as reference] \
-  
-  gamemode             [Game mode to generate 0=std, 1=taiko, 2=ctb, 3=mania] \
-  difficulty           [Difficulty star rating to generate] \
-  mapper_id            [Mapper user ID for style] \
-  year                 [Upload year to simulate] \
-  hitsounded           [Whether to add hitsounds] \
-  slider_multiplier    [Slider velocity multiplier] \
-  circle_size          [Circle size] \
-  keycount             [Key count for mania] \
-  hold_note_ratio      [Hold note ratio for mania 0-1] \
-  scroll_speed_ratio   [Scroll speed ratio for mania and ctb 0-1] \
-  descriptors          [List of beatmap user tags for style] \
-  negative_descriptors [List of beatmap user tags for classifier-free guidance] \
-  
-  add_to_beatmap       [Whether to add generated content to the reference beatmap instead of making a new beatmap] \
-  start_time           [Generation start time in milliseconds] \
-  end_time             [Generation end time in milliseconds] \
-  in_context           [List of additional context to provide to the model [NONE,TIMING,KIAI,MAP,GD,NO_HS]] \
-  output_type          [List of content types to generate] \
-  cfg_scale            [Scale of the classifier-free guidance] \
-  super_timing         [Whether to use slow accurate variable BPM timing generator] \
-  seed                 [Random seed for generation] \
+  audio_path="path/to/audio.mp3" \
+  output_path="output/" \
+  gamemode=0 \
+  difficulty=5.5 \
+  year=2023 \
+  descriptors="['jump aim','clean']" \
+  in_context=[TIMING,KIAI]
 ```
 
-Example:
-```
+**Example:**
+```sh
 python inference.py beatmap_path="'C:\Users\USER\AppData\Local\osu!\Songs\1 Kenji Ninuma - DISCO PRINCE\Kenji Ninuma - DISCOPRINCE (peppy) [Normal].osu'" gamemode=0 difficulty=5.5 year=2023 descriptors="['jump aim','clean']" in_context=[TIMING,KIAI]
 ```
 
-## Interactive CLI
-For those who prefer a terminal-based workflow but want a guided setup, the interactive CLI script is an excellent alternative to the Web UI.
-
-### Launch the CLI
-Navigate to the cloned directory. You may need to make the script executable first.
+### Interactive CLI (osu!)
 
 ```sh
-# Make the script executable (only needs to be done once)
 chmod +x cli_inference.sh
-```
-
-```sh
-# Run the script
 ./cli_inference.sh
 ```
 
-### Using the CLI
-The script will walk you through a series of prompts to configure all generation parameters, just like the Web UI.
+Guided prompts for osu! beatmap parameters.
 
-It uses a color-coded interface for clarity.
-It provides an advanced multi-select menu for choosing style descriptors using your arrow keys and spacebar.
-After you've answered all the questions, it will display the final command for your review.
-You can then confirm to execute it directly or cancel and copy the command for manual use.
+### Generation Tips (osu!)
 
-## Generation Tips
+- Edit `configs/inference_v29.yaml` to set defaults.
+- Descriptors: [osu! wiki beatmap tags](https://osu.ppy.sh/wiki/en/Beatmap/Beatmap_tags).
+- Always provide `year` (2007–2023) and `difficulty` to avoid inconsistent generation.
+- Increase `cfg_scale` to strengthen `mapper_id` and `descriptors` effects.
+- Use `negative_descriptors` with `cfg_scale > 1` (must match descriptor count).
+- Provide timing/kiai via `beatmap_path` and `in_context=[TIMING,KIAI]` for speed and accuracy.
+- Remap part of a beatmap: `beatmap_path`, `start_time`, `end_time`, `add_to_beatmap=true`.
+- Generate guest difficulty: `beatmap_path`, `in_context=[GD,TIMING,KIAI]`.
+- Generate hitsounds only: `beatmap_path`, `in_context=[NO_HS,TIMING,KIAI]`.
+- Generate timing only: `super_timing=true`, `output_type=[TIMING]`.
 
-- You can edit `configs/inference_v29.yaml` and add your arguments there instead of typing them in the terminal every time.
-- All available descriptors can be found [here](https://osu.ppy.sh/wiki/en/Beatmap/Beatmap_tags).
-- Always provide a year argument between 2007 and 2023. If you leave it unknown, the model might generate with an inconsistent style.
-- Always provide a difficulty argument. If you leave it unknown, the model might generate with an inconsistent difficulty.
-- Increase the `cfg_scale` parameter to increase the effectiveness of the `mapper_id` and `descriptors` arguments.
-- You can use the `negative_descriptors` argument to guide the model away from certain styles. This only works when `cfg_scale > 1`. Make sure the number of negative descriptors is equal to the number of descriptors.
-- If your song style and desired beatmap style don't match well, the model might not follow your directions. For example, its hard to generate a high SR, high SV beatmap for a calm song. 
-- If you already have timing and kiai times done for a song, then you can give this to the model to greatly increase inference speed and accuracy: Use the `beatmap_path` and `in_context=[TIMING,KIAI]` arguments.
-- To remap just a part of your beatmap, use the `beatmap_path`, `start_time`, `end_time`, and `add_to_beatmap=true` arguments.
-- To generate a guest difficulty for a beatmap, use the `beatmap_path` and `in_context=[GD,TIMING,KIAI]` arguments.
-- To generate hitsounds for a beatmap, use the `beatmap_path` and `in_context=[NO_HS,TIMING,KIAI]` arguments.
-- To generate only timing for a song, use the `super_timing=true` and `output_type=[TIMING]` arguments.
+### MaiMod: AI-driven Modding Tool (osu!)
 
-## MaiMod: The AI-driven Modding Tool
+MaiMod detects issues in osu! beatmaps that automatic tools miss (incorrect snapping, timing, object placement, slider shapes, hitsounds).
 
-MaiMod is a modding tool for osu! beatmaps that uses Mapperatorinator predictions to find potential faults and inconsistencies which can't be detected by other automatic modding tools like [Mapset Verifier](https://github.com/Naxesss/MapsetVerifier).
-It can detect issues like:
-- Incorrect snapping or rhythmic patterns
-- Inaccurate timing points
-- Inconsistent hit object positions or new combo placements
-- Weird slider shapes
-- Inconsistent hitsounds or volumes
+Try [MaiMod Colab](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mai_mod_inference.ipynb) or run locally:
 
-You can try MaiMod [here](https://colab.research.google.com/github/OliBomby/Mapperatorinator/blob/main/colab/mai_mod_inference.ipynb), or run it locally:
-To run MaiMod locally, you'll need to install Mapperatorinator. Then, run the `mai_mod.py` script, specifying your beatmap's path with the `beatmap_path` argument.
 ```sh
 python mai_mod.py beatmap_path="'C:\Users\USER\AppData\Local\osu!\Songs\1 Kenji Ninuma - DISCO PRINCE\Kenji Ninuma - DISCOPRINCE (peppy) [Normal].osu'"
 ```
-This will print the modding suggestions to the console, which you can then apply to your beatmap manually.
-Suggestions are ordered by the 'surprisal' which is a measure of how unexpected the model found the issue to be, so you can prioritize the most important issue
 
-MaiMod also accepts the same arguments as `inference.py`, so you can customize the modding process by adding additional context to the AI like the `mapper_id`.
+Suggestions are ordered by "surprisal." Accepts same arguments as `inference.py`.
 
-MaiMod Web UI coming soon.
+### Overview (osu! architecture)
 
-## Overview
+**Tokenization:** osu! beatmaps → event representation (hit objects, hitsounds, slider velocities, timing, kiai). Quantized to 10ms intervals (time) and 32-pixel grids (position).
 
-### Tokenization
+**Model architecture:** Wrapper around [HF Transformers Whisper](https://huggingface.co/docs/transformers/en/model_doc/whisper#transformers.WhisperForConditionalGeneration) with custom input embeddings and loss (219M parameters). Mel spectrogram frames as encoder input; decoder outputs discrete event vocabulary.
 
-Mapperatorinator converts osu! beatmaps into an intermediate event representation that can be directly converted to and from tokens.
-It includes hit objects, hitsounds, slider velocities, new combos, timing points, kiai times, and taiko/mania scroll speeds.
+**Multitask training format:** Conditional generation tokens (gamemode, difficulty, mapper ID, year, metadata) precede SOS. Random masking to 'unknown' tokens during training enables flexible inference metadata.
 
-Here is a small examle of the tokenization process:
+**Seamless long generation:** Context length: 8.192 seconds. 90% overlap, sequential generation, decoder pre-filled 50% from previous windows, logit processor prevents past/far-future tokens. Random offset training forces onset-based timing correction.
 
-![mapperatorinator_parser](https://github.com/user-attachments/assets/84efde76-4c27-48a1-b8ce-beceddd9e695)
+**Refined coordinates with diffusion:** Quantized positions (32px grid) denoised to final coordinates via modified [osu-diffusion](https://github.com/OliBomby/osu-diffusion). Specialized to last 10% of noise schedule. Slider end positions recalculated each diffusion step to match required slider lengths.
 
-To save on vocabulary size, time events are quantized to 10ms intervals and position coordinates are quantized to 32 pixel grid points.
+**Post-processing:** Refine with diffusion, resnap to ticks, snap overlaps, convert mania columns, generate taiko drumrolls, fix slider length discrepancies.
 
-### Model architecture
-The model is basically a wrapper around the [HF Transformers Whisper](https://huggingface.co/docs/transformers/en/model_doc/whisper#transformers.WhisperForConditionalGeneration) model, with custom input embeddings and loss function.
-Model size amounts to 219M parameters.
-This model was found to be faster and more accurate than T5 for this task.
+**Super timing generator:** Infer timing 20 times, average results. Near-perfect for variable BPM songs.
 
-The high-level overview of the model's input-output is as follows:
+### Training (osu!)
 
-![Picture2](https://user-images.githubusercontent.com/28675590/201044116-1384ad72-c540-44db-a285-7319dd01caad.svg)
-
-The model uses Mel spectrogram frames as encoder input, with one frame per input position. The model decoder output at each step is a softmax distribution over a discrete, predefined, vocabulary of events. Outputs are sparse, events are only needed when a hit-object occurs, instead of annotating every single audio frame.
-
-### Multitask training format
-
-![Multitask training format](https://github.com/user-attachments/assets/62f490bc-a567-4671-a7ce-dbcc5f9cd6d9)
-
-Before the SOS token are additional tokens that facilitate conditional generation. These tokens include the gamemode, difficulty, mapper ID, year, and other metadata.
-During training, these tokens do not have accompanying labels, so they are never output by the model. 
-Also during training there is a random chance that a metadata token gets replaced by an 'unknown' token, so during inference we can use these 'unknown' tokens to reduce the amount of metadata we have to give to the model.
-
-### Seamless long generation
-
-The context length of the model is 8.192 seconds long. This is obviously not enough to generate a full beatmap, so we have to split the song into multiple windows and generate the beatmap in small parts.
-To make sure that the generated beatmap does not have noticeable seams in between windows, we use a 90% overlap and generate the windows sequentially.
-Each generation window except the first starts with the decoder pre-filled up to 50% of the generation window with tokens from the previous windows.
-We use a logit processor to make sure that the model can't generate time tokens that are in the first 50% of the generation window.
-Additionally, the last 40% of the generation window is reserved for the next window. Any generated time tokens in that range are treated as EOS tokens.
-This ensures that each generated token is conditioned on at least 4 seconds of previous tokens and 3.3 seconds of future audio to anticipate.
-
-To prevent offset drifting during long generation, random offsets have been added to time events in the decoder during training.
-This forces it to correct timing errors by listening to the onsets in the audio instead, and results in a consistently accurate offset.
-
-### Refined coordinates with diffusion
-
-Position coordinates generated by the decoder are quantized to 32 pixel grid points, so afterward we use diffusion to denoise the coordinates to the final positions.
-For this we trained a modified version of [osu-diffusion](https://github.com/OliBomby/osu-diffusion) that is specialized to only the last 10% of the noise schedule, and accepts the more advanced metadata tokens that Mapperatorinator uses for conditional generation.
-
-Since the Mapperatorinator model outputs the SV of sliders, the required length of the slider is fixed regardless of the shape of the control point path.
-Therefore, we try to guide the diffusion process to create coordinates that fit the required slider lengths.
-We do this by recalculating the slider end positions after every step of the diffusion process based on the required length and the current control point path.
-This means that the diffusion process does not have direct control over the slider end positions, but it can still influence them by changing the control point path.
-
-### Post-processing
-
-Mapperatorinator does some extra post-processing to improve the quality of the generated beatmap:
-
-- Refine position coordinates with diffusion.
-- Resnap time events to the nearest tick using the snap divisors generated by the model.
-- Snap near-perfect positional overlaps.
-- Convert mania column events to X coordinates.
-- Generate slider paths for taiko drumrolls.
-- Fix big discrepancies in required slider length and control point path length.
-
-### Super timing generator
-
-Super timing generator is an algorithm that improves the precision and accuracy of generated timing by infering timing for the whole song 20 times and averaging the results.
-This is useful for songs with variable BPM, or songs with BPM changes. The result is almost perfect with only sometimes a section that needs manual adjustment.
-
-## Training
-
-The instruction below creates a training environment on your local machine.
-
-### 1. Clone the repository
-
-```sh
-git clone https://github.com/OliBomby/Mapperatorinator.git
-cd Mapperatorinator
-```
-
-### 2. Create dataset
-
-Create your own dataset using the [Mapperator console app](https://github.com/mappingtools/Mapperator/blob/master/README.md#create-a-high-quality-dataset). It requires an [osu! OAuth client token](https://osu.ppy.sh/home/account/edit) to verify beatmaps and get additional metadata. Place the dataset in a `datasets` directory next to the `Mapperatorinator` directory.
+Create dataset with [Mapperator console app](https://github.com/mappingtools/Mapperator/blob/master/README.md#create-a-high-quality-dataset). Requires [osu! OAuth token](https://osu.ppy.sh/home/account/edit).
 
 ```sh
 Mapperator.ConsoleApp.exe dataset2 -t "/Mapperatorinator/datasets/beatmap_descriptors.csv" -i "path/to/osz/files" -o "/datasets/cool_dataset"
 ```
 
-### 3. Create docker container
-Training in your venv is also possible, but we recommend using Docker on WSL for better performance.
+**Docker (recommended on WSL):**
 ```sh
 docker compose up -d --force-recreate
 docker attach mapperatorinator_space
 ```
 
-### 4. Configure parameters and begin training
-
-All configurations are located in `./configs/osut5/train.yaml`. Begin training by calling `osuT5/train.py`.
-
+**Train:**
 ```sh
 python osuT5/train.py -cn train_v29 train_dataset_path="/workspace/datasets/cool_dataset" test_dataset_path="/workspace/datasets/cool_dataset" train_dataset_end=90 test_dataset_start=90 test_dataset_end=100
 ```
 
-## See also
+Configurations: `./configs/osut5/train.yaml`.
+
+### See Also (osu!)
+
 - [Mapper Classifier](./classifier/README.md)
 - [RComplexion](./rcomplexion/README.md)
 
+---
+
 ## Credits
 
-Special thanks to:
+**ADOFAI fork:** Tiller431
+
+**Upstream Mapperatorinator:** [OliBomby/Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) by OliBomby
+
+Built upon:
+- [osuT5](https://github.com/gyataro/osuT5) by gyataro — training code and T5 architecture
+- [osu-diffusion](https://github.com/OliBomby/osu-diffusion) by OliBomby & NiceAesth — coordinate refinement
+
+Special thanks (original Mapperatorinator):
 1. The authors of [osuT5](https://github.com/gyataro/osuT5) for their training code.
 2. Hugging Face team for their [tools](https://huggingface.co/docs/transformers/index).
 3. [Jason Won](https://github.com/jaswon) and [Richard Nagyfi](https://github.com/sedthh) for bouncing ideas.
 4. [Marvin](https://github.com/minetoblend) for donating training credits.
 5. The osu! community for the beatmaps.
 
-## Related works
+## Related Works
 
 1. [osu! Beatmap Generator](https://github.com/Syps/osu_beatmap_generator) by Syps (Nick Sypteras)
 2. [osumapper](https://github.com/kotritrona/osumapper) by kotritrona, jyvden, Yoyolick (Ryan Zmuda)

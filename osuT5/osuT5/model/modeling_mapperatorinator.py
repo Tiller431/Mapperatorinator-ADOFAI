@@ -219,6 +219,12 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
                 unreduced_loss *= sample_weights.unsqueeze(1)
             loss = unreduced_loss.sum() / (labels != LABEL_IGNORE_ID).sum()
 
+        # Training: do not return 8192-tgt logits. Seq2SeqLMOutput is a
+        # Mapping; accelerate convert_to_fp32 → tensor.float() clones every
+        # bf16 field (operations.py). That copy is the first-forward OOM.
+        if self.training:
+            return Seq2SeqLMOutput(loss=loss)
+
         return Seq2SeqLMOutput(
             loss=loss,
             logits=output.logits,

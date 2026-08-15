@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -11,10 +12,11 @@ from slider import Beatmap, TimingPoint
 from tqdm import tqdm
 
 from config import InferenceConfig
-from .server import InferenceClient, model_generate, model_forward
+from .compiled_decode import model_generate_compiled
+from .server import InferenceClient, model_generate, model_forward, precompute_encoder_outputs
 from ..dataset.osu_parser import OsuParser
 from ..dataset.data_utils import (update_event_times, remove_events_of_type, get_hold_note_ratio,
-                                  get_scroll_speed_ratio, get_hitsounded_status)
+                                  get_scroll_speed_ratio, get_hitsounded_status, calculate_difficulty)
 from ..model import Mapperatorinator
 from ..tokenizer import Event, EventType, Tokenizer, ContextType
 
@@ -44,19 +46,15 @@ class GenerationConfig:
 
 
 # noinspection PyProtectedMember
-def generation_config_from_beatmap(beatmap: Beatmap, tokenizer: Tokenizer) -> GenerationConfig:
+def generation_config_from_beatmap(beatmap: Beatmap, beatmap_path, tokenizer: Optional[Tokenizer] = None) -> GenerationConfig:
     gamemode = int(beatmap.mode)
-    difficulty = None
-    if gamemode == 0 and len(beatmap._hit_objects) > 0:  # We don't have diffcalc for other gamemodes
-        try:
-            difficulty = round(float(beatmap.stars()), 2)
-        except Exception:
-            pass
+    difficulty = calculate_difficulty(path=beatmap_path)
+
     return GenerationConfig(
         gamemode=gamemode,
         beatmap_id=beatmap.beatmap_id,
         difficulty=difficulty,
-        mapper_id=tokenizer.beatmap_mapper.get(beatmap.beatmap_id, None),
+        mapper_id=tokenizer.beatmap_mapper.get(beatmap.beatmap_id, None) if tokenizer else None,
         hp_drain_rate=beatmap.hp_drain_rate,
         circle_size=beatmap.circle_size,
         overall_difficulty=beatmap.overall_difficulty,
@@ -67,7 +65,7 @@ def generation_config_from_beatmap(beatmap: Beatmap, tokenizer: Tokenizer) -> Ge
         keycount=int(beatmap.circle_size) if gamemode == 3 else 4,
         hold_note_ratio=get_hold_note_ratio(beatmap) if gamemode == 3 else None,
         scroll_speed_ratio=get_scroll_speed_ratio(beatmap) if gamemode in [1, 3] else None,
-        descriptors=[tokenizer.descriptor_name(idx) for idx in tokenizer.beatmap_descriptors.get(beatmap.beatmap_id, [])] if beatmap.beatmap_id in tokenizer.beatmap_descriptors else None,
+        descriptors=[tokenizer.descriptor_name(idx) for idx in tokenizer.beatmap_descriptors.get(beatmap.beatmap_id, [])] if tokenizer and beatmap.beatmap_id in tokenizer.beatmap_descriptors else None,
     )
 
 
@@ -75,6 +73,7 @@ class Processor(object):
     def __init__(self, args: InferenceConfig, model: Mapperatorinator | InferenceClient, tokenizer: Tokenizer, cfg_scale: float = None):
         """Model inference stage that processes sequences."""
         self.device = args.device
+        self.precision = args.precision
         self.args = args
         self.model = model
         self.tokenizer = tokenizer
@@ -131,6 +130,7 @@ class Processor(object):
 
         if self.add_positions:
             self.position_precision = args.train.data.position_precision
+            self.position_refinement = args.train.data.position_refinement
             x_min, x_max, y_min, y_max = args.train.data.position_range
             self.x_min = x_min // self.position_precision
             self.x_max = x_max // self.position_precision
@@ -152,9 +152,15 @@ class Processor(object):
 
         self.timeshift_bias = args.timeshift_bias
         self.types_first = args.train.data.types_first
+        # CUDA-graph fast decoder loop (see compiled_decode.py). Requires CUDA;
+        # inference.py disables it on other devices. When the model is an
+        # InferenceClient this flag lives on the server instead.
+        self.fast_decoder_loop = args.fast_decoder_loop
+        self.last_generation_stats: dict[str, float | int] | None = None
 
     def model_generate(self, model_kwargs, **generate_kwargs: Any) -> Any:
         generate_kwargs2 = generate_kwargs | dict(
+            precision=self.precision,
             do_sample=self.do_sample,
             num_beams=self.num_beams,
             top_p=self.top_p,
@@ -170,12 +176,22 @@ class Processor(object):
         )
 
         if isinstance(self.model, InferenceClient):
-            return self.model.generate(model_kwargs, generate_kwargs2)
-        else:
-            return model_generate(self.model, self.tokenizer, model_kwargs, generate_kwargs2)
+            response = self.model.generate(model_kwargs, generate_kwargs2)
+            return response, getattr(self.model, "last_generation_stats", None)
+        # Batch-1 requests with precomputed encoder outputs go through the fast
+        # decoder loop when enabled (it is captured for a fixed batch size and
+        # cannot do beam search). With an InferenceClient the equivalent dispatch
+        # happens on the server.
+        if (self.fast_decoder_loop
+                and isinstance(model_kwargs.get('encoder_outputs'), torch.Tensor)
+                and model_kwargs['encoder_outputs'].shape[0] == 1
+                and self.num_beams == 1):
+            return model_generate_compiled(self.model, self.tokenizer, model_kwargs, generate_kwargs2)
+        return model_generate(self.model, self.tokenizer, model_kwargs, generate_kwargs2)
 
     def model_forward(self, model_kwargs) -> Any:
         generate_kwargs2 = dict(
+            precision=self.precision,
             cfg_scale=self.cfg_scale,
         )
 
@@ -246,6 +262,7 @@ class Processor(object):
         )
 
         generate_func = self.generate_parallel if self.parallel else self.generate_sequential
+        self._reset_generation_stats()
         if isinstance(self.model, InferenceClient):
             with self.model:
                 generate_func(**inputs)
@@ -312,7 +329,51 @@ class Processor(object):
             req_special_tokens: list[str],
             verbose: bool = True,
     ):
+        """Generate windows sequentially, reusing encoder outputs precomputed in a
+        single batched pass before the decode loop. Each window skips the
+        per-window encoder prefill; the encoder is a pure function of the audio
+        window + static conditioning, so hoisting it out of the sequential loop
+        changes only timing, not values.
+        """
         song_length = sequences[2]
+        all_frames = self.prepare_frames(sequences[0])  # (N, L_raw)
+        frame_times = sequences[1]
+        n_windows = all_frames.shape[0]
+
+        # Static conditioning broadcast across windows (beatmap_idx/difficulty/mapper_idx)
+        cond_kwargs = {k: v for k, v in model_kwargs.items()
+                       if k in ("beatmap_idx", "difficulty", "mapper_idx") and isinstance(v, torch.Tensor)}
+
+        # Per-window song positions
+        if self.do_song_position_embed:
+            starts = (frame_times / song_length).to(torch.float32)
+            ends = ((frame_times + self.miliseconds_per_sequence) / song_length).to(torch.float32)
+            song_positions = torch.stack([starts, ends], dim=1)  # (N, 2)
+        else:
+            song_positions = None
+
+        # Precompute encoder outputs for all windows in one batched pass
+        t0 = _time.perf_counter() if verbose else 0
+        if verbose:
+            print(f"Precomputing encoder outputs for {n_windows} windows...")
+        if isinstance(self.model, InferenceClient):
+            # The client doesn't own the model, so the server precomputes.
+            # Conditioning is expanded per window because the server may split
+            # the request into multiple batches.
+            precompute_kwargs = {k: v.expand(n_windows).contiguous() for k, v in cond_kwargs.items()}
+            precompute_kwargs["inputs"] = all_frames
+            if song_positions is not None:
+                precompute_kwargs["song_position"] = song_positions
+            enc_hidden = self.model.precompute_encoder(precompute_kwargs)  # (N, L_enc, D)
+        else:
+            with torch.no_grad():
+                enc_hidden = precompute_encoder_outputs(
+                    self.model, all_frames, cond_kwargs, song_positions,
+                    batch_size=self.max_batch_size,
+                )
+        if verbose:
+            print(f"Encoder precompute: {_time.perf_counter() - t0:.2f}s "
+                  f"({(_time.perf_counter() - t0) / n_windows * 1000:.1f} ms/window)")
 
         for i, context in enumerate(out_context):
             if context["finished"]:
@@ -320,13 +381,11 @@ class Processor(object):
 
             if verbose:
                 print(f"Generating {context['context_type'].value}")
-            iterator = tqdm(list(zip(*sequences[:2]))) if verbose else zip(*sequences[:2])
-            for sequence_index, (frames, frame_time) in enumerate(iterator):
-                trim_lookback = sequence_index != 0 and self.types_first and self.lookback_time > 0
-                trim_lookahead = sequence_index != len(sequences[0]) - 1
-
-                # noinspection PyUnresolvedReferences
-                frames = self.prepare_frames(frames)
+            tokens_per_second_meter = self._create_tokens_per_second_meter()
+            iterator = tqdm(list(zip(range(n_windows), frame_times)), dynamic_ncols=True) if verbose else zip(range(n_windows), frame_times)
+            for sequence_index, (wi, frame_time) in enumerate(iterator):
+                trim_lookback = sequence_index != 0 and self.lookback_time > 0
+                trim_lookahead = sequence_index != n_windows - 1
                 frame_time = frame_time.item()
 
                 # Get relevant tokens for current frame
@@ -337,15 +396,9 @@ class Processor(object):
 
                 [prompt, uncond_prompt], max_len = self.pad_prompts([cond_prompt, uncond_prompt])
 
-                # Prepare additional model kwargs
-                if self.do_song_position_embed:
-                    global_pos_start = frame_time / song_length
-                    global_pos_end = (frame_time + self.miliseconds_per_sequence) / song_length
-                    model_kwargs["song_position"] = torch.tensor([global_pos_start, global_pos_end], dtype=torch.float32).unsqueeze(0)
-
-                result = self.model_generate(
+                result, generation_stats = self.model_generate(
                     model_kwargs | dict(
-                        inputs=frames,
+                        encoder_outputs=enc_hidden[wi:wi + 1],
                         decoder_input_ids=prompt,
                         decoder_attention_mask=prompt.ne(self.tokenizer.pad_id),
                         negative_prompt=uncond_prompt,
@@ -355,6 +408,9 @@ class Processor(object):
                     lookahead_time=self.lookahead_time if trim_lookahead else 0,
                     context_type=context["context_type"].value,
                 )
+                self._record_generation_stats(generation_stats)
+                if verbose:
+                    self._update_tokens_per_second_meter(iterator, tokens_per_second_meter, generation_stats)
 
                 # Only support batch size 1
                 predicted_tokens = result[0, max_len:].cpu()
@@ -392,20 +448,24 @@ class Processor(object):
             verbose,
         )
 
-        for i in range(len(result)):
-            frame_time = frame_times[i].item()
-            if self.add_out_context_types:
-                for context in out_context:
-                    # Find the tokens in predicted_tokens[i] between context sos and eos
-                    start, end = self._get_token_context(
-                        result[i],
-                        self.tokenizer.context_sos[context["context_type"]],
-                        self.tokenizer.context_eos[context["context_type"]],
-                    )
-                    self.add_predicted_tokens_to_context(context, result[i, start:end], frame_time)
-            else:
-                start, end = self._get_token_context(result[i], self.tokenizer.sos_id, self.tokenizer.eos_id)
-                self.add_predicted_tokens_to_context(out_context[0], result[i, start:end], frame_time)
+        sequence_index = 0
+        for batch, _ in result:
+            for sequence in batch:
+                frame_time = frame_times[sequence_index].item()
+                if self.add_out_context_types:
+                    for context in out_context:
+                        # Find the tokens in predicted_tokens[i] between context sos and eos
+                        start, end = self._get_token_context(
+                            sequence,
+                            self.tokenizer.context_sos[context["context_type"]],
+                            self.tokenizer.context_eos[context["context_type"]],
+                            strict=True,
+                        )
+                        self.add_predicted_tokens_to_context(context, sequence[start:end], frame_time)
+                else:
+                    start, end = self._get_token_context(sequence, self.tokenizer.sos_id, self.tokenizer.eos_id)
+                    self.add_predicted_tokens_to_context(out_context[0], sequence[start:end], frame_time)
+                sequence_index += 1
 
     def ai_mod(
             self,
@@ -448,14 +508,6 @@ class Processor(object):
             model_kwargs=model_kwargs,
             req_special_tokens=req_special_tokens,
         )
-        result = self._batched_inference(
-            self.model_forward,
-            cond_prompts,
-            uncond_prompts,
-            frames,
-            model_kwargses,
-            verbose,
-        )
 
         for context in out_context_data:
             context['surprisals'] = np.zeros(len(context["events"]), dtype=np.float32)
@@ -463,94 +515,115 @@ class Processor(object):
             context['expected_events_str'] = np.empty(len(context["events"]), dtype=np.object_)
             context['events_str'] = np.empty(len(context["events"]), dtype=np.object_)
 
-            for sequence_index in range(len(frames)):
-                trim_lookback = sequence_index != 0
-                trim_lookahead = sequence_index != len(sequences[0]) - 1
+        results = self._batched_inference(
+            self.model_forward,
+            cond_prompts,
+            uncond_prompts,
+            frames,
+            model_kwargses,
+            verbose=verbose,
+        )
 
-                frame_time = frame_times[sequence_index].item()
+        sequence_index = 0
+        for batch, _ in results:
+            for result in batch:
+                for context in out_context_data:
+                    trim_lookback = sequence_index != 0
+                    trim_lookahead = sequence_index != len(sequences[0]) - 1
 
-                # Get relevant tokens for current frame
-                s, e = self._get_events_time_range(context["event_times"], frame_time, frame_time + self.miliseconds_per_sequence)
-                events, event_times = context["events"][s:e], context["event_times"][s:e]
-                tokens = self._encode(events, frame_time).squeeze(0)
-                seq_prompt = cond_prompts[sequence_index].squeeze(0)
-                padding = result.shape[1] - len(seq_prompt)
+                    frame_time = frame_times[sequence_index].item()
 
-                # Get the range within the current frame with lookback and lookahead removed
-                window_start_t = frame_time + self.lookback_time if trim_lookback else frame_time
-                window_end_t = frame_time + self.lookahead_max_time if trim_lookahead else frame_time + self.miliseconds_per_sequence
-                s2, e2 = self._get_events_time_range(event_times, window_start_t, window_end_t)
+                    # Get relevant tokens for current frame
+                    s, e = self._get_events_time_range(context["event_times"], frame_time, frame_time + self.miliseconds_per_sequence)
+                    events, event_times = context["events"][s:e], context["event_times"][s:e]
+                    tokens = self._encode(events, frame_time).squeeze(0)
+                    seq_prompt = cond_prompts[sequence_index].squeeze(0)
+                    padding = result.shape[0] - len(seq_prompt)
 
-                # Find the tokens in predicted_tokens[i] between context sos and eos
-                if self.add_out_context_types:
-                    start, end = self._get_token_context(
-                        seq_prompt,
-                        self.tokenizer.context_sos[context["context_type"]],
-                        self.tokenizer.context_eos[context["context_type"]],
-                    )
-                else:
-                    start, end = self._get_token_context(seq_prompt, self.tokenizer.sos_id, self.tokenizer.eos_id)
+                    # Get the range within the current frame with lookback and lookahead removed
+                    window_start_t = frame_time + self.lookback_time if trim_lookback else frame_time
+                    window_end_t = frame_time + self.lookahead_max_time if trim_lookahead else frame_time + self.miliseconds_per_sequence
+                    s2, e2 = self._get_events_time_range(event_times, window_start_t, window_end_t)
 
-                # Shift start and end because we want to get the logits for the event instead of the next event
-                logits = result[sequence_index, start + padding - 1:end + padding - 1]
-                assert len(logits) == len(events), f"Logits length {len(logits)} does not match events length {len(events)} for context {context['context_type']} at frame {sequence_index}."
+                    # Find the tokens in predicted_tokens[i] between context sos and eos
+                    if self.add_out_context_types:
+                        start, end = self._get_token_context(
+                            seq_prompt,
+                            self.tokenizer.context_sos[context["context_type"]],
+                            self.tokenizer.context_eos[context["context_type"]],
+                            strict=True,
+                        )
+                    else:
+                        start, end = self._get_token_context(seq_prompt, self.tokenizer.sos_id, self.tokenizer.eos_id)
 
-                # Cut the tokens and logits to the generation window
-                tokens = tokens[s2:e2]
-                logits = logits[s2:e2]
+                    # Shift start and end because we want to get the logits for the event instead of the next event
+                    logits = result[start + padding - 1:end + padding - 1]
+                    assert len(logits) == len(events), f"Logits length {len(logits)} does not match events length {len(events)} for context {context['context_type']} at frame {sequence_index}."
 
-                # Calculate surprisal and relative surprisal
-                probs = logits.softmax(dim=-1)
-                entropy = -torch.sum(probs * torch.log2(probs + 1e-10), dim=-1)
-                surprisal = -torch.log2(probs[torch.arange(len(tokens)), tokens] + 1e-10)
-                relative_surprisal = torch.where(entropy > 0, surprisal / entropy, torch.zeros_like(entropy))
+                    # Cut the tokens and logits to the generation window
+                    tokens = tokens[s2:e2]
+                    logits = logits[s2:e2]
 
-                # Get the most likely token as a suggestion for a fix
-                suggested_tokens = logits.argmax(dim=-1)
-                suggested_events = self._decode(suggested_tokens, frame_time, True)
+                    # Calculate surprisal and relative surprisal
+                    probs = logits.softmax(dim=-1)
+                    entropy = -torch.sum(probs * torch.log2(probs + 1e-10), dim=-1)
+                    surprisal = -torch.log2(probs[torch.arange(len(tokens)), tokens] + 1e-10)
+                    relative_surprisal = torch.where(entropy > 0, surprisal / entropy, torch.zeros_like(entropy))
 
-                context['surprisals'][s:e][s2:e2] = relative_surprisal
-                context['expected_events'][s:e][s2:e2] = suggested_events
+                    # Get the most likely token as a suggestion for a fix
+                    suggested_tokens = logits.argmax(dim=-1)
+                    suggested_events = self._decode(suggested_tokens, frame_time, True)
 
-            # Post-process events
-            def process_event(event: Event) -> Any:
-                offset = self.position_precision // 2 if self.position_precision > 1 else 0
-                # Rescale position events
-                if event.type == EventType.POS_X or event.type == EventType.POS_Y:
-                    return f"{event.type.value[4]}:{event.value * self.position_precision}"
-                elif event.type == EventType.POS:
-                    return f"x:{((event.value % self.x_count) + self.x_min) * self.position_precision + offset} y:{((event.value // self.x_count) + self.y_min) * self.position_precision + offset}"
-                # Convert distance events to string
-                elif event.type == EventType.DISTANCE:
-                    return f"{event.value}"
-                # Convert volume to string
-                elif event.type == EventType.VOLUME:
-                    return f"{event.value}%"
-                # Convert snapping events to string
-                elif event.type == EventType.SNAPPING:
-                    return f"1/{event.value}" if event.value > 0 else "none"
-                # Convert time shift events to string mm:ss:fff
-                elif event.type == EventType.TIME_SHIFT:
-                    timestamp = f"{event.value // 60000:02}:{(event.value // 1000) % 60:02}:{event.value % 1000:03}"
-                    return f"[link=osu://edit/{timestamp}]{timestamp}[/link]"
-                # Convert hitsound events to string
-                elif event.type == EventType.HITSOUND:
-                    hitsound_map = ["whistle", "finish", "clap"]
-                    hitsounds = [hitsound_map[i] for i in range(3) if (event.value >> i) & 1]
-                    sampleset_map = ["normal", "soft", "drum"]
-                    sampleset = ((event.value // 8) % 3)
-                    additions = ((event.value // 24) % 3)
-                    return f"{sampleset_map[sampleset]}:{sampleset_map[additions]}-{':'.join(hitsounds) if hitsounds else 'none'}"
-                # Convert EOS control events to string
-                elif event.type == EventType.CONTROL and event.value in [self.tokenizer.eos_id] + list(self.tokenizer.context_eos.values()):
-                    return f"End of sequence"
-                else:
-                    return event
+                    context['surprisals'][s:e][s2:e2] = relative_surprisal
+                    context['expected_events'][s:e][s2:e2] = suggested_events
 
-            for i, event in enumerate(context['events']):
-                context['events_str'][i] = process_event(event)
-            for i, event in enumerate(context['expected_events']):
-                context['expected_events_str'][i] = process_event(event)
+                    # Post-process events
+                    def process_event(event: Event) -> Any:
+                        offset = self.position_precision // 2 if self.position_precision > 1 else 0
+                        # Rescale position events
+                        if event.type == EventType.POS_X or event.type == EventType.POS_Y:
+                            return f"{event.type.value[4]}:{event.value * self.position_precision}"
+                        elif event.type == EventType.POS:
+                            return f"x:{((event.value % self.x_count) + self.x_min) * self.position_precision + offset} y:{((event.value // self.x_count) + self.y_min) * self.position_precision + offset}"
+                        # Convert distance events to string
+                        elif event.type == EventType.DISTANCE:
+                            return f"{event.value}"
+                        # Convert mania column to string
+                        elif event.type == EventType.MANIA_COLUMN:
+                            return f"{event.value + 1}"
+                        # Convert volume to string
+                        elif event.type == EventType.VOLUME:
+                            return f"{event.value}%"
+                        # Convert snapping events to string
+                        elif event.type == EventType.SNAPPING:
+                            return f"1/{event.value}" if event.value > 0 else "none"
+                        # Convert time shift events to string mm:ss:fff
+                        elif event.type == EventType.TIME_SHIFT:
+                            timestamp = f"{event.value // 60000:02}:{(event.value // 1000) % 60:02}:{event.value % 1000:03}"
+                            return f"[link=osu://edit/{timestamp}]{timestamp}[/link]"
+                        # Convert SV events to string
+                        elif event.type == EventType.SCROLL_SPEED:
+                            return f"x{(event.value / 100):.2f}"
+                        # Convert hitsound events to string
+                        elif event.type == EventType.HITSOUND:
+                            hitsound_map = ["whistle", "finish", "clap"]
+                            hitsounds = [hitsound_map[i] for i in range(3) if (event.value >> i) & 1]
+                            sampleset_map = ["normal", "soft", "drum"]
+                            sampleset = ((event.value // 8) % 3)
+                            additions = ((event.value // 24) % 3)
+                            return f"{sampleset_map[sampleset]}:{sampleset_map[additions]}-{':'.join(hitsounds) if hitsounds else 'none'}"
+                        # Convert EOS control events to string
+                        elif event.type == EventType.CONTROL and event.value in [self.tokenizer.eos_id] + list(self.tokenizer.context_eos.values()):
+                            return f"End of sequence"
+                        else:
+                            return event
+
+                    for i, event in enumerate(context['events'][s:e][s2:e2]):
+                        context['events_str'][s:e][s2:e2][i] = process_event(event)
+                    for i, event in enumerate(context['expected_events'][s:e][s2:e2]):
+                        context['expected_events_str'][s:e][s2:e2][i] = process_event(event)
+
+                sequence_index += 1
 
         return out_context_data
 
@@ -563,6 +636,7 @@ class Processor(object):
     ):
         in_context = in_context or []
         out_context = out_context or []
+        requested_out_context = out_context.copy()
 
         # Merge extra in context with in context
         if extra_in_context is not None:
@@ -597,8 +671,15 @@ class Processor(object):
                 gen_out_context.remove(ContextType.SV)
 
         # We have to generate the out contexts in order of the template
-        out_context_count = max(all_out_context.index(oc) for oc in gen_out_context) + 1
-        gen_out_context = all_out_context[:out_context_count]
+        requested_out_context_was_explicit = len(requested_out_context) > 0
+        requested_out_context = [oc for oc in requested_out_context if oc in gen_out_context]
+        if len(requested_out_context) == 0:
+            if requested_out_context_was_explicit:
+                raise ValueError("No requested output contexts are available for the selected template and gamemode.")
+            gen_out_context = all_out_context.copy()
+        else:
+            out_context_count = max(all_out_context.index(oc) for oc in requested_out_context) + 1
+            gen_out_context = all_out_context[:out_context_count]
 
         return gen_in_context, gen_out_context, req_special_tokens
 
@@ -664,7 +745,7 @@ class Processor(object):
 
     def _batched_inference(
             self,
-            genereate_func,
+            generate_func,
             cond_prompts: list[torch.Tensor],
             uncond_prompts: list[torch.Tensor],
             frames: torch.Tensor,
@@ -677,11 +758,10 @@ class Processor(object):
         max_batch_size = max(1, self.max_batch_size // self.num_beams // (2 if self.cfg_scale > 1 else 1))
         num_samples = cond_prompt.size(0)
         model_kwarg_keys = list(model_kwargses[0].keys())
-        results = []
 
         # Process each batch
-        iterator = tqdm(list(range(0, num_samples, max_batch_size))) if verbose else range(0, num_samples,
-                                                                                           max_batch_size)
+        tokens_per_second_meter = self._create_tokens_per_second_meter()
+        iterator = tqdm(list(range(0, num_samples, max_batch_size)), dynamic_ncols=True) if verbose else range(0, num_samples, max_batch_size)
         for i in iterator:
             frames_batch = frames[i:i + max_batch_size]
             cond_prompt_batch = cond_prompt[i:i + max_batch_size]
@@ -691,7 +771,7 @@ class Processor(object):
                                   model_kwarg_keys}
 
             # Start generation
-            results.append(genereate_func(
+            result = generate_func(
                 model_kwargs_batch | dict(
                     inputs=frames_batch,
                     decoder_input_ids=cond_prompt_batch,
@@ -700,19 +780,28 @@ class Processor(object):
                     negative_prompt_attention_mask=uncond_prompt_batch.ne(
                         self.tokenizer.pad_id) if uncond_prompt_batch is not None else None,
                 ),
-            ))
+            )
 
-        # Concatenate all batch results to form the final result
-        padded_results, _ = self.pad_prompts(results)
-        result = torch.cat(padded_results, dim=0)
-        return result
+            generation_stats = None
+            if isinstance(result, tuple) and len(result) == 2:
+                result, generation_stats = result
 
-    def _get_token_context(self, tokens: torch.Tensor, sos, eos):
+            self._record_generation_stats(generation_stats)
+            if verbose:
+                self._update_tokens_per_second_meter(iterator, tokens_per_second_meter, generation_stats)
+
+            yield result, generation_stats
+
+        torch.cuda.empty_cache()
+
+    def _get_token_context(self, tokens: torch.Tensor, sos, eos, strict=False):
         """Get the start and end indices of the token context in the given tokens."""
         start = (tokens == sos).nonzero(as_tuple=True)[0]
-        start = start[0] + 1 if len(start) > 0 else 1
+        start = start[0] + 1 if len(start) > 0 else (None if strict else 0)
         end = (tokens == eos).nonzero(as_tuple=True)[0]
-        end = end[0] if len(end) > 0 else len(tokens)
+        end = end[0] if len(end) > 0 else (None if strict else len(tokens))
+        if start is None or end is None:
+            return 0, 0
         return start, end
 
     def split_into_batches(self, tensor, max_batch_size, batch_size=1):
@@ -795,7 +884,8 @@ class Processor(object):
                 beatmap = Beatmap.from_path(beatmap_path)
                 data["events"], data["event_times"] = parser.parse(beatmap, song_length=song_length)
                 if add_class:
-                    data["class"] = self.get_class_vector(generation_config_from_beatmap(beatmap, self.tokenizer), song_length)
+                    data["class"] = self.get_class_vector(
+                        generation_config_from_beatmap(beatmap, beatmap_path, self.tokenizer), song_length)
             elif context == ContextType.NO_HS:
                 beatmap = Beatmap.from_path(beatmap_path)
                 hs_events, hs_event_times = parser.parse(beatmap, song_length=song_length)
@@ -805,7 +895,8 @@ class Processor(object):
                 beatmap = Beatmap.from_path(beatmap_path)
                 data["events"], data["event_times"] = parser.parse(beatmap, song_length=song_length)
                 if add_class:
-                    data["class"] = self.get_class_vector(generation_config_from_beatmap(beatmap, self.tokenizer), song_length)
+                    data["class"] = self.get_class_vector(
+                        generation_config_from_beatmap(beatmap, beatmap_path, self.tokenizer), song_length)
             elif context == ContextType.KIAI:
                 beatmap = Beatmap.from_path(beatmap_path)
                 data["events"], data["event_times"] = parser.parse_kiai(beatmap)
@@ -861,6 +952,9 @@ class Processor(object):
     ) -> list[dict[str, Any]]:
         out = []
         for i, context in enumerate(out_context):
+            context_is_provided = context in given_context or (
+                extra_in_context is not None and context in extra_in_context
+            )
             context_data = self.get_context(
                 context,
                 beatmap_path=beatmap_path,
@@ -868,7 +962,7 @@ class Processor(object):
                 song_length=song_length,
                 add_type=self.add_out_context_types,
                 add_class=False,
-                finished=context in given_context,
+                finished=context_is_provided,
                 partial=self.add_to_beatmap and self.start_time is not None,
             )
 
@@ -1206,7 +1300,17 @@ class Processor(object):
                 continue
 
             if event.type == EventType.TIME_SHIFT:
-                event.value = frame_time + event.value * MILISECONDS_PER_STEP
+                # Half-step (+5ms) de-biasing. Time shifts are encoded to the 10ms
+                # token grid by truncation (int((ms - start) * STEPS_PER_MILLISECOND)
+                # in data_utils / _encode), so a decoded step represents the floor
+                # of the true time. Multiplying straight back biases every event
+                # ~5ms early (measured mean -4.82ms, median -5.0ms over 50k time
+                # shifts from ranked maps). Adding half a step recenters the
+                # quantization error to ~0 (mean -4.82 -> +0.18ms). This is
+                # self-consistent with _encode's truncation on context round-trips:
+                # the +5 is truncated back to the same step.
+                half_step = MILISECONDS_PER_STEP // 2 if event.value >= 0 else 0
+                event.value = frame_time + event.value * MILISECONDS_PER_STEP + half_step
 
             events.append(event)
 
@@ -1215,14 +1319,25 @@ class Processor(object):
     def _rescale_positions(self, events: list[Event], event_times: list[int]) -> tuple[list[Event], list[int]]:
         new_events = []
         new_event_times = []
-        offset = self.position_precision // 2 if self.position_precision > 1 else 0
+        default_offset = self.position_precision // 2 if self.position_precision > 1 else 0
+        default_offset = np.array([default_offset, default_offset], dtype=np.int32)
         for i, event in enumerate(events):
             if event.type == EventType.POS_X or event.type == EventType.POS_Y:
                 new_events.append(Event(type=event.type, value=event.value * self.position_precision))
                 new_event_times.append(event_times[i])
             elif event.type == EventType.POS:
-                new_events.append(Event(type=EventType.POS_X, value=((event.value % self.x_count) + self.x_min) * self.position_precision + offset))
-                new_events.append(Event(type=EventType.POS_Y, value=((event.value // self.x_count) + self.y_min) * self.position_precision + offset))
+                if i + 1 < len(events) and events[i + 1].type == EventType.POS_REFINE and self.position_refinement:
+                    refinement_range = self.position_precision // self.position_refinement
+                    refinement = events[i + 1].value
+                    offset = np.array([refinement % refinement_range, refinement // refinement_range], dtype=np.int32) * self.position_refinement
+                else:
+                    offset = default_offset
+
+                p = np.array([event.value % self.x_count + self.x_min, event.value // self.x_count + self.y_min], dtype=np.int32)
+                p *= self.position_precision
+                p += offset
+                new_events.append(Event(type=EventType.POS_X, value=p[0]))
+                new_events.append(Event(type=EventType.POS_Y, value=p[1]))
                 new_event_times.append(event_times[i])
                 new_event_times.append(event_times[i])
             else:
@@ -1264,3 +1379,44 @@ class Processor(object):
                 new_events.append(event)
                 new_event_times.append(event_times[i])
         return new_events, new_event_times
+
+    def _reset_generation_stats(self) -> None:
+        self.last_generation_stats = {
+            "generated_tokens": 0,
+            "elapsed_seconds": 0.0,
+            "tokens_per_second": 0.0,
+        }
+
+    def _record_generation_stats(self, stats: Any) -> None:
+        if not isinstance(stats, dict):
+            return
+
+        if self.last_generation_stats is None:
+            self._reset_generation_stats()
+
+        generated_tokens = int(stats.get("generated_tokens", 0) or 0)
+        elapsed_seconds = float(stats.get("elapsed_seconds", 0.0) or 0.0)
+        self.last_generation_stats["generated_tokens"] += generated_tokens
+        self.last_generation_stats["elapsed_seconds"] += elapsed_seconds
+
+        total_elapsed = float(self.last_generation_stats["elapsed_seconds"])
+        total_tokens = int(self.last_generation_stats["generated_tokens"])
+        self.last_generation_stats["tokens_per_second"] = total_tokens / total_elapsed if total_elapsed > 0 else 0.0
+
+    @staticmethod
+    def _create_tokens_per_second_meter(alpha: float = 0.1) -> dict[str, float | None]:
+        return {"alpha": alpha, "ema": None}
+
+    @staticmethod
+    def _update_tokens_per_second_meter(progress_bar, meter: dict[str, float | None], stats: Any) -> None:
+        if progress_bar is None or not isinstance(stats, dict):
+            return
+
+        tokens_per_second = stats.get("tokens_per_second")
+        if tokens_per_second is None or tokens_per_second <= 0:
+            return
+
+        previous = meter.get("ema")
+        alpha = float(meter.get("alpha", 0.1))
+        meter["ema"] = float(tokens_per_second) if previous is None else (alpha * float(tokens_per_second) + (1 - alpha) * float(previous))
+        progress_bar.set_postfix_str(f"{meter['ema']:.1f} tok/s", refresh=False)

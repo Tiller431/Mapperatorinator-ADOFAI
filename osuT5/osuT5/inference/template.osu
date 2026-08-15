@@ -5,17 +5,19 @@ AudioFilename: $audio_filename
 AudioLeadIn: 0
 PreviewTime: $preview_time
 Countdown: 0
-SampleSet: Soft
+SampleSet: All
 StackLeniency: 0.7
 Mode: $mode
 LetterboxInBreaks: 0
 WidescreenStoryboard: 1
+OverlayPosition: Above
 
 [Editor]
+Bookmarks:-330001
 DistanceSpacing: 1.0
 BeatDivisor: 4
 GridSize: 8
-TimelineZoom: 1
+TimelineZoom: 2.20004
 
 [Metadata]
 Title:$title
@@ -49,6 +51,12 @@ $background_line//Break Periods
 $timing_points
 
 [Colours]
+Combo0 : 255,192,0
+Combo1 : 255,192,0
+Combo2 : 0,202,0
+͏Combo3 : 242,24,57
+Combo4 : 18,124,255
+Combo5 : 242,24,57
 
 [HitObjects]
 $hit_objects

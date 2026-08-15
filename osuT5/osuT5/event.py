@@ -52,7 +52,14 @@ class EventType(Enum):
     DENDEN = "denden"
     DENDEN_END = "denden_end"
     CONTROL = "control"
-    
+    SLIDER_SUSTAIN = "slider_sustain"
+    SLIDER_REPEAT_SUSTAIN = "slider_repeat_sustain"
+    SPINNER_SUSTAIN = "spinner_sustain"
+    HOLD_NOTE_SUSTAIN = "hold_note_sustain"
+    DRUMROLL_SUSTAIN = "drumroll_sustain"
+    DENDEN_SUSTAIN = "denden_sustain"
+    POS_REFINE = "pos_refine"
+
     # ADOFAI event types
     TILE_ANGLE = "adofai_angle"
     MIDSPIN = "adofai_midspin"

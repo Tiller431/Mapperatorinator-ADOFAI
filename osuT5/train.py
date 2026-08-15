@@ -28,6 +28,7 @@ from osuT5.utils import (
     configure_nccl_for_pcie_multigpu,
     ddp_reducer_named_parameters,
     resolve_mixed_precision,
+    strip_fp32_output_conversion,
     sync_registered_modules,
 )
 
@@ -184,6 +185,12 @@ def main(args: TrainConfig):
     ) = accelerator.prepare(
         model, optimizer, scheduler, train_dataloader, test_dataloader
     )
+    # prepare() wraps forward with convert_outputs_to_fp32 (accelerate 1.12.0
+    # operations.py ConvertOutputsToFp32 → convert_to_fp32 → tensor.float()).
+    # That clones Seq2SeqLMOutput.logits [B, 8192, vocab] to fp32 after
+    # ``loss, stats = forward(...)`` and OOMs the same as mixed_precision=no.
+    # Pop the wrapper; keep autocast. Loss/backward stay bf16.
+    strip_fp32_output_conversion(model)
 
     # Rank-0 wandb after DDP wrap so tracker hooks cannot empty/freeze the
     # unwrapped module before ``_verify_param_shape_across_processes``.

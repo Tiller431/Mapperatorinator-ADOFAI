@@ -72,6 +72,24 @@ def apply_inference_settings(
     return level
 
 
+def is_adofai_dataset(args) -> bool:
+    """ADOFAI generate is selected by train.data.dataset_type, not a format= flag."""
+    data = getattr(getattr(args, "train", None), "data", None)
+    return getattr(data, "dataset_type", None) == "adofai"
+
+
+def is_untrained_model_path(model_path) -> bool:
+    if model_path is None:
+        return True
+    text = str(model_path).strip()
+    return text == "" or text.lower() in {"scratch", "untrained"}
+
+
+def timing_events_as_in_context(events: list[Event], times: list[float]) -> tuple[list[Event], list[float]]:
+    """Pass generated timing as Processor extra_in_context (Events, not osu TimingPoints)."""
+    return (list(events), list(times))
+
+
 def tokens_to_events(tokenizer, token_ids: list[int]) -> list[Event]:
     """Decode tokenizer ids to Events, skipping PAD/SOS/EOS and unknown ids."""
     events = []

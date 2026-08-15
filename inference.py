@@ -34,7 +34,13 @@ from osuT5.osuT5.utils import load_model_loaders, resolve_compatible_lora_path, 
 from osu_diffusion import DiT_models
 from osu_diffusion.config import DiffusionTrainConfig
 from adofai.converter import AdofaiConverter
-from adofai.export import adofai_output_path, apply_inference_settings
+from adofai.export import (
+    adofai_output_path,
+    apply_inference_settings,
+    is_adofai_dataset,
+    is_untrained_model_path,
+    timing_events_as_in_context,
+)
 from adofai.parser import write_adofai
 
 
@@ -358,15 +364,7 @@ def compile_derived_args(args: InferenceConfig):
 
 def is_adofai_inference(args: InferenceConfig) -> bool:
     """ADOFAI generate is selected by the train config, not a format= flag."""
-    data = getattr(getattr(args, "train", None), "data", None)
-    return getattr(data, "dataset_type", None) == "adofai"
-
-
-def is_untrained_model_path(model_path) -> bool:
-    if model_path is None:
-        return True
-    text = str(model_path).strip()
-    return text == "" or text.lower() in {"scratch", "untrained"}
+    return is_adofai_dataset(args)
 
 
 def compile_adofai_args(args: InferenceConfig, verbose=True):
@@ -554,7 +552,9 @@ def generate(
         )[0]
         if adofai:
             # Keep ADOFAI timing Events (BPM/offset/SetSpeed). Do not convert to osu TimingPoints.
-            extra_in_context[ContextType.TIMING] = (timing_events, timing_times)
+            extra_in_context[ContextType.TIMING] = timing_events_as_in_context(
+                timing_events, timing_times
+            )
         else:
             timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
             timing = postprocessor.generate_timing(timing_events)

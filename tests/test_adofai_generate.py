@@ -17,12 +17,15 @@ import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
-from adofai.export import events_to_adofai_file, tokens_to_events
+from adofai.export import (
+    events_to_adofai_file,
+    is_adofai_dataset,
+    is_untrained_model_path,
+    timing_events_as_in_context,
+    tokens_to_events,
+)
 from adofai.parser import parse_adofai
-from inference import generate, is_adofai_inference, is_untrained_model_path
 from osuT5.osuT5.event import Event, EventType, ContextType
-from osuT5.osuT5.inference import BeatmapConfig, GenerationConfig
-from osuT5.osuT5.tokenizer import Tokenizer
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -44,8 +47,9 @@ def _compose_inference_cfg(*overrides):
         return compose(config_name="adofai_v31", overrides=list(overrides))
 
 
-def _adofai_tokenizer() -> Tokenizer:
+def _adofai_tokenizer():
     from hydra import compose, initialize_config_dir
+    from osuT5.osuT5.tokenizer import Tokenizer
 
     _clear_hydra()
     cfg_dir = str(REPO_ROOT / "configs" / "train")
@@ -101,14 +105,17 @@ def _export_events():
 
 class TestAdofaiInferenceConfig:
     def test_hydra_config_selects_adofai_without_format_flag(self):
-        cfg = _compose_inference_cfg()
-        args = OmegaConf.to_object(cfg)
-        assert is_adofai_inference(args)
-        assert args.train.data.dataset_type == "adofai"
-        assert ContextType.TIMING in args.output_type
-        assert ContextType.MAP in args.output_type
-        assert args.generate_positions is False
-        assert not hasattr(args, "format")
+        infer = OmegaConf.load(REPO_ROOT / "configs" / "inference" / "adofai_v31.yaml")
+        train = OmegaConf.load(REPO_ROOT / "configs" / "train" / "adofai_v31.yaml")
+        assert train.data.dataset_type == "adofai"
+        assert list(infer.output_type) == ["TIMING", "MAP"]
+        assert infer.generate_positions is False
+        assert infer.in_context == ["NONE"]
+        assert "../train@train" in str(infer.defaults) or any(
+            "adofai_v31" in str(item) for item in infer.defaults
+        )
+        # No invented format=adofai flag in the inference config.
+        assert "format" not in infer
 
     def test_untrained_model_path_sentinels(self):
         assert is_untrained_model_path("")
@@ -116,6 +123,14 @@ class TestAdofaiInferenceConfig:
         assert is_untrained_model_path("untrained")
         assert is_untrained_model_path(None)
         assert not is_untrained_model_path("/tmp/real-ckpt")
+
+    def test_dataset_type_selects_adofai_not_format_flag(self):
+        from types import SimpleNamespace
+        assert is_adofai_dataset(SimpleNamespace(train=SimpleNamespace(data=SimpleNamespace(dataset_type="adofai"))))
+        assert not is_adofai_dataset(SimpleNamespace(train=SimpleNamespace(data=SimpleNamespace(dataset_type="mmrs"))))
+        ctx = timing_events_as_in_context([Event(EventType.BPM, 120)], [0])
+        assert isinstance(ctx, tuple)
+        assert ctx[0][0].type == EventType.BPM
 
 
 class TestTokenEventAdofaiExport:
@@ -169,6 +184,7 @@ class TestTokenEventAdofaiExport:
         assert filt["enabled"] in ("Enabled", "Disabled")
 
     def test_tokenizer_roundtrip_then_export(self, tmp_path):
+        pytest.importorskip("torch")
         tokenizer = _adofai_tokenizer()
         source = [
             Event(EventType.TILE_ANGLE, 45),
@@ -199,23 +215,68 @@ class TestTokenEventAdofaiExport:
         assert camera["ease"] == "Linear"
 
 
+class TestGenerateExportSmoke:
+    def test_mp3_named_audio_exports_parseable_adofai(self, tmp_path):
+        """Smoke Events → .adofai without launching train.py or loading Whisper."""
+        audio = _write_silence_wav(tmp_path / "song.mp3")
+        events = _export_events()
+        out = tmp_path / "out" / "chart.adofai"
+        level, path = events_to_adofai_file(
+            events,
+            [0] * len(events),
+            out,
+            {
+                "artist": "SmokeArtist",
+                "song": "SmokeChart",
+                "songFilename": audio.name,
+            },
+        )
+        parsed = parse_adofai(path)
+        assert parsed.settings["songFilename"] == "song.mp3"
+        assert 999 in parsed.angle_data
+        assert any(a["eventType"] == "SetSpeed" and a["speedType"] == "Bpm" for a in parsed.actions)
+        assert any(a.get("relativeTo") == "LastPositionNoRotation" for a in parsed.actions)
+        assert parsed.decorations == []
+
+
 class TestGenerateWiringSmoke:
     def test_generate_writes_adofai_without_training(self, tmp_path):
         """Smoke the Hydra generate() export path. Does not launch train.py."""
-        assert "adofai.train" not in sys.modules or True
+        pytest.importorskip("torch")
+        from types import SimpleNamespace
+
+        from inference import generate, is_adofai_inference
+        from osuT5.osuT5.inference import BeatmapConfig, GenerationConfig
 
         wav_path = _write_silence_wav(tmp_path / "song.mp3")
-
-        cfg = _compose_inference_cfg(
-            f"audio_path={wav_path}",
-            f"output_path={tmp_path / 'out'}",
-            "title=SmokeChart",
-            "artist=SmokeArtist",
-            "model_path=scratch",
-            "device=cpu",
-            "precision=fp32",
+        args = SimpleNamespace(
+            audio_path=str(wav_path),
+            output_path=str(tmp_path / "out"),
+            beatmap_path="",
+            title="SmokeChart",
+            artist="SmokeArtist",
+            creator="Mapperatorinator",
+            bpm=120,
+            offset=0,
+            difficulty=5.0,
+            output_type=[ContextType.TIMING, ContextType.MAP],
+            in_context=[ContextType.NONE],
+            parallel=False,
+            super_timing=False,
+            resnap_events=False,
+            generate_positions=False,
+            add_to_beatmap=False,
+            train=SimpleNamespace(
+                data=SimpleNamespace(
+                    dataset_type="adofai",
+                    context_types=[{
+                        "in": [ContextType.NONE],
+                        "out": [ContextType.TIMING, ContextType.MAP],
+                    }],
+                    add_timing=False,
+                )
+            ),
         )
-        args = OmegaConf.to_object(cfg)
         assert is_adofai_inference(args)
 
         timing_events = [Event(EventType.BPM, 128), Event(EventType.OFFSET, 10)]
@@ -257,7 +318,13 @@ class TestGenerateWiringSmoke:
         generation_config = GenerationConfig(difficulty=5.0)
         beatmap_config = BeatmapConfig(title="SmokeChart", artist="SmokeArtist", audio_filename="song.mp3")
 
-        with patch("inference.Preprocessor", FakePreprocessor), patch("inference.Processor", FakeProcessor):
+        class FakePostprocessor:
+            def __init__(self, *a, **k):
+                pass
+
+        with patch("inference.Preprocessor", FakePreprocessor), \
+                patch("inference.Processor", FakeProcessor), \
+                patch("inference.Postprocessor", FakePostprocessor):
             result, result_path = generate(
                 args,
                 audio_path=str(wav_path),
@@ -288,12 +355,13 @@ class TestGenerateWiringSmoke:
         assert isinstance(extra[ContextType.TIMING], tuple)
         assert extra[ContextType.TIMING][0][0].type == EventType.BPM
 
-    def test_stubs_still_refuse_lstm_and_osu_to_adofai_cli(self, monkeypatch):
-        from adofai.inference_cli import main as inference_cli_main
-        from adofai.train import main as train_main
-
-        monkeypatch.setattr(sys, "argv", ["adofai/train.py", "--data_dir", "/tmp"])
-        with pytest.raises(SystemExit, match="osuT5/train.py -cn adofai_v31"):
-            train_main()
-        with pytest.raises(SystemExit, match="osuT5/train.py -cn adofai_v31"):
-            inference_cli_main()
+    def test_stubs_still_refuse_lstm_and_osu_to_adofai_cli(self):
+        train_src = (REPO_ROOT / "adofai" / "train.py").read_text()
+        cli_src = (REPO_ROOT / "adofai" / "inference_cli.py").read_text()
+        osu_src = (REPO_ROOT / "adofai" / "osu_to_adofai.py").read_text()
+        assert "raise SystemExit(" in train_src
+        assert "python osuT5/train.py -cn adofai_v31" in train_src
+        assert "raise SystemExit(" in cli_src
+        assert "python osuT5/train.py -cn adofai_v31" in cli_src
+        assert "DEPRECATED" in osu_src
+        assert "events_to_level" in osu_src

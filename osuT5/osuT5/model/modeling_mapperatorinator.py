@@ -58,7 +58,11 @@ def get_backbone_model(config: MapperatorinatorConfig):
 
 
 class Mapperatorinator(PreTrainedModel, GenerationMixin):
-    __slots__ = ["spectrogram", "decoder_embedder", "encoder_embedder", "transformer", "style_embedder", "num_classes"]
+    # Do not put child modules in ``__slots__``. nn.Module.__setattr__ stores
+    # children in ``_modules`` and does not populate the slot; DDP's
+    # ``_verify_param_shape_across_processes`` walks ``_modules`` only. Rank 0
+    # then reports 0 params while ranks 1/2/3 still have the Muon 194 +
+    # AdamW 233 = 427 optimizer-split of the 478,783,248-param model.
     config_class = MapperatorinatorConfig
     base_model_prefix = "model"
     main_input_name = "frames"

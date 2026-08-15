@@ -21,6 +21,13 @@ from osuT5.utils import (
     get_optimizer,
     get_dataloaders,
     get_shared_training_state,
+    allgather_ddp_reducer_counts,
+    assert_model_ready_for_ddp,
+    assert_same_ddp_reducer_counts,
+    bind_cuda_device_from_local_rank,
+    configure_nccl_for_pcie_multigpu,
+    ddp_reducer_named_parameters,
+    sync_registered_modules,
 )
 
 
@@ -28,10 +35,12 @@ def print_model_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())  # Total parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)  # Trainable params
     frozen_params = total_params - trainable_params  # Non-trainable (frozen) params
+    reducer_tensors = len(ddp_reducer_named_parameters(model))
 
     print(f"Total Parameters: {total_params:,}")
     print(f"Trainable Parameters: {trainable_params:,}")
     print(f"Frozen Parameters: {frozen_params:,}")
+    print(f"DDP reducer parameter tensors: {reducer_tensors}")
 
 
 def get_next_checkpoint_iteration(checkpoint_root: str = "checkpoints") -> int:
@@ -54,6 +63,19 @@ def get_next_checkpoint_iteration(checkpoint_root: str = "checkpoints") -> int:
 def main(args: TrainConfig):
     args: TrainConfig = OmegaConf.to_object(args)
     checkpoint_iteration = get_next_checkpoint_iteration()
+
+    # NCCL env *before* process-group init. 4×A40 PIX/PXB (no NVLink) hung
+    # on the first DDP verify ALLGATHER (NumelIn=1 NumelOut=4); all 4 ranks
+    # timed out together. 427-vs-0 after that timeout is not an empty module.
+    nccl_defaults = configure_nccl_for_pcie_multigpu()
+    if nccl_defaults:
+        print(f"NCCL PCIe defaults applied before Accelerator(): {nccl_defaults}")
+
+    # Fork the Manager *before* any CUDA / NCCL init. Manager() after
+    # Accelerator() is CUDA+fork UB and breaks the first NCCL collective
+    # on every rank (num_workers=0 does not avoid this).
+    shared = get_shared_training_state()
+    bind_cuda_device_from_local_rank()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -79,19 +101,28 @@ def main(args: TrainConfig):
     if args.logging.run_name:
         wandb_kwargs["name"] = args.logging.run_name
 
-    accelerator.init_trackers(
-        "osuT5",
-        init_kwargs={
-            "wandb": wandb_kwargs,
-        }
-    )
-
     setup_args(args)
 
-    shared = get_shared_training_state()
-    model, tokenizer = load_model(args.pretrained_path, args, device=accelerator.device, precision=args.precision,
-                                  attn_implementation=args.attn_implementation, eval_mode=False,
-                                  gamemode=args.pretrained_gamemode)
+    # Build on CPU so every rank materializes the same param set *before*
+    # the NCCL verify allgather. All 4 A40 ranks already printed
+    # Embedding(95471, 768) / 478,783,248 / Muon 194 + AdamW 233 = 427.
+    with torch.enable_grad():
+        model, tokenizer = load_model(
+            args.pretrained_path,
+            args,
+            device="cpu",
+            precision=args.precision,
+            attn_implementation=args.attn_implementation,
+            eval_mode=False,
+            gamemode=args.pretrained_gamemode,
+        )
+    sync_registered_modules(model)
+    ddp_signature = assert_model_ready_for_ddp(model)
+    print(
+        f"[rank {accelerator.process_index}/{accelerator.num_processes}] "
+        f"DDP reducer param tensors={len(ddp_signature)} "
+        f"(Muon+AdamW split of the full model) before device move"
+    )
     train_dataloader, test_dataloader = get_dataloaders(tokenizer, args, shared)
 
     if args.enable_lora:
@@ -102,6 +133,15 @@ def main(args: TrainConfig):
         # for n, p in lora_params.items():
         #     print(n, p.sum())
         model.print_trainable_parameters()
+        sync_registered_modules(model)
+        ddp_signature = assert_model_ready_for_ddp(model)
+
+    # Move before creating the optimizer so Muon/AdamW hold the same
+    # Parameter objects DDP will wrap (not stale CPU tensors).
+    if accelerator.device.type != "cpu":
+        model.to(accelerator.device)
+        sync_registered_modules(model)
+        ddp_signature = assert_model_ready_for_ddp(model)
 
     optimizer = get_optimizer(model, args)
     scheduler = get_scheduler(optimizer, args, accelerator)
@@ -113,6 +153,19 @@ def main(args: TrainConfig):
 
     print(model)
     print_model_parameters(model)
+    sync_registered_modules(model)
+    ddp_signature = assert_model_ready_for_ddp(model)
+    # Gloo (CPU) gather of the 427-split. Does not use NCCL, so it cannot
+    # be the PIX/PXB ALLGATHER hang. 427-vs-0 after an NCCL timeout is
+    # not this check.
+    reducer_counts = allgather_ddp_reducer_counts(len(ddp_signature))
+    assert_same_ddp_reducer_counts(reducer_counts)
+    print(
+        f"[rank {accelerator.process_index}/{accelerator.num_processes}] "
+        f"Gloo reducer counts={reducer_counts} "
+        f"immediately before accelerator.prepare()"
+    )
+    accelerator.wait_for_everyone()
 
     # noinspection PyTypeChecker
     (
@@ -123,6 +176,15 @@ def main(args: TrainConfig):
         test_dataloader,
     ) = accelerator.prepare(
         model, optimizer, scheduler, train_dataloader, test_dataloader
+    )
+
+    # Rank-0 wandb after DDP wrap so tracker hooks cannot empty/freeze the
+    # unwrapped module before ``_verify_param_shape_across_processes``.
+    accelerator.init_trackers(
+        "osuT5",
+        init_kwargs={
+            "wandb": wandb_kwargs,
+        }
     )
 
     accelerator.register_for_checkpointing(tokenizer)

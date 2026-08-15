@@ -26,6 +26,17 @@ from ..model.modeling_mapperatorinator import Mapperatorinator
 from ..tokenizer import Tokenizer
 from ..config import TrainConfig
 from ..cond_size import cond_size_from_embeds
+from .ddp_utils import (
+    allgather_ddp_reducer_counts,
+    assert_identical_ddp_param_sets,
+    assert_model_ready_for_ddp,
+    assert_same_ddp_reducer_counts,
+    bind_cuda_device_from_local_rank,
+    configure_nccl_for_pcie_multigpu,
+    ddp_param_signature,
+    ddp_reducer_named_parameters,
+    sync_registered_modules,
+)
 
 
 LORA_METADATA_FILENAME = "mapperatorinator_lora_metadata.json"
@@ -387,43 +398,61 @@ def load_model_loaders(
     tokenizer = tokenizer_loader()
 
     def model_loader():
-        dtype = _precision_to_dtype(precision)
-        if not ckpt_path:
-            model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)
-            model.to(device=device, dtype=dtype)
-        elif not _is_local_custom_checkpoint(ckpt_path):
-            model = Mapperatorinator.from_pretrained(
-                ckpt_path.as_posix() if isinstance(ckpt_path, Path) else ckpt_path,
-                dtype=dtype,
-                attn_implementation=attn_implementation,
-                device_map=device,
-                subfolder=ckpt_subfolder,
-            )
-            model.generation_config.disable_compile = True
-        else:
-            model_state = torch.load(ckpt_path / "pytorch_model.bin", weights_only=True)
-            model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)
-            if t5_args.pretrained_t5_compat:
-                del model_state["shared.weight"]
-                del model_state["encoder.embed_tokens.weight"]
-                del model_state["decoder.embed_tokens.weight"]
-                del model_state["lm_head.weight"]
-                model.transformer.load_state_dict(model_state, strict=False)
+        # Grad must be on while Parameters are registered. Rank-0 wandb /
+        # inference_mode leftovers otherwise yield the DDP "0 params" crash.
+        with torch.enable_grad():
+            dtype = _precision_to_dtype(precision)
+            if not ckpt_path:
+                model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)
+                model.to(device=device, dtype=dtype)
+            elif not _is_local_custom_checkpoint(ckpt_path):
+                model = Mapperatorinator.from_pretrained(
+                    ckpt_path.as_posix() if isinstance(ckpt_path, Path) else ckpt_path,
+                    dtype=dtype,
+                    attn_implementation=attn_implementation,
+                    device_map=device,
+                    subfolder=ckpt_subfolder,
+                )
+                model.generation_config.disable_compile = True
             else:
-                model.load_state_dict(model_state)
-            model.to(device=device, dtype=dtype)
+                model_state = torch.load(ckpt_path / "pytorch_model.bin", weights_only=True)
+                model = _get_model(t5_args, tokenizer, dtype=dtype, attn_implementation=attn_implementation)
+                if t5_args.pretrained_t5_compat:
+                    del model_state["shared.weight"]
+                    del model_state["encoder.embed_tokens.weight"]
+                    del model_state["decoder.embed_tokens.weight"]
+                    del model_state["lm_head.weight"]
+                    model.transformer.load_state_dict(model_state, strict=False)
+                else:
+                    model.load_state_dict(model_state)
+                model.to(device=device, dtype=dtype)
 
-        if lora_path is not None:
-            try:
-                from peft import PeftModel
-            except ImportError:
-                raise ImportError("Please install the 'peft' library to use LoRA fine-tuning.")
-            model = PeftModel.from_pretrained(model, lora_path)
-            model = model.merge_and_unload()
-            print(f"Loaded LoRA weights from {lora_path}")
+            if lora_path is not None:
+                try:
+                    from peft import PeftModel
+                except ImportError:
+                    raise ImportError("Please install the 'peft' library to use LoRA fine-tuning.")
+                model = PeftModel.from_pretrained(model, lora_path)
+                model = model.merge_and_unload()
+                print(f"Loaded LoRA weights from {lora_path}")
 
-        if eval_mode:
-            model.eval()
+            # Re-attach children that live as attributes but dropped out of
+            # ``_modules``. Unfreezing does nothing when the module tree is
+            # empty — that was rank 0 at ``_verify_param_shape_across_processes``.
+            sync_registered_modules(model)
+            if eval_mode:
+                model.eval()
+            else:
+                model.train()
+                if not ddp_reducer_named_parameters(model):
+                    if sum(1 for _ in model.parameters()) == 0:
+                        raise RuntimeError(
+                            "load_model produced an empty module (no Parameter "
+                            "tensors). DDP would report 0 params on this rank "
+                            "against the Muon 194 + AdamW 233 = 427 split."
+                        )
+                    for param in model.parameters():
+                        param.requires_grad_(True)
 
         print(f"Model loaded: {resolved_source} on device {device}")
         return model

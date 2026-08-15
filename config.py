@@ -20,6 +20,7 @@ class InferenceConfig:
     
     # Format settings
     format: str = 'adofai'  # Output format: 'adofai' or 'osu'
+    stub: bool = False  # Use stub generation (for ADOFAI format only)
 
     # Conditional generation settings
     gamemode: Optional[int] = None  # Gamemode of the beatmap

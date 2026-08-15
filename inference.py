@@ -399,7 +399,7 @@ def generate(
             verbose=verbose,
         )
 
-        events, _ = reduce(merge_events, result)
+        events, event_times = reduce(merge_events, result)
 
         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
             timing = postprocessor.generate_timing(events)
@@ -409,6 +409,7 @@ def generate(
             events = postprocessor.resnap_events(events, timing)
     else:
         events = timing_events
+        event_times = timing_times if timing_times is not None else []
 
     # Generate positions with diffusion
     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
@@ -432,32 +433,49 @@ def generate(
     # Handle ADOFAI format export
     if args.format == "adofai":
         if output_path is not None and output_path != "":
-            # Import ADOFAI export functionality
-            from adofai.inference import create_stub_adofai
-            
             # Extract metadata
             audio_filename = Path(audio_path).name
             title = args.title or beatmap_config.title or "Generated Song"
             artist = args.artist or beatmap_config.artist or "Unknown Artist"
             creator = args.creator or beatmap_config.creator or "Mapperatorinator ADOFAI"
-            bpm = args.bpm if hasattr(args, 'bpm') else beatmap_config.bpm
-            offset = args.offset if hasattr(args, 'offset') else beatmap_config.offset
             
-            # For v1, use stub generation (model not trained on ADOFAI yet)
-            # TODO: Replace with actual event-to-ADOFAI conversion when model is retrained
-            result_path = create_stub_adofai(
-                output_path=output_path,
-                audio_filename=audio_filename,
-                bpm=bpm,
-                offset=offset,
-                title=title,
-                artist=artist,
-                creator=creator,
-            )
-            
-            if verbose:
-                print(f"Generated ADOFAI chart saved to {result_path}")
-                print("Note: This is a stub/placeholder chart. Train on ADOFAI dataset for quality generation.")
+            if args.stub:
+                # Explicit stub generation
+                from adofai.inference import create_stub_adofai
+                
+                bpm = args.bpm if hasattr(args, 'bpm') else beatmap_config.bpm
+                offset = args.offset if hasattr(args, 'offset') else beatmap_config.offset
+                
+                result_path = create_stub_adofai(
+                    output_path=output_path,
+                    audio_filename=audio_filename,
+                    bpm=bpm,
+                    offset=offset,
+                    title=title,
+                    artist=artist,
+                    creator=creator,
+                )
+                
+                if verbose:
+                    print(f"Generated ADOFAI stub chart saved to {result_path}")
+            else:
+                # Real event-to-ADOFAI conversion (primary path)
+                from adofai.osu_to_adofai import export_osu_to_adofai
+                
+                result_path = export_osu_to_adofai(
+                    events=events,
+                    times=event_times if 'event_times' in locals() else [],
+                    output_path=output_path,
+                    audio_filename=audio_filename,
+                    title=title,
+                    artist=artist,
+                    creator=creator,
+                )
+                
+                if verbose:
+                    print(f"Generated ADOFAI chart saved to {result_path}")
+                    print(f"  Converted from {len(events)} osuT5 events")
+                    print("  Note: Uses osuT5 pretrained model + event-to-ADOFAI conversion")
     else:
         # Original osu! export path
         if args.add_to_beatmap:

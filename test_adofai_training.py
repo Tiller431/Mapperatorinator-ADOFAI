@@ -243,6 +243,94 @@ def test_smoke_training():
         print("  Note: Full training loop requires running adofai/train.py")
 
 
+def test_audio_detection_mismatch():
+    """Test that audio is found even with filename mismatch."""
+    print("Testing audio_detection_mismatch...")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        chart_dir = tmpdir / "test123__MismatchTest"
+        chart_dir.mkdir()
+        
+        # Create chart with songFilename="song.ogg" but actual file is "music.ogg"
+        level = AdofaiLevel(
+            settings={
+                "version": 14,
+                "artist": "Test",
+                "song": "Test",
+                "author": "Test",
+                "songFilename": "song.ogg",  # This doesn't exist
+                "bpm": 120,
+                "offset": 0,
+                "volume": 100,
+                "pitch": 100,
+                "hitsound": "Kick",
+                "hitsoundVolume": 100,
+            },
+            angle_data=[0, 90, 180, 270],
+            actions=[]
+        )
+        
+        write_adofai(level, chart_dir / "level.adofai")
+        
+        # Create audio file with different name
+        create_silent_wav(chart_dir / "music.ogg", duration_sec=5.0)
+        
+        # Try to load as dataset entry
+        entry = AdofaiDatasetEntry(chart_dir)
+        
+        # Should find audio despite filename mismatch
+        assert entry.has_audio(), "Audio not detected with filename mismatch"
+        assert entry.audio_file is not None
+        assert entry.audio_file.name == "music.ogg"
+        
+        print("✓ Audio detection with mismatch: PASSED")
+
+
+def test_audio_detection_case_insensitive():
+    """Test that audio is found with case variations (Music.MP3, etc.)."""
+    print("Testing audio_detection_case_insensitive...")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        chart_dir = tmpdir / "test456__CaseTest"
+        chart_dir.mkdir()
+        
+        # Create chart
+        level = AdofaiLevel(
+            settings={
+                "version": 14,
+                "artist": "Test",
+                "song": "Test",
+                "author": "Test",
+                "songFilename": "audio.MP3",  # Uppercase extension
+                "bpm": 120,
+                "offset": 0,
+                "volume": 100,
+                "pitch": 100,
+                "hitsound": "Kick",
+                "hitsoundVolume": 100,
+            },
+            angle_data=[0, 90],
+            actions=[]
+        )
+        
+        write_adofai(level, chart_dir / "level.adofai")
+        
+        # Create audio with uppercase extension
+        audio_path = chart_dir / "audio.MP3"
+        create_silent_wav(audio_path, duration_sec=5.0)
+        
+        # Try to load as dataset entry
+        entry = AdofaiDatasetEntry(chart_dir)
+        
+        # Should find audio despite case difference
+        assert entry.has_audio(), "Audio not detected with uppercase extension"
+        assert entry.audio_file is not None
+        
+        print("✓ Audio detection case-insensitive: PASSED")
+
+
 if __name__ == "__main__":
     print("Running ADOFAI training pipeline tests...\n")
     
@@ -252,5 +340,7 @@ if __name__ == "__main__":
     test_tokenizer()
     test_batch_collation()
     test_smoke_training()
+    test_audio_detection_mismatch()
+    test_audio_detection_case_insensitive()
     
     print("\n✅ All training pipeline tests passed!")

@@ -70,12 +70,43 @@ class AdofaiDatasetEntry:
             self.audio_file = self._find_audio_file(chart_dir)
     
     def _find_audio_file(self, chart_dir: Path) -> Optional[Path]:
-        """Find audio file in chart directory."""
-        audio_extensions = ['.ogg', '.mp3', '.wav', '.flac', '.m4a']
-        for ext in audio_extensions:
-            audio_files = list(chart_dir.glob(f"*{ext}"))
-            if audio_files:
-                return audio_files[0]
+        """
+        Find audio file in chart directory.
+        
+        Tries multiple strategies:
+        1. Check songFilename from level.adofai settings
+        2. Scan for common audio extensions (case-insensitive)
+        """
+        # Strategy 1: Try songFilename from level.adofai
+        try:
+            from .parser import parse_adofai
+            level = parse_adofai(self.level_path)
+            song_filename = level.settings.get('songFilename', '')
+            if song_filename:
+                # Try as relative path from chart_dir
+                audio_path = chart_dir / song_filename
+                if audio_path.exists() and audio_path.is_file():
+                    return audio_path
+                
+                # Try just the basename (in case path is different)
+                from pathlib import PurePath
+                basename = PurePath(song_filename).name
+                audio_path = chart_dir / basename
+                if audio_path.exists() and audio_path.is_file():
+                    return audio_path
+        except Exception:
+            # If level parsing fails, fall through to scan
+            pass
+        
+        # Strategy 2: Scan directory for audio files (case-insensitive)
+        audio_extensions = {'.ogg', '.mp3', '.wav', '.flac', '.m4a', '.aac'}
+        
+        for file in chart_dir.iterdir():
+            if file.is_file():
+                # Check extension case-insensitively
+                if file.suffix.lower() in audio_extensions:
+                    return file
+        
         return None
     
     def has_audio(self) -> bool:

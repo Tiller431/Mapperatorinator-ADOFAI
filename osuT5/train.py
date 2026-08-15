@@ -21,6 +21,8 @@ from osuT5.utils import (
     get_optimizer,
     get_dataloaders,
     get_shared_training_state,
+    assert_model_ready_for_ddp,
+    ddp_reducer_named_parameters,
 )
 
 
@@ -28,10 +30,12 @@ def print_model_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())  # Total parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)  # Trainable params
     frozen_params = total_params - trainable_params  # Non-trainable (frozen) params
+    reducer_tensors = len(ddp_reducer_named_parameters(model))
 
     print(f"Total Parameters: {total_params:,}")
     print(f"Trainable Parameters: {trainable_params:,}")
     print(f"Frozen Parameters: {frozen_params:,}")
+    print(f"DDP reducer parameter tensors: {reducer_tensors}")
 
 
 def get_next_checkpoint_iteration(checkpoint_root: str = "checkpoints") -> int:
@@ -54,6 +58,11 @@ def get_next_checkpoint_iteration(checkpoint_root: str = "checkpoints") -> int:
 def main(args: TrainConfig):
     args: TrainConfig = OmegaConf.to_object(args)
     checkpoint_iteration = get_next_checkpoint_iteration()
+
+    # Fork the Manager *before* Accelerator touches CUDA. Manager() after
+    # init_process_group is CUDA+fork UB and can leave rank 0 with a dead
+    # context whose reducer param list is empty.
+    shared = get_shared_training_state()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -79,19 +88,27 @@ def main(args: TrainConfig):
     if args.logging.run_name:
         wandb_kwargs["name"] = args.logging.run_name
 
-    accelerator.init_trackers(
-        "osuT5",
-        init_kwargs={
-            "wandb": wandb_kwargs,
-        }
-    )
-
     setup_args(args)
 
-    shared = get_shared_training_state()
-    model, tokenizer = load_model(args.pretrained_path, args, device=accelerator.device, precision=args.precision,
-                                  attn_implementation=args.attn_implementation, eval_mode=False,
-                                  gamemode=args.pretrained_gamemode)
+    # Build on CPU so every rank materializes the same param set *before*
+    # DDP wrap. Per-rank `.to(accelerator.device)` + rank-0 wandb.watch
+    # was the 4×A40 failure: Rank 3 had 427 reducer params, rank 0 had 0.
+    with torch.enable_grad():
+        model, tokenizer = load_model(
+            args.pretrained_path,
+            args,
+            device="cpu",
+            precision=args.precision,
+            attn_implementation=args.attn_implementation,
+            eval_mode=False,
+            gamemode=args.pretrained_gamemode,
+        )
+    ddp_signature = assert_model_ready_for_ddp(model)
+    print(
+        f"[rank {accelerator.process_index}/{accelerator.num_processes}] "
+        f"DDP reducer param tensors={len(ddp_signature)} "
+        f"before accelerator.prepare()"
+    )
     train_dataloader, test_dataloader = get_dataloaders(tokenizer, args, shared)
 
     if args.enable_lora:
@@ -102,6 +119,7 @@ def main(args: TrainConfig):
         # for n, p in lora_params.items():
         #     print(n, p.sum())
         model.print_trainable_parameters()
+        ddp_signature = assert_model_ready_for_ddp(model)
 
     optimizer = get_optimizer(model, args)
     scheduler = get_scheduler(optimizer, args, accelerator)
@@ -113,6 +131,7 @@ def main(args: TrainConfig):
 
     print(model)
     print_model_parameters(model)
+    accelerator.wait_for_everyone()
 
     # noinspection PyTypeChecker
     (
@@ -123,6 +142,15 @@ def main(args: TrainConfig):
         test_dataloader,
     ) = accelerator.prepare(
         model, optimizer, scheduler, train_dataloader, test_dataloader
+    )
+
+    # Rank-0 wandb after DDP wrap so tracker hooks cannot freeze the
+    # unwrapped module (reducer would then see 0 params on rank 0).
+    accelerator.init_trackers(
+        "osuT5",
+        init_kwargs={
+            "wandb": wandb_kwargs,
+        }
     )
 
     accelerator.register_for_checkpointing(tokenizer)

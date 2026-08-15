@@ -118,8 +118,7 @@ def test_mapperatorinator_training_forward_omits_logits():
         REPO_ROOT / "osuT5" / "osuT5" / "model" / "modeling_mapperatorinator.py"
     ).read_text(encoding="utf-8")
     assert "if self.training" in src
-    after_loss = src.split("if labels is not None:")[1]
-    train_branch = after_loss.split("if self.training")[1]
+    train_branch = src.split("if self.training")[1]
     first_return = train_branch.split("return", 1)[1].split("\n", 1)[0]
     assert "Seq2SeqLMOutput(loss=loss)" in first_return
     assert "logits" not in first_return

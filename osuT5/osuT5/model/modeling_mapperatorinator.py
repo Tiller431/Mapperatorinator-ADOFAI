@@ -7,6 +7,7 @@ import torch.nn as nn
 from transformers import PreTrainedModel, GenerationMixin, WhisperForConditionalGeneration
 from transformers.modeling_outputs import Seq2SeqLMOutput, BaseModelOutput
 
+from .chunked_cross_entropy import chunked_linear_cross_entropy, decoder_hidden_states
 from .configuration_mapperatorinator import MapperatorinatorConfig
 from .spectrogram import MelSpectrogram
 
@@ -210,20 +211,34 @@ class Mapperatorinator(PreTrainedModel, GenerationMixin):
             inputs["decoder_inputs_embeds"] = self.decoder_embedder(decoder_input_ids)
             del inputs["decoder_input_ids"]
 
-        output = self.transformer.forward(**inputs)
-
+        # Training: skip the full backbone forward. That applies proj_out /
+        # lm_head over every target step and allocates [B, T, V] logits
+        # (8 × 8192 × 95471 × 2 = 11.65 GiB). Chunked CE on hidden states.
         loss = None
+        if self.training:
+            if labels is not None:
+                hidden = decoder_hidden_states(self.transformer, inputs)
+                logit_scale = None
+                if hasattr(self.transformer, "logit_scale"):
+                    logit_scale = self.transformer.logit_scale()
+                loss = chunked_linear_cross_entropy(
+                    hidden,
+                    self.get_output_embeddings(),
+                    labels,
+                    class_weight=self.loss_fn.weight,
+                    ignore_index=LABEL_IGNORE_ID,
+                    label_smoothing=getattr(self.loss_fn, "label_smoothing", 0.0),
+                    sample_weights=sample_weights,
+                    logit_scale=logit_scale,
+                )
+            return Seq2SeqLMOutput(loss=loss)
+
+        output = self.transformer.forward(**inputs)
         if labels is not None:
             unreduced_loss = self.loss_fn(torch.swapaxes(output.logits, 1, -1), labels)
             if sample_weights is not None:
                 unreduced_loss *= sample_weights.unsqueeze(1)
             loss = unreduced_loss.sum() / (labels != LABEL_IGNORE_ID).sum()
-
-        # Training: do not return 8192-tgt logits. Seq2SeqLMOutput is a
-        # Mapping; accelerate convert_to_fp32 → tensor.float() clones every
-        # bf16 field (operations.py). That copy is the first-forward OOM.
-        if self.training:
-            return Seq2SeqLMOutput(loss=loss)
 
         return Seq2SeqLMOutput(
             loss=loss,

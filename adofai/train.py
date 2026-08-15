@@ -270,6 +270,10 @@ def main():
                         help='Random seed')
     
     args = parser.parse_args()
+    raise SystemExit(
+        "adofai/train.py is not the production path. "
+        "Use: python osuT5/train.py -cn adofai_v31"
+    )
     
     # Set seed
     torch.manual_seed(args.seed)

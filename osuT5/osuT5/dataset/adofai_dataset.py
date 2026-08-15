@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import numpy.typing as npt
 import torch
 from torch.utils.data import IterableDataset
 
@@ -29,36 +28,9 @@ from .adofai_augment import (
     apply_matched_rate,
     apply_reflection,
     apply_rotation,
+    pitch_shift_same_duration,
     resolve_difficulty,
 )
-
-
-def _pitch_shift_same_duration(samples: npt.NDArray, sample_rate: int, pitch: float) -> npt.NDArray:
-    """Same-duration waveform pitch shift. Chart events stay untouched."""
-    if abs(pitch - 100.0) < 1e-6:
-        return samples
-    n_steps = float(12.0 * np.log2(pitch / 100.0))
-    waveform = torch.from_numpy(np.asarray(samples, dtype=np.float32))
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
-    try:
-        shifted = torch.nn.functional.interpolate(
-            waveform.unsqueeze(0),
-            scale_factor=100.0 / pitch,
-            mode="linear",
-            align_corners=False,
-        ).squeeze(0)
-        # interpolate changes duration; resample back to original length
-        shifted = torch.nn.functional.interpolate(
-            shifted.unsqueeze(0),
-            size=waveform.shape[-1],
-            mode="linear",
-            align_corners=False,
-        ).squeeze(0)
-        return shifted.squeeze(0).numpy()
-    except Exception as exc:
-        print(f"Warning: same-duration pitch shift failed ({exc}); using original audio")
-        return samples
 
 
 class AdofaiDataset(IterableDataset, SequenceDatasetMixin):
@@ -127,6 +99,7 @@ class AdofaiDataset(IterableDataset, SequenceDatasetMixin):
         return chart_dirs
 
     def _apply_rotation(self, angle_data, actions, rotate_deg):
+        """Rotate angleData and camera/track world pos + rotation. angleOffset/twirls/999 unchanged."""
         return apply_rotation(angle_data, actions, rotate_deg)
 
     def _apply_reflection(self, angle_data, actions, axis):
@@ -165,15 +138,15 @@ class AdofaiDataset(IterableDataset, SequenceDatasetMixin):
 
         if not self.test and random.random() < self.p_rotate:
             rotate_deg = random.uniform(0, 360)
-            aug_angles, aug_actions = apply_rotation(aug_angles, aug_actions, rotate_deg)
+            aug_angles, aug_actions = self._apply_rotation(aug_angles, aug_actions, rotate_deg)
         if not self.test and random.random() < self.p_reflect:
             axis = random.choice(self.reflect_axes)
-            aug_angles, aug_actions = apply_reflection(aug_angles, aug_actions, axis)
+            aug_angles, aug_actions = self._apply_reflection(aug_angles, aug_actions, axis)
 
         rate_factor = 1.0
         if not self.test and random.random() < self.p_rate:
             rate_factor = random.uniform(self.rate_range[0], self.rate_range[1])
-            aug_settings, aug_actions = apply_matched_rate(aug_settings, aug_actions, rate_factor)
+            aug_settings, aug_actions = self._apply_matched_rate(aug_settings, aug_actions, rate_factor)
 
         if not self.test and random.random() < self.p_pitch:
             pitch = random.uniform(self.pitch_range[0], self.pitch_range[1])
@@ -195,7 +168,7 @@ class AdofaiDataset(IterableDataset, SequenceDatasetMixin):
             return
 
         if float(aug_settings.get("pitch", 100)) != 100:
-            audio_samples = _pitch_shift_same_duration(
+            audio_samples = pitch_shift_same_duration(
                 audio_samples, self.args.sample_rate, float(aug_settings["pitch"])
             )
 

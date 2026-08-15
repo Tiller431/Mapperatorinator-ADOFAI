@@ -214,6 +214,10 @@ def generate_adofai_from_audio(
 
 
 def main():
+    raise SystemExit(
+        "adofai/inference_cli.py is not the production path. "
+        "Train with: python osuT5/train.py -cn adofai_v31"
+    )
     parser = argparse.ArgumentParser(
         description="Generate ADOFAI charts from audio using trained model"
     )

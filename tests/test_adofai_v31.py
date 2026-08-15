@@ -250,6 +250,26 @@ class TestLosslessAugmentation:
         assert actions[4]["duration"] == 4.0
         assert actions[4]["angleOffset"] == 11
 
+    def test_pitch_shift_keeps_duration_and_changes_audio(self):
+        from osuT5.osuT5.dataset.adofai_augment import pitch_shift_same_duration
+
+        sr = 16000
+        t = np.arange(sr, dtype=np.float32) / sr
+        tone = np.sin(2 * np.pi * 220 * t).astype(np.float32)
+        same = pitch_shift_same_duration(tone, sr, 100)
+        shifted = pitch_shift_same_duration(tone, sr, 150)
+        assert len(same) == len(tone)
+        assert len(shifted) == len(tone)
+        assert np.allclose(same, tone)
+        assert not np.allclose(shifted, tone, atol=1e-3)
+
+    def test_v31_config_forbids_timing_jitter(self):
+        import yaml
+
+        for name in ("configs/train/adofai_v31.yaml", "configs/train/adofai_whisper_tiny.yaml"):
+            data = yaml.safe_load(Path(name).read_text(encoding="utf-8"))
+            assert data["data"]["timing_random_offset"] == 0
+
 
 class TestConverterTimingBugs:
     """Test that converter timing bugs are fixed."""

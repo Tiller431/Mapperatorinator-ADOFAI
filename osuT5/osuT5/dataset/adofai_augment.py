@@ -89,6 +89,60 @@ def apply_reflection(angle_data: list, actions: list[dict], axis: str = "x_flip"
     ]
 
 
+def _ola_time_stretch(samples: np.ndarray, target_len: int, win: int = 1024) -> np.ndarray:
+    """Overlap-add time-stretch that keeps spectral pitch, restores duration."""
+    x = np.asarray(samples, dtype=np.float64)
+    if target_len <= 0:
+        return np.zeros(0, dtype=np.float32)
+    if len(x) == 0:
+        return np.zeros(target_len, dtype=np.float32)
+    if len(x) == target_len:
+        return x.astype(np.float32)
+    win = int(min(win, len(x), target_len))
+    if win < 8:
+        t_src = np.linspace(0.0, 1.0, len(x), endpoint=False)
+        t_dst = np.linspace(0.0, 1.0, target_len, endpoint=False)
+        return np.interp(t_dst, t_src, x).astype(np.float32)
+    hop_in = max(1, win // 4)
+    n_frames = max(1, 1 + (len(x) - win) // hop_in)
+    hop_out = max(1, int(round((target_len - win) / max(n_frames - 1, 1)))) if n_frames > 1 else 1
+    window = np.hanning(win)
+    out = np.zeros(max(target_len, (n_frames - 1) * hop_out + win) + 1, dtype=np.float64)
+    norm = np.zeros_like(out)
+    for i in range(n_frames):
+        src_start = i * hop_in
+        frame = np.zeros(win, dtype=np.float64)
+        avail = max(0, min(win, len(x) - src_start))
+        if avail:
+            frame[:avail] = x[src_start:src_start + avail]
+        dst_start = i * hop_out
+        out[dst_start:dst_start + win] += frame * window
+        norm[dst_start:dst_start + win] += window
+    norm[norm < 1e-8] = 1.0
+    return (out / norm)[:target_len].astype(np.float32)
+
+
+def pitch_shift_same_duration(samples: np.ndarray, sample_rate: int, pitch: float) -> np.ndarray:
+    """Same-duration pitch shift. Chart events stay untouched; settings.pitch is the knob.
+
+    pitch=100 is identity. Other values resample (pitch+duration) then OLA-stretch
+    back to the original length so duration is unchanged.
+    """
+    del sample_rate  # rate is unused; shift is defined by the game pitch percent
+    samples = np.asarray(samples, dtype=np.float32)
+    if samples.size == 0 or abs(float(pitch) - 100.0) < 1e-6:
+        return samples
+    ratio = float(pitch) / 100.0
+    if ratio <= 0:
+        return samples
+    n = len(samples)
+    n_pitched = max(1, int(round(n / ratio)))
+    t_src = np.linspace(0.0, 1.0, n, endpoint=False)
+    t_dst = np.linspace(0.0, 1.0, n_pitched, endpoint=False)
+    pitched = np.interp(t_dst, t_src, samples.astype(np.float64))
+    return _ola_time_stretch(pitched, n)
+
+
 def apply_matched_rate(settings: dict, actions: list[dict], rate_factor: float) -> tuple[dict, list[dict]]:
     if rate_factor == 1.0:
         return settings, actions

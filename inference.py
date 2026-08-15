@@ -33,6 +33,9 @@ from osuT5.osuT5.tokenizer import ContextType
 from osuT5.osuT5.utils import load_model_loaders, resolve_compatible_lora_path, resolve_model_checkpoint_path, get_model_checkpoint_subfolder
 from osu_diffusion import DiT_models
 from osu_diffusion.config import DiffusionTrainConfig
+from adofai.converter import AdofaiConverter
+from adofai.export import adofai_output_path, apply_inference_settings
+from adofai.parser import write_adofai
 
 
 def get_default_logger():
@@ -353,6 +356,41 @@ def compile_derived_args(args: InferenceConfig):
         args.tags = " ".join(f"{k}={v}" for k, v in tags.items())
 
 
+def is_adofai_inference(args: InferenceConfig) -> bool:
+    """ADOFAI generate is selected by the train config, not a format= flag."""
+    data = getattr(getattr(args, "train", None), "data", None)
+    return getattr(data, "dataset_type", None) == "adofai"
+
+
+def is_untrained_model_path(model_path) -> bool:
+    if model_path is None:
+        return True
+    text = str(model_path).strip()
+    return text == "" or text.lower() in {"scratch", "untrained"}
+
+
+def compile_adofai_args(args: InferenceConfig, verbose=True):
+    """Force osu-only inference features off for the ADOFAI export path."""
+    forced = {
+        "generate_positions": False,
+        "export_osz": False,
+        "add_to_beatmap": False,
+        "resnap_events": False,
+        "super_timing": False,
+        "auto_select_gamemode_model": False,
+        "snap_near_perfect_overlaps": False,
+    }
+    for key, value in forced.items():
+        if getattr(args, key) != value:
+            setattr(args, key, value)
+            if verbose:
+                print(f"ADOFAI inference: using {key} {value}")
+    if args.difficulty is None:
+        args.difficulty = 5.0
+        if verbose:
+            print("ADOFAI inference: using default difficulty 5.0")
+
+
 def compile_args(args: InferenceConfig, verbose=True):
     """Validates and populates missing args."""
     compile_device_and_seed(args, verbose=verbose)
@@ -364,6 +402,8 @@ def compile_args(args: InferenceConfig, verbose=True):
         compile_default_args(args, verbose=verbose)
 
     compile_derived_args(args)
+    if is_adofai_inference(args):
+        compile_adofai_args(args, verbose=verbose)
 
 
 def get_config(args: InferenceConfig):
@@ -490,10 +530,11 @@ def generate(
     output_type = args.output_type.copy()
     timing_model = model if timing_model is None else timing_model
     timing_tokenizer = tokenizer if timing_tokenizer is None else timing_tokenizer
+    adofai = is_adofai_inference(args)
 
     # Auto generate timing if not provided in in_context and required for the model and this output_type
     timing_events, timing_times, timing = None, None, None
-    if args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
+    if (not adofai) and args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
         super_timing_generator = SuperTimingGenerator(args, timing_model, timing_tokenizer)
         timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
         timing = postprocessor.generate_timing(timing_events)
@@ -511,17 +552,22 @@ def generate(
             beatmap_path=beatmap_path,
             verbose=verbose,
         )[0]
-        timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
-        timing = postprocessor.generate_timing(timing_events)
-        extra_in_context[ContextType.TIMING] = timing
+        if adofai:
+            # Keep ADOFAI timing Events (BPM/offset/SetSpeed). Do not convert to osu TimingPoints.
+            extra_in_context[ContextType.TIMING] = (timing_events, timing_times)
+        else:
+            timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
+            timing = postprocessor.generate_timing(timing_events)
+            extra_in_context[ContextType.TIMING] = timing
         if ContextType.TIMING in output_type:
             output_type.remove(ContextType.TIMING)
-    elif ContextType.TIMING in args.in_context or (
-            args.train.data.add_timing and any(t in args.in_context for t in [ContextType.GD, ContextType.NO_HS])):
+    elif (not adofai) and (ContextType.TIMING in args.in_context or (
+            args.train.data.add_timing and any(t in args.in_context for t in [ContextType.GD, ContextType.NO_HS]))):
         # Exact timing is provided in the other beatmap, so we don't need to generate it
         timing = [tp for tp in Beatmap.from_path(Path(beatmap_path)).timing_points if tp.parent is None]
 
     # Generate beatmap
+    event_times = timing_times
     if len(output_type) > 0:
         result = processor.generate(
             sequences=sequences,
@@ -533,16 +579,30 @@ def generate(
             verbose=verbose,
         )
 
-        events, _ = reduce(merge_events, result)
+        events, event_times = reduce(merge_events, result)
+        if adofai and timing_events:
+            events, event_times = merge_events((timing_events, timing_times), (events, event_times))
 
-        if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
+        if (not adofai) and timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
             timing = postprocessor.generate_timing(events)
 
         # Resnap timing events
-        if args.resnap_events and timing is not None:
+        if (not adofai) and args.resnap_events and timing is not None:
             events = postprocessor.resnap_events(events, timing)
     else:
         events = timing_events
+        event_times = timing_times
+
+    if adofai:
+        return _export_adofai_result(
+            args,
+            events=events or [],
+            event_times=event_times or [],
+            audio_path=audio_path,
+            output_path=output_path,
+            verbose=verbose,
+            logger=logger,
+        )
 
     # Generate positions with diffusion
     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
@@ -587,10 +647,48 @@ def generate(
     return result, result_path
 
 
+def _export_adofai_result(
+        args: InferenceConfig,
+        *,
+        events: list,
+        event_times: list,
+        audio_path: str,
+        output_path: str,
+        verbose: bool,
+        logger,
+):
+    """Write Events through events_to_level to a parseable .adofai file."""
+    result_path = adofai_output_path(output_path, args.title)
+    base_settings = {
+        "artist": args.artist or "Unknown Artist",
+        "song": args.title or "Unknown Song",
+        "author": args.creator or "Mapperatorinator",
+        "songFilename": Path(audio_path).name,
+        "levelDesc": "Generated by Mapperatorinator ADOFAI",
+    }
+    if event_times is None:
+        event_times = [0] * len(events)
+    level = AdofaiConverter().events_to_level(events, event_times, base_settings)
+    apply_inference_settings(
+        level,
+        bpm=args.bpm,
+        offset=args.offset,
+        difficulty=args.difficulty,
+        events=events,
+    )
+    write_adofai(level, result_path)
+    if verbose:
+        logger.info(f"Generated ADOFAI chart saved to {result_path}")
+    return level.to_dict(), result_path
+
+
 def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, device, max_batch_size: int = 8,
                            use_server: bool = False, precision: str = "fp32", attn_implementation: str = "sdpa",
                            eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
-                           auto_select_gamemode_model: bool = True, fast_decoder_loop: bool = False):
+                           auto_select_gamemode_model: bool = True, fast_decoder_loop: bool = False,
+                           allow_untrained: bool = False):
+    if allow_untrained and is_untrained_model_path(ckpt_path):
+        ckpt_path = None
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path=ckpt_path,
         t5_args=t5_args,
@@ -602,6 +700,7 @@ def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, d
         lora_path=lora_path,
         gamemode=gamemode,
         auto_select_gamemode_model=auto_select_gamemode_model,
+        allow_untrained=allow_untrained,
     )
 
     return InferenceClient(
@@ -687,12 +786,14 @@ def main(args: InferenceConfig):
     compile_args(args)
     setup_inference_environment(args.seed)
 
+    allow_untrained = is_adofai_inference(args) and is_untrained_model_path(args.model_path)
     model, tokenizer = load_model_with_server(args.model_path, args.train, args.device,
                                               max_batch_size=args.max_batch_size, use_server=args.use_server,
                                               precision=args.precision, attn_implementation=args.attn_implementation,
                                               lora_path=args.lora_path, gamemode=args.gamemode,
                                               auto_select_gamemode_model=args.auto_select_gamemode_model,
-                                              fast_decoder_loop=args.fast_decoder_loop)
+                                              fast_decoder_loop=args.fast_decoder_loop,
+                                              allow_untrained=allow_untrained)
 
     timing_model, timing_tokenizer = None, None
     if should_load_separate_timing_model(args):
@@ -708,6 +809,7 @@ def main(args: InferenceConfig):
             gamemode=args.gamemode,
             auto_select_gamemode_model=False,
             fast_decoder_loop=args.fast_decoder_loop,
+            allow_untrained=allow_untrained,
         )
 
     diff_model, diff_tokenizer, refine_model = None, None, None

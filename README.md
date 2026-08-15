@@ -6,22 +6,26 @@ This is a fork of [Mapperatorinator](https://github.com/OliBomby/Mapperatorinato
 
 ## Current Status
 
-**The `main` branch still contains the upstream osu! Mapperatorinator code and README.** ADOFAI-specific work is under development in pull requests:
+Foundation (PR #1) and Whisper training (PR #2) are on `main`. Generate/export wiring uses the existing Hydra entry point — there is no `format=adofai` flag.
 
-- **[PR #1: ADOFAI Foundation](https://github.com/Tiller431/Mapperatorinator-ADOFAI/pull/1)** (`cursor/adofai-foundation-5317`)  
-  LSTM-based proof-of-concept with `.adofai` parser, event representation, dataset pipeline, and training/inference scripts. Trains on log-mel spectrograms. **Not the production path.**
-
-- **[PR #2: Whisper Training Path](https://github.com/Tiller431/Mapperatorinator-ADOFAI/pull/2)** (`cursor/adofai-whisper-training-1075`)  
-  Production training using Whisper-small encoder-decoder (`Tiger14n/ropewhisper-small`) via the `osuT5` infrastructure. Implements ADOFAI vocabulary, lossless augmentations, and full event coverage (tiles, speed, camera, VFX). **This is the real training path.**
-
-**Training command (lives on PR #2, not yet on `main`):**
+**Train:**
 ```bash
 python osuT5/train.py -cn adofai_v31 data.train_dataset_path=/path/to/adofai-charts
 ```
 
-**Inference/export:** Generation and export are still being wired. The intended local path is `inference.py` with an mp3 (once ADOFAI format support is added), but that integration does not yet exist on PR #2. No trained ADOFAI checkpoint exists either.
+**Generate** (writes a parseable `.adofai` via `events_to_level`; untrained weights make garbage charts):
+```bash
+python inference.py -cn adofai_v31 \
+  audio_path=your_song.mp3 \
+  output_path=./generated \
+  model_path=/path/to/adofai_v31_checkpoint \
+  difficulty=5
+```
+
+Empty / `scratch` `model_path` initializes Whisper-small plus a random ADOFAI head for a wiring smoke only.
 
 **What works today:**
+- Generate/export wiring: `python inference.py -cn adofai_v31` writes a parseable `.adofai` from an mp3 via Events → `events_to_level` (untrained weights = garbage charts)
 - `.adofai` file I/O (UTF-8 BOM handling, trailing commas, `pathData`/`angleData`)
 - Event vocabulary: tiles (angles 0-359°, midspin 999), SetSpeed, Twirl, Pause, Hold, MultiPlanet, camera (MoveCamera with `LastPositionNoRotation`), MoveTrack (`positionOffset`), VFX (Flash, Bloom, ShakeScreen, SetFilter)
 - Training config: `configs/train/adofai_v31.yaml` (Whisper-small, difficulty conditioning ON, style/mapper/year/descriptors OFF, lossless rotate/reflect/pitch/rate augmentations, staged context: timing first, then map)
@@ -32,11 +36,9 @@ python osuT5/train.py -cn adofai_v31 data.train_dataset_path=/path/to/adofai-cha
 - Decorations, editor-only actions, and tag/descriptor conditioning are deferred.
 - `adofai/converter.py` timing calculations have known bugs; do not rely on its timestamp math as ground truth.
 
-Once the PRs merge, this README will be updated to reflect the unified state.
+## Installation
 
-## Installation (from `main` branch — osu! Mapperatorinator)
-
-The instructions below are for the **upstream osu! Mapperatorinator** currently on `main`. For ADOFAI-specific setup, see the PR branches above.
+The osu! Mapperatorinator install steps still apply (Python 3.10, ffmpeg, PyTorch, `requirements.txt`). ADOFAI train/generate commands are above.
 
 ### 1. Clone the repository
 

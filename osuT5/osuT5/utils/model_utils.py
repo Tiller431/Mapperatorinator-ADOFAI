@@ -305,7 +305,7 @@ def resolve_model_checkpoint_path(
 
 def load_model(ckpt_path: str | Path | None, t5_args: TrainConfig, device, precision: str = "fp32", attn_implementation: str = "sdpa",
                eval_mode: bool = True, pickle_module=None, gamemode: int | None = None,
-               auto_select_gamemode_model: bool = True):
+               auto_select_gamemode_model: bool = True, allow_untrained: bool = False):
     model_loader, tokenizer_loader = load_model_loaders(
         ckpt_path,
         t5_args,
@@ -316,6 +316,7 @@ def load_model(ckpt_path: str | Path | None, t5_args: TrainConfig, device, preci
         pickle_module,
         gamemode=gamemode,
         auto_select_gamemode_model=auto_select_gamemode_model,
+        allow_untrained=allow_untrained,
     )
     return model_loader(), tokenizer_loader()
 
@@ -331,10 +332,13 @@ def load_model_loaders(
         lora_path=None,
         gamemode: int | None = None,
         auto_select_gamemode_model: bool = True,
+        allow_untrained: bool = False,
 ):
     if not ckpt_path:
-        if eval_mode:
+        if eval_mode and not allow_untrained:
             raise ValueError("Model path is empty.")
+        elif allow_untrained:
+            print("No checkpoint provided; initializing untrained weights from the backbone config.")
         else:
             print("No pretrained model path provided, training from scratch.")
 

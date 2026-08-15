@@ -4,9 +4,8 @@ DEPRECATED STUB: ADOFAI inference placeholder.
 This file contains stub inference functions and should NOT be used for production generation.
 
 Production inference path:
-    1. Train Whisper model: python osuT5/train.py -cn adofai_v31
-    2. Generate using osuT5 inference with the trained ADOFAI checkpoint
-    3. Convert osuT5 Events → .adofai using adofai/converter.py
+    python inference.py -cn adofai_v31 audio_path=song.mp3 output_path=./generated model_path=/path/to/ckpt
+    (Hydra repo-root inference.py → Events → adofai/converter.py events_to_level)
 
 This stub generates random charts and does NOT use the trained Whisper model.
 """

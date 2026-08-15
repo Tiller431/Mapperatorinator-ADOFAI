@@ -12,7 +12,10 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from osuT5.osuT5.event import Event, EventType
+try:
+    from osuT5.event import Event, EventType
+except ModuleNotFoundError:
+    from osuT5.osuT5.event import Event, EventType
 
 from .converter import AdofaiConverter
 from .parser import AdofaiLevel, write_adofai

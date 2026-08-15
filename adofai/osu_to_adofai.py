@@ -20,7 +20,10 @@ import sys
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from osuT5.osuT5.event import Event, EventType
+try:
+    from osuT5.event import Event, EventType
+except ModuleNotFoundError:
+    from osuT5.osuT5.event import Event, EventType
 from adofai.event import AdofaiEvent, AdofaiEventType
 from adofai.parser import AdofaiLevel, write_adofai
 

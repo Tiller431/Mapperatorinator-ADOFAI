@@ -3,6 +3,11 @@ Converter between ADOFAI events and model tokens.
 
 This module bridges ADOFAI's event representation and the tokenizer vocabulary,
 handling conversion to/from the intermediate event format used by the model.
+
+``level_to_events`` still emits raw integers (including ANGLE_OFFSET /
+VFX_INTENSITY). ``osuT5.osuT5.adofai_vocab.BUCKET_SPECS`` is the shared
+quantize/dequantize map used by Tokenizer.encode/decode and CPU encode/decode
+before export writes reconstructed ints back through ``events_to_level``.
 """
 
 from __future__ import annotations

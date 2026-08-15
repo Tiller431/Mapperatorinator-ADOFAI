@@ -11,7 +11,13 @@ from tqdm import tqdm
 from transformers.utils import PushToHubMixin, cached_file
 
 from .dataset.data_utils import load_mmrs_metadata, filter_mmrs_metadata, filter_web_beatmaps
-from .adofai_vocab import adofai_event_ranges, adofai_input_event_ranges, encode_event, resolve_event_type
+from .adofai_vocab import (
+    adofai_event_ranges,
+    adofai_input_event_ranges,
+    dequantize_adofai_value,
+    encode_event,
+    resolve_event_type,
+)
 from .event import Event, EventType, EventRange, ContextType
 from .config import TrainConfig
 
@@ -269,11 +275,13 @@ class Tokenizer(PushToHubMixin):
         offset = self.offset
         for er in self.event_ranges:
             if offset <= token_id <= offset + er.max_value - er.min_value:
-                return Event(type=er.type, value=er.min_value + token_id - offset)
+                stored = er.min_value + token_id - offset
+                return Event(type=er.type, value=dequantize_adofai_value(er.type, stored))
             offset += er.max_value - er.min_value + 1
         for er in self.input_event_ranges:
             if offset <= token_id <= offset + er.max_value - er.min_value:
-                return Event(type=er.type, value=er.min_value + token_id - offset)
+                stored = er.min_value + token_id - offset
+                return Event(type=er.type, value=dequantize_adofai_value(er.type, stored))
             offset += er.max_value - er.min_value + 1
 
         raise ValueError(f"id {token_id} is not mapped to any event")

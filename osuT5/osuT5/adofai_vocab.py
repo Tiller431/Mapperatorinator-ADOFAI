@@ -1,11 +1,124 @@
 """ADOFAI EventRange tables and encode used by Tokenizer and smoke tests.
 
 Kept torch-free so tests can encode converter output without importing tokenizer.py.
+
+Wide signed fields (ANGLE_OFFSET, VFX_INTENSITY) use a shared signed-hybrid
+bucket map: 1-wide bins near zero, geometric bins out to the 126-set extrema
+plus headroom. Tokenizer.encode/decode and CPU encode/decode must use this
+map so train ``Embedding(vocab_size_out, 384)`` stays small while every event
+still encodes. Decode reconstructs a legal integer (not bit-exact for the
+log region). TIME_SHIFT stays a raw range plus chunking.
 """
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+
 from .event import Event, EventRange, EventType
+
+
+@dataclass(frozen=True)
+class SignedHybridBuckets:
+    """Signed buckets: exact ints in ``[-linear_abs, linear_abs]``, log beyond.
+
+    Index layout (``min_value=0``):
+    negative log (most negative first), negative linear, 0, positive linear,
+    positive log. Values outside ``[-max_abs, max_abs]`` clamp to the edge
+    bucket so encode never drops the event.
+    """
+
+    linear_abs: int
+    max_abs: int
+    log_subdiv: int = 8
+
+    @property
+    def n_log(self) -> int:
+        if self.max_abs <= self.linear_abs:
+            return 0
+        return max(1, math.ceil(math.log2(self.max_abs / self.linear_abs) * self.log_subdiv))
+
+    @property
+    def n_bins(self) -> int:
+        return 1 + 2 * self.linear_abs + 2 * self.n_log
+
+    @property
+    def zero_idx(self) -> int:
+        return self.n_log + self.linear_abs
+
+    def _log_edge(self, i: int) -> float:
+        if self.n_log == 0:
+            return float(self.linear_abs)
+        ratio = self.max_abs / self.linear_abs
+        return float(self.linear_abs) * (ratio ** (i / self.n_log))
+
+    def quantize(self, value: int) -> int:
+        value = int(value)
+        if value == 0:
+            return self.zero_idx
+        sign = 1 if value > 0 else -1
+        mag = min(abs(value), self.max_abs)
+        if mag <= self.linear_abs:
+            return self.zero_idx + sign * mag
+        lo, hi = 1, self.n_log
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if mag <= self._log_edge(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        log_idx = lo - 1
+        if sign > 0:
+            return self.zero_idx + self.linear_abs + 1 + log_idx
+        return self.n_log - 1 - log_idx
+
+    def dequantize(self, bucket: int) -> int:
+        bucket = int(bucket)
+        if bucket < 0:
+            bucket = 0
+        elif bucket >= self.n_bins:
+            bucket = self.n_bins - 1
+        if bucket == self.zero_idx:
+            return 0
+        if bucket < self.n_log:
+            log_idx = self.n_log - 1 - bucket
+            lo = self._log_edge(log_idx)
+            hi = self._log_edge(log_idx + 1)
+            return -int(round(math.sqrt(lo * hi)))
+        if bucket < self.zero_idx:
+            return -(self.zero_idx - bucket)
+        pos = bucket - self.zero_idx
+        if pos <= self.linear_abs:
+            return pos
+        log_idx = pos - self.linear_abs - 1
+        lo = self._log_edge(log_idx)
+        hi = self._log_edge(log_idx + 1)
+        return int(round(math.sqrt(lo * hi)))
+
+
+# 126-set extrema: ANGLE_OFFSET ≈ -1e8..17280, VFX_INTENSITY ±1e6. Headroom
+# covers the previous raw table edges (±2^27 / ±2^20) without 1-wide bins.
+ANGLE_OFFSET_BUCKETS = SignedHybridBuckets(linear_abs=2048, max_abs=150_000_000, log_subdiv=8)
+VFX_INTENSITY_BUCKETS = SignedHybridBuckets(linear_abs=256, max_abs=1_500_000, log_subdiv=8)
+
+BUCKET_SPECS: dict[EventType, SignedHybridBuckets] = {
+    EventType.ANGLE_OFFSET: ANGLE_OFFSET_BUCKETS,
+    EventType.VFX_INTENSITY: VFX_INTENSITY_BUCKETS,
+}
+
+
+def quantize_adofai_value(event_type: EventType, value: int) -> int:
+    spec = BUCKET_SPECS.get(event_type)
+    if spec is None:
+        return int(value)
+    return spec.quantize(value)
+
+
+def dequantize_adofai_value(event_type: EventType, stored: int) -> int:
+    spec = BUCKET_SPECS.get(event_type)
+    if spec is None:
+        return int(stored)
+    return spec.dequantize(stored)
 
 
 def adofai_event_ranges() -> list[EventRange]:
@@ -14,8 +127,9 @@ def adofai_event_ranges() -> list[EventRange]:
     Camera/VFX/gameplay bounds are widened from Tiller727/adofai-charts-v1
     (Workshop ``level.adofai``) plus known smoke overflows (zoom 1000,
     RepeatEvents 48, filter intensity 500, speed mult 1280, bloom -1752,
-    shake 4333, angleOffset -1e8, VFX intensity ±1e6). Values are stored
-    as-is; there is no clip-to-old-max (1000 must not become 400).
+    shake 4333). ANGLE_OFFSET and VFX_INTENSITY are signed-hybrid bucket
+    indices (not 2^28 / 2^21 raw bins); converter still emits raw ints and
+    encode/decode apply ``BUCKET_SPECS``. Other values stay 1-wide.
     """
     return [
         EventRange(EventType.TILE_ANGLE, 0, 359),
@@ -79,10 +193,10 @@ def adofai_event_ranges() -> list[EventRange]:
         EventRange(EventType.VFX_OPACITY, 0, 100),
         EventRange(EventType.VFX_ENABLED, 0, 1),
         EventRange(EventType.VFX_DISABLE_OTHERS, 0, 1),
-        EventRange(EventType.VFX_INTENSITY, -1_048_576, 1_048_575),
+        EventRange(EventType.VFX_INTENSITY, 0, VFX_INTENSITY_BUCKETS.n_bins - 1),
         EventRange(EventType.VFX_STRENGTH, 0, 2047),
         EventRange(EventType.VFX_THRESHOLD, 0, 100),
-        EventRange(EventType.ANGLE_OFFSET, -134_217_728, 134_217_727),
+        EventRange(EventType.ANGLE_OFFSET, 0, ANGLE_OFFSET_BUCKETS.n_bins - 1),
     ]
 
 
@@ -123,14 +237,30 @@ def encode_event(
 
     er = event_range[event_type]
     offset = event_start[event_type]
+    value = quantize_adofai_value(event_type, event.value)
 
-    if not er.min_value <= event.value <= er.max_value:
+    if not er.min_value <= value <= er.max_value:
         raise ValueError(
             f"event value {event.value} is not within range "
             f"[{er.min_value}, {er.max_value}] for event type {event.type}"
         )
 
-    return offset + event.value - er.min_value
+    return offset + value - er.min_value
+
+
+def decode_event(
+    token_id: int,
+    ranges: list[EventRange],
+    event_start: dict[EventType, int],
+) -> Event:
+    """Inverse of ``encode_event``; bucketed types reconstruct a legal int."""
+    for er in ranges:
+        start = event_start[er.type]
+        width = er.max_value - er.min_value
+        if start <= token_id <= start + width:
+            stored = er.min_value + token_id - start
+            return Event(type=er.type, value=dequantize_adofai_value(er.type, stored))
+    raise ValueError(f"id {token_id} is not mapped to any event")
 
 
 def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 1_048_575):
@@ -151,7 +281,7 @@ def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 1_04
     for er in ranges:
         event_start[er.type] = offset
         offset += er.max_value - er.min_value + 1
-    return event_range, event_start
+    return ranges, event_range, event_start
 
 
 def _encode_time_shift_chunks(
@@ -177,7 +307,7 @@ def _encode_time_shift_chunks(
 
 def encode_adofai_events(events: list[Event], num_diff_classes: int = 24) -> list[int]:
     """Encode a converter event stream with the ADOFAI EventRange tables."""
-    event_range, event_start = _adofai_encode_tables(num_diff_classes=num_diff_classes)
+    _ranges, event_range, event_start = _adofai_encode_tables(num_diff_classes=num_diff_classes)
     tokens: list[int] = []
     for event in events:
         event_type = resolve_event_type(event.type, event_range)
@@ -186,3 +316,9 @@ def encode_adofai_events(events: list[Event], num_diff_classes: int = 24) -> lis
         else:
             tokens.append(encode_event(event, event_range, event_start))
     return tokens
+
+
+def decode_adofai_events(token_ids: list[int], num_diff_classes: int = 24) -> list[Event]:
+    """Decode CPU encode tokens; bucketed fields become reconstructed ints."""
+    ranges, _event_range, event_start = _adofai_encode_tables(num_diff_classes=num_diff_classes)
+    return [decode_event(int(token_id), ranges, event_start) for token_id in token_ids]

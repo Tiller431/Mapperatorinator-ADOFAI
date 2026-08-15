@@ -132,7 +132,11 @@ def encode_event(
     return offset + event.value - er.min_value
 
 
-def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 4096):
+def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 1_048_575):
+    # Converter emits absolute ms. 4096 overflowed real Workshop charts
+    # (first fail 4437; 126-chart max 921354). 2^20-1 plus chunking means
+    # TIME_SHIFT is never dropped. Training Tokenizer still computes its
+    # own windowed range from sequence length.
     ranges = [
         EventRange(EventType.TIME_SHIFT, 0, max_time_shift),
         EventRange(EventType.SNAPPING, 0, 16),
@@ -149,7 +153,35 @@ def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 4096
     return event_range, event_start
 
 
+def _encode_time_shift_chunks(
+    value: int,
+    event_range: dict[EventType, EventRange],
+    event_start: dict[EventType, int],
+) -> list[int]:
+    """Encode one TIME_SHIFT, splitting values above the table max (no drop)."""
+    er = event_range[EventType.TIME_SHIFT]
+    value = int(value)
+    if value < er.min_value:
+        raise ValueError(
+            f"event value {value} is not within range "
+            f"[{er.min_value}, {er.max_value}] for event type {EventType.TIME_SHIFT}"
+        )
+    tokens = []
+    while value > er.max_value:
+        tokens.append(encode_event(Event(EventType.TIME_SHIFT, er.max_value), event_range, event_start))
+        value -= er.max_value
+    tokens.append(encode_event(Event(EventType.TIME_SHIFT, value), event_range, event_start))
+    return tokens
+
+
 def encode_adofai_events(events: list[Event], num_diff_classes: int = 24) -> list[int]:
     """Encode a converter event stream with the ADOFAI EventRange tables."""
     event_range, event_start = _adofai_encode_tables(num_diff_classes=num_diff_classes)
-    return [encode_event(event, event_range, event_start) for event in events]
+    tokens: list[int] = []
+    for event in events:
+        event_type = resolve_event_type(event.type, event_range)
+        if event_type == EventType.TIME_SHIFT:
+            tokens.extend(_encode_time_shift_chunks(event.value, event_range, event_start))
+        else:
+            tokens.append(encode_event(event, event_range, event_start))
+    return tokens

@@ -15,6 +15,50 @@ except ModuleNotFoundError:
     from osuT5.osuT5.event import Event, EventType
 from .parser import AdofaiLevel
 
+# SharpFAI EventEnums numeric / on-disk meanings. Not ADOFAI-JS aliases (CW/CCW).
+# AngleCorrectionDirection: Backward=-1, None=0, Forward=1
+# PlanetCount: TwoPlanets=2, ThreePlanets=3
+_SHARPFAI_INT_ENUMS = {
+    "Backward": -1,
+    "Forward": 1,
+    "None": 0,
+    "TwoPlanets": 2,
+    "ThreePlanets": 3,
+}
+
+
+def _coerce_int(value, default: int = 0) -> int:
+    """int() that accepts null and known SharpFAI enum strings."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        if value in _SHARPFAI_INT_ENUMS:
+            return _SHARPFAI_INT_ENUMS[value]
+        try:
+            return int(float(value))
+        except ValueError:
+            return default
+    return default
+
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_xy(pos, default_x: int = 0, default_y: int = 0) -> tuple[int, int]:
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+        return default_x, default_y
+    return _coerce_int(pos[0], default_x), _coerce_int(pos[1], default_y)
+
 
 class AdofaiConverter:
     """
@@ -62,8 +106,10 @@ class AdofaiConverter:
         ]
         self.tile_anchors = ["ThisTile", "Start", "End"]
     
-    def _ease_to_id(self, ease: str) -> int:
+    def _ease_to_id(self, ease) -> int:
         """Convert ease type string to ID."""
+        if not isinstance(ease, str):
+            return 0
         try:
             return self.ease_types.index(ease)
         except ValueError:
@@ -75,8 +121,10 @@ class AdofaiConverter:
             return self.ease_types[ease_id]
         return "Linear"
     
-    def _relative_to_id(self, relative: str) -> int:
+    def _relative_to_id(self, relative) -> int:
         """Convert relativeTo string to ID."""
+        if not isinstance(relative, str):
+            return 0
         try:
             return self.relative_to_types.index(relative)
         except ValueError:
@@ -128,9 +176,9 @@ class AdofaiConverter:
     def _tile_ref_to_id(self, ref) -> int:
         if not isinstance(ref, (list, tuple)) or len(ref) < 2:
             return 64 * 4
-        offset = max(-64, min(64, int(ref[0])))
+        offset = max(-64, min(64, _coerce_int(ref[0], 0)))
         try:
-            anchor = self.tile_anchors.index(ref[1])
+            anchor = self.tile_anchors.index(ref[1]) if isinstance(ref[1], str) else 0
         except ValueError:
             anchor = 0
         return (offset + 64) * 4 + anchor
@@ -159,24 +207,24 @@ class AdofaiConverter:
         
         # Extract initial settings
         settings = level.settings
-        initial_bpm = settings.get("bpm", 100)
-        offset = settings.get("offset", 0)
+        initial_bpm = _coerce_float(settings.get("bpm", 100), 100)
+        offset = _coerce_int(settings.get("offset", 0), 0)
         
         # Add metadata events at the start
-        events.append(Event(EventType.BPM, int(initial_bpm)))
+        events.append(Event(EventType.BPM, _coerce_int(initial_bpm, 100)))
         event_times.append(0)
         
-        events.append(Event(EventType.OFFSET, int(offset)))
+        events.append(Event(EventType.OFFSET, offset))
         event_times.append(0)
 
-        pitch = settings.get("pitch", 100)
-        events.append(Event(EventType.PITCH, int(pitch)))
+        pitch = _coerce_int(settings.get("pitch", 100), 100)
+        events.append(Event(EventType.PITCH, pitch))
         event_times.append(0)
         
         # Add difficulty if available
         difficulty = settings.get("difficulty", None)
         if difficulty is not None:
-            events.append(Event(EventType.DIFFICULTY, int(difficulty)))
+            events.append(Event(EventType.DIFFICULTY, _coerce_int(difficulty, 0)))
             event_times.append(0)
         
         # Track state for timing calculations
@@ -206,16 +254,16 @@ class AdofaiConverter:
                     if event_type == "SetSpeed":
                         speed_type = action.get("speedType", "Bpm")
                         if speed_type == "Bpm":
-                            new_bpm = action.get("beatsPerMinute", current_bpm)
-                            events.append(Event(EventType.SET_SPEED_BPM, int(new_bpm)))
+                            new_bpm = _coerce_float(action.get("beatsPerMinute", current_bpm), current_bpm)
+                            events.append(Event(EventType.SET_SPEED_BPM, _coerce_int(new_bpm, int(current_bpm))))
                             event_times.append(current_time)
                             current_bpm = new_bpm
                         elif speed_type == "Multiplier":
-                            multiplier = float(action.get("bpmMultiplier", 1.0))
+                            multiplier = _coerce_float(action.get("bpmMultiplier", 1.0), 1.0)
                             events.append(Event(EventType.SET_SPEED_MULT, int(round(multiplier * 10))))
                             event_times.append(current_time)
                             current_bpm *= multiplier
-                        events.append(Event(EventType.ANGLE_OFFSET, int(action.get("angleOffset", 0))))
+                        events.append(Event(EventType.ANGLE_OFFSET, _coerce_int(action.get("angleOffset", 0), 0)))
                         event_times.append(current_time)
                     
                     elif event_type == "Twirl":
@@ -224,21 +272,21 @@ class AdofaiConverter:
                         event_times.append(current_time)
                     
                     elif event_type == "Pause":
-                        duration = float(action.get("duration", 1.0))
+                        duration = _coerce_float(action.get("duration", 1.0), 1.0)
                         events.append(Event(EventType.PAUSE, int(round(duration * 10))))
                         event_times.append(current_time)
-                        events.append(Event(EventType.PAUSE_COUNTDOWN, int(action.get("countdownTicks", 0))))
+                        events.append(Event(EventType.PAUSE_COUNTDOWN, _coerce_int(action.get("countdownTicks", 0), 0)))
                         event_times.append(current_time)
-                        angle_dir = int(action.get("angleCorrectionDir", -1))
+                        angle_dir = _coerce_int(action.get("angleCorrectionDir", -1), -1)
                         events.append(Event(EventType.PAUSE_ANGLE_DIR, { -1: 0, 0: 1, 1: 2 }.get(angle_dir, 0)))
                         event_times.append(current_time)
                         pending_pause_ms += duration * (60000.0 / current_bpm)
                     
                     elif event_type == "Hold":
-                        duration = float(action.get("duration", 1.0))
+                        duration = _coerce_float(action.get("duration", 1.0), 1.0)
                         events.append(Event(EventType.HOLD, int(round(duration * 10))))
                         event_times.append(current_time)
-                        events.append(Event(EventType.HOLD_DISTANCE, int(action.get("distanceMultiplier", 100))))
+                        events.append(Event(EventType.HOLD_DISTANCE, _coerce_int(action.get("distanceMultiplier", 100), 100)))
                         event_times.append(current_time)
                         landing = action.get("landingAnimation", False)
                         events.append(Event(EventType.HOLD_LANDING, self._enabled_to_id(landing) if not isinstance(landing, bool) else int(landing)))
@@ -260,26 +308,24 @@ class AdofaiConverter:
                         events.append(Event(EventType.MOVE_CAMERA, 1))
                         event_times.append(current_time)
                         
-                        # Position (quantized to grid, default 0,0)
-                        pos = action.get("position", [0, 0])
-                        events.append(Event(EventType.CAMERA_POSITION_X, int(pos[0])))
+                        # Position (quantized to grid, default 0,0). Workshop files use [null, null].
+                        pos_x, pos_y = _coerce_xy(action.get("position", [0, 0]))
+                        events.append(Event(EventType.CAMERA_POSITION_X, pos_x))
                         event_times.append(current_time)
-                        events.append(Event(EventType.CAMERA_POSITION_Y, int(pos[1])))
+                        events.append(Event(EventType.CAMERA_POSITION_Y, pos_y))
                         event_times.append(current_time)
                         
                         # Rotation (quantized to degrees)
-                        rotation = action.get("rotation", 0)
-                        events.append(Event(EventType.CAMERA_ROTATION, int(rotation)))
+                        events.append(Event(EventType.CAMERA_ROTATION, _coerce_int(action.get("rotation", 0), 0)))
                         event_times.append(current_time)
                         
                         # Zoom (quantized to percentage)
-                        zoom = action.get("zoom", 100)
-                        events.append(Event(EventType.CAMERA_ZOOM, int(zoom)))
+                        events.append(Event(EventType.CAMERA_ZOOM, _coerce_int(action.get("zoom", 100), 100)))
                         event_times.append(current_time)
                         
                         # Duration in beats, quantized to 0.1-beat steps
-                        duration = action.get("duration", 1.0)
-                        events.append(Event(EventType.CAMERA_DURATION, int(round(float(duration) * 10))))
+                        duration = _coerce_float(action.get("duration", 1.0), 1.0)
+                        events.append(Event(EventType.CAMERA_DURATION, int(round(duration * 10))))
                         event_times.append(current_time)
                         
                         # Ease type (string -> enum ID)
@@ -293,26 +339,26 @@ class AdofaiConverter:
                         relative_id = self._relative_to_id(relative_to)
                         events.append(Event(EventType.CAMERA_RELATIVE, relative_id))
                         event_times.append(current_time)
-                        events.append(Event(EventType.ANGLE_OFFSET, int(action.get("angleOffset", 0))))
+                        events.append(Event(EventType.ANGLE_OFFSET, _coerce_int(action.get("angleOffset", 0), 0)))
                         event_times.append(current_time)
                     
                     elif event_type == "MoveTrack":
                         events.append(Event(EventType.MOVE_TRACK, 1))
                         event_times.append(current_time)
-                        pos_offset = action.get("positionOffset", [0, 0])
-                        events.append(Event(EventType.CAMERA_POSITION_X, int(pos_offset[0])))
+                        pos_x, pos_y = _coerce_xy(action.get("positionOffset", [0, 0]))
+                        events.append(Event(EventType.CAMERA_POSITION_X, pos_x))
                         event_times.append(current_time)
-                        events.append(Event(EventType.CAMERA_POSITION_Y, int(pos_offset[1])))
+                        events.append(Event(EventType.CAMERA_POSITION_Y, pos_y))
                         event_times.append(current_time)
                         events.append(Event(EventType.TRACK_START_TILE, self._tile_ref_to_id(action.get("startTile", [0, "ThisTile"]))))
                         event_times.append(current_time)
                         events.append(Event(EventType.TRACK_END_TILE, self._tile_ref_to_id(action.get("endTile", [0, "ThisTile"]))))
                         event_times.append(current_time)
-                        events.append(Event(EventType.CAMERA_DURATION, int(round(float(action.get("duration", 1.0)) * 10))))
+                        events.append(Event(EventType.CAMERA_DURATION, int(round(_coerce_float(action.get("duration", 1.0), 1.0) * 10))))
                         event_times.append(current_time)
                         events.append(Event(EventType.CAMERA_EASE, self._ease_to_id(action.get("ease", "Linear"))))
                         event_times.append(current_time)
-                        events.append(Event(EventType.ANGLE_OFFSET, int(action.get("angleOffset", 0))))
+                        events.append(Event(EventType.ANGLE_OFFSET, _coerce_int(action.get("angleOffset", 0), 0)))
                         event_times.append(current_time)
                     
                     # Must-have gameplay events
@@ -326,7 +372,7 @@ class AdofaiConverter:
                         event_times.append(current_time)
                     
                     elif event_type == "SetPlanetRotation":
-                        ease_parts = action.get("easeParts", 1)
+                        ease_parts = _coerce_int(action.get("easeParts", 1), 1)
                         events.append(Event(EventType.SET_PLANET_ROTATION, ease_parts))
                         event_times.append(current_time)
                     
@@ -343,17 +389,15 @@ class AdofaiConverter:
                         event_times.append(current_time)
                     
                     elif event_type == "ScaleMargin":
-                        scale = action.get("scale", 100)
-                        events.append(Event(EventType.SCALE_MARGIN, int(scale)))
+                        events.append(Event(EventType.SCALE_MARGIN, _coerce_int(action.get("scale", 100), 100)))
                         event_times.append(current_time)
                     
                     elif event_type == "ScaleRadius":
-                        scale = action.get("scale", 100)
-                        events.append(Event(EventType.SCALE_RADIUS, int(scale)))
+                        events.append(Event(EventType.SCALE_RADIUS, _coerce_int(action.get("scale", 100), 100)))
                         event_times.append(current_time)
                     
                     elif event_type == "Multitap":
-                        presses = action.get("presses", 2)
+                        presses = _coerce_int(action.get("presses", 2), 2)
                         events.append(Event(EventType.MULTITAP, presses))
                         event_times.append(current_time)
                     
@@ -368,12 +412,12 @@ class AdofaiConverter:
                     
                     # Track events
                     elif event_type == "PositionTrack":
-                        pos = action.get("position", [0, 0])
+                        pos_x, pos_y = _coerce_xy(action.get("position", action.get("positionOffset", [0, 0])))
                         events.append(Event(EventType.POSITION_TRACK, 1))
                         event_times.append(current_time)
-                        events.append(Event(EventType.CAMERA_POSITION_X, int(pos[0])))
+                        events.append(Event(EventType.CAMERA_POSITION_X, pos_x))
                         event_times.append(current_time)
-                        events.append(Event(EventType.CAMERA_POSITION_Y, int(pos[1])))
+                        events.append(Event(EventType.CAMERA_POSITION_Y, pos_y))
                         event_times.append(current_time)
                     
                     elif event_type == "ColorTrack":
@@ -412,7 +456,7 @@ class AdofaiConverter:
                     
                     # Control flow events
                     elif event_type == "RepeatEvents":
-                        repetitions = action.get("repetitions", 1)
+                        repetitions = _coerce_int(action.get("repetitions", 1), 1)
                         events.append(Event(EventType.REPEAT_EVENTS, repetitions))
                         event_times.append(current_time)
                     
@@ -425,40 +469,40 @@ class AdofaiConverter:
                         event_times.append(current_time)
                     
                     elif event_type == "Flash":
-                        events.append(Event(EventType.FLASH, int(round(float(action.get("duration", 1.0)) * 10))))
+                        events.append(Event(EventType.FLASH, int(round(_coerce_float(action.get("duration", 1.0), 1.0) * 10))))
                         event_times.append(current_time)
                         plane = 0 if action.get("plane", "Foreground") == "Background" else 1
                         events.append(Event(EventType.VFX_PLANE, plane))
                         event_times.append(current_time)
                         events.append(Event(EventType.VFX_COLOR, self._hex_to_color_id(action.get("startColor", "ffffff"))))
                         event_times.append(current_time)
-                        events.append(Event(EventType.VFX_OPACITY, int(action.get("startOpacity", 100))))
+                        events.append(Event(EventType.VFX_OPACITY, _coerce_int(action.get("startOpacity", 100), 100)))
                         event_times.append(current_time)
                         events.append(Event(EventType.VFX_COLOR, self._hex_to_color_id(action.get("endColor", "ffffff"))))
                         event_times.append(current_time)
-                        events.append(Event(EventType.VFX_OPACITY, int(action.get("endOpacity", 0))))
+                        events.append(Event(EventType.VFX_OPACITY, _coerce_int(action.get("endOpacity", 0), 0)))
                         event_times.append(current_time)
-                        events.append(Event(EventType.ANGLE_OFFSET, int(action.get("angleOffset", 0))))
+                        events.append(Event(EventType.ANGLE_OFFSET, _coerce_int(action.get("angleOffset", 0), 0)))
                         event_times.append(current_time)
                         events.append(Event(EventType.CAMERA_EASE, self._ease_to_id(action.get("ease", "Linear"))))
                         event_times.append(current_time)
                     
                     elif event_type == "Bloom":
                         enabled = self._enabled_to_id(action.get("enabled", "Enabled"))
-                        intensity = int(action.get("intensity", 100))
+                        intensity = _coerce_int(action.get("intensity", 100), 100)
                         events.append(Event(EventType.BLOOM, intensity if enabled else 0))
                         event_times.append(current_time)
                         events.append(Event(EventType.VFX_ENABLED, enabled))
                         event_times.append(current_time)
-                        events.append(Event(EventType.VFX_THRESHOLD, int(action.get("threshold", 50))))
+                        events.append(Event(EventType.VFX_THRESHOLD, _coerce_int(action.get("threshold", 50), 50)))
                         event_times.append(current_time)
                         events.append(Event(EventType.VFX_COLOR, self._hex_to_color_id(action.get("color", "ffffff"))))
                         event_times.append(current_time)
                     
                     elif event_type == "ShakeScreen":
-                        events.append(Event(EventType.SHAKE_SCREEN, int(action.get("intensity", 100))))
+                        events.append(Event(EventType.SHAKE_SCREEN, _coerce_int(action.get("intensity", 100), 100)))
                         event_times.append(current_time)
-                        events.append(Event(EventType.VFX_STRENGTH, int(action.get("strength", 100))))
+                        events.append(Event(EventType.VFX_STRENGTH, _coerce_int(action.get("strength", 100), 100)))
                         event_times.append(current_time)
                     
                     elif event_type == "SetFilter":
@@ -466,7 +510,7 @@ class AdofaiConverter:
                         event_times.append(current_time)
                         events.append(Event(EventType.VFX_ENABLED, self._enabled_to_id(action.get("enabled", "Enabled"))))
                         event_times.append(current_time)
-                        events.append(Event(EventType.VFX_INTENSITY, int(action.get("intensity", 100))))
+                        events.append(Event(EventType.VFX_INTENSITY, _coerce_int(action.get("intensity", 100), 100)))
                         event_times.append(current_time)
                         events.append(Event(EventType.VFX_DISABLE_OTHERS, self._enabled_to_id(action.get("disableOthers", False))))
                         event_times.append(current_time)
@@ -506,9 +550,9 @@ class AdofaiConverter:
                 events.append(Event(EventType.MIDSPIN, 0))
                 event_times.append(current_time)
             else:
-                events.append(Event(EventType.TIME_SHIFT, int(current_time)))
+                events.append(Event(EventType.TIME_SHIFT, _coerce_int(current_time, 0)))
                 event_times.append(current_time)
-                events.append(Event(EventType.TILE_ANGLE, int(round(float(tile_angle))) % 360))
+                events.append(Event(EventType.TILE_ANGLE, int(round(_coerce_float(tile_angle, 0))) % 360))
                 event_times.append(current_time)
 
             # Pause is a wait on this tile after arrival, before leaving for the next tile.

@@ -1,0 +1,25 @@
+defaults:
+  - default
+  - ../train@train: adofai_v31
+  - ../diffusion@diffusion: v1
+  - _self_
+
+# Trained adofai_v31 checkpoint directory, Hugging Face repo, or empty/untrained
+# to init Whisper-small + a random ADOFAI head (garbage charts; wiring smoke only).
+model_path: ''
+version: 'ADOFAI v31'
+output_type: [TIMING, MAP]   # Staged: timing first, then notes/angles
+in_context: [NONE]
+generate_positions: false    # ADOFAI uses tile angles, not osu XY diffusion
+resnap_events: false         # No osu snap divisors
+super_timing: false          # osu SuperTimingGenerator is not the ADOFAI timing vocab
+snap_near_perfect_overlaps: false
+export_osz: false
+add_to_beatmap: false
+auto_select_gamemode_model: false
+use_server: false
+fast_decoder_loop: false
+precision: 'fp32'
+temperature: 0.9
+top_p: 0.9
+max_batch_size: 4

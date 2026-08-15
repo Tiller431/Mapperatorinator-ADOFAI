@@ -248,24 +248,27 @@ python osuT5/train.py -cn adofai_v31 \
 - Logs: `tensorboard_logs/`
 - Final vocab size: ~10k-15k tokens (depends on event range quantization)
 
-### Generation (two-pass, like osu!)
+### Generation (staged timing → map, then events_to_level)
 
-After training, generate charts using osuT5 inference:
+The real entry point is repo-root Hydra `inference.py` with `configs/inference/adofai_v31.yaml`. There is no `format=adofai` flag; ADOFAI export is selected because that config sets `train.data.dataset_type=adofai`.
 
 ```bash
-python osuT5/inference.py \
-  checkpoint_path=outputs/<timestamp>/checkpoints/step_65536.pt \
-  audio_path=your_song.ogg \
+python inference.py -cn adofai_v31 \
+  audio_path=your_song.mp3 \
   output_path=./generated \
-  format=adofai \
-  difficulty=12
+  model_path=/path/to/adofai_v31_checkpoint \
+  difficulty=5 \
+  title="Song Title" \
+  artist="Artist"
 ```
 
-Generation is **staged** (v29/v31 style):
-1. **Pass 1:** Timing context (BPM, offset, SetSpeed, timing points)
-2. **Pass 2:** Full chart (tiles, angles, midspin, Twirl, camera, VFX) conditioned on Pass 1
+Untrained / empty `model_path` (or `model_path=scratch`) initializes Whisper-small plus a random ADOFAI head so the wiring can write a parseable `.adofai`. Those charts are garbage until you train.
 
-**Note:** Generation code for ADOFAI is in progress. Current path: osuT5 model outputs tokens → converter decodes to Events → `adofai/converter.py` events_to_level() → write .adofai file.
+Generation is **staged** (matches `adofai_v31` `context_types`):
+1. **Pass 1:** Timing context (BPM, offset, SetSpeed, Pause, Hold)
+2. **Pass 2:** Notes/angles (tiles, midspin 999, Twirl, camera, VFX) conditioned on Pass 1 Events — not osu TimingPoints
+
+Export: Processor Events → `adofai/converter.py` `events_to_level()` → write `.adofai` with SharpFAI on-disk keys. Decorations stay empty.
 
 ## Evaluation Ideas
 
@@ -293,7 +296,7 @@ Manual playtesting is essential — ADOFAI is very sensitive to timing precision
 1. Collect a serious ADOFAI set (orders of magnitude more chart+audio pairs than 126).
 2. Smoke: `python osuT5/train.py -cn adofai_whisper_tiny`
 3. Full train on Colab Pro A100/L4 or 4090: `python osuT5/train.py -cn adofai_v31 data.train_dataset_path=/path/to/charts`
-4. Generate with the trained Whisper checkpoint, then `events_to_level` export.
+4. Generate: `python inference.py -cn adofai_v31 audio_path=song.mp3 output_path=./generated model_path=/path/to/ckpt difficulty=5`
 
 ## References
 

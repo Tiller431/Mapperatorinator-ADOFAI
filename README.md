@@ -345,6 +345,7 @@ Use the provided Colab notebook for easy cloud training with free GPU:
 - No local setup needed
 - Saves to Google Drive
 - Guided step-by-step
+- Dataset: Upload `adofai-top100.tar.gz` to `MyDrive/adofai-dataset/` or access the [shared Drive folder](https://drive.google.com/drive/folders/1lATJxQI8P3uLsRtiC7ay5u3SrFhH1cfd)
 
 #### Option 2: Local Training
 

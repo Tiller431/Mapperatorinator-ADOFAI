@@ -191,7 +191,7 @@ Use the provided Colab notebook for easy cloud training:
 
 **Requirements**:
 - Google account
-- ADOFAI charts organized in Drive: `MyDrive/adofai-dataset/charts-top100/<id>__<name>/level.adofai` + audio
+- ADOFAI charts: Upload `adofai-top100.tar.gz` to `MyDrive/adofai-dataset/` or access the [shared Drive folder](https://drive.google.com/drive/folders/1lATJxQI8P3uLsRtiC7ay5u3SrFhH1cfd) (notebook auto-extracts to `charts-top100/<id>__<name>/level.adofai` + audio)
 
 ---
 

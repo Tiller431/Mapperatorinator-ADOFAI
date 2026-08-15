@@ -1,0 +1,88 @@
+defaults:
+  - default
+  - ../model@model: whisper_small_v2
+  - _self_
+
+compile: true          # PyTorch 2.0 optimization
+mixed_precision: 'bf16'         # Enable mixed precision (no/fp16/bf16)
+
+data:                  # Data settings
+  dataset_type: "adofai"
+  train_dataset_path: "/workspace/datasets/adofai-top100"  # Placeholder: user should override
+  test_dataset_path: "/workspace/datasets/adofai-top100"
+  train_dataset_start: 0
+  train_dataset_end: 113  # 90% of 126 charts
+  test_dataset_start: 113
+  test_dataset_end: 126
+  num_classes: 0  # Not used for ADOFAI
+  
+  # ADOFAI lossless augmentation (LOCKED SETS, not cartesian product)
+  # Sampling: pick ONE geometric (rotate/reflect/identity), THEN independently maybe rate, maybe pitch
+  adofai_identity_augment: true    # Include identity (no transform)
+  adofai_rotate_augment: true      # Include 8 rotations (0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°)
+  adofai_reflect_augment: true     # Include 4 reflections (X, Y, y=x, y=-x) + floor-0 Twirl
+  adofai_matched_rate_factors: [1.0]  # Matched rate: [0.9, 1.0, 1.1, 1.2] or [1.0] to disable
+  adofai_pitch_shifts: [100]       # Pitch (settings.pitch): [90, 100, 110] or [100] to disable
+  # Geometric pool size: 1 identity + 8 rotations + 4 reflects = 13
+  # Total variants per chart: 13 × len(rates) × len(pitches)
+  
+  # Special Prefix Tokens (ADOFAI configuration)
+  add_out_context_types: true  # Add tokens indicating types of the out context
+  add_gamemode_token: false    # ADOFAI has no gamemode
+  add_style_token: false       # Tyler: NO style tags
+  add_diff_token: true         # Researcher + v29: difficulty ON
+  add_mapper_token: false      # Tyler: NO mapper tags
+  add_year_token: false        # Tyler: NO year tags
+  add_hitsounded_token: false  # Not applicable to ADOFAI
+  add_song_length_token: false
+  add_global_sv_token: false   # ADOFAI uses SetSpeed, not osu SV
+  add_cs_token: false          # Not applicable
+  add_keycount_token: false    # Not applicable
+  add_hold_note_ratio_token: false
+  add_scroll_speed_ratio_token: false
+  add_descriptors: false       # Tyler: NO descriptors
+  add_sv_special_token: false
+  add_kiai_special_token: false
+  add_song_position_token: false
+  
+  # Difficulty configuration
+  num_diff_classes: 24         # RBF bins for difficulty embedding
+  max_diff: 20                 # Max difficulty value
+  
+  # ---
+  timing_random_offset: 2
+  src_seq_len: 4096            # v31: longer context (32.8s @ 16kHz, hop 128)
+  tgt_seq_len: 8192            # v31: longer target
+  rhythm_weight: 1.0           # v31/v29: Weight of rhythm tokens in loss
+  
+  context_types:               # ADOFAI context: timing first, then notes/actions
+    - "in": ['${context_type:none}']
+      "out": ['${context_type:timing}', '${context_type:map}']
+  
+  context_weights: [1]
+  
+  add_timing: false      # Interweave timing tokens with the beatmap tokens
+  add_snapping: false    # ADOFAI doesn't use snap divisors like osu
+  add_timing_points: false
+  add_hitsounds: false   # ADOFAI hitsounds are separate events
+  add_pre_tokens: false
+  per_track: false
+  add_distances: false   # Not applicable to ADOFAI
+  add_positions: false   # ADOFAI uses angles, not XY positions
+  dt_augment_prob: 0.0   # No DT augmentation (use pitch shift instead if needed)
+  types_first: true      # Put the type token at the start of the group
+  add_kiai: false
+  gamemodes: []          # ADOFAI has no gamemode
+  add_sv: false          # ADOFAI uses SetSpeed events
+
+dataloader:             # Dataloader settings
+  num_workers: 32
+
+optim:                  # Optimizer settings (v31 muon recipe)
+  name: muon
+  base_lr: 1e-2         # Should not be scaled with the number of devices present
+  batch_size: 32        # Batch size per GPU (for 4 GPUs = 128 total; single GPU use 8-16)
+  grad_acc: 1
+  total_steps: 65536    # v31: full training steps
+  warmup_steps: 0
+  final_cosine: 1e-5

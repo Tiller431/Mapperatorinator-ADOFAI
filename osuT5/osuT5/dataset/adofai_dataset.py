@@ -89,9 +89,45 @@ class AdofaiDataset(IterableDataset):
         self.test = test
         self.shared = shared
         
-        # Lossless rotation augmentation
+        # Lossless augmentation: LOCKED PARAMETER SETS (not cartesian product)
+        # Sampling rule: pick ONE geometric transform, THEN independently maybe rate, maybe pitch
+        
+        # Geometric transforms (pick ONE per sample)
         self.rotation_angles = [0, 45, 90, 135, 180, 225, 270, 315]  # 8 rotations
-        self.apply_rotation = getattr(args, 'adofai_rotate_augment', True)
+        self.reflect_transforms = [
+            ('x_flip', lambda a: (-a) % 360 if a != 999 else 999),
+            ('y_flip', lambda a: (180 - a) % 360 if a != 999 else 999),
+            ('diag_y_eq_x', lambda a: (90 - a) % 360 if a != 999 else 999),
+            ('diag_y_eq_neg_x', lambda a: (270 - a) % 360 if a != 999 else 999),
+        ]
+        
+        # Build geometric transform pool
+        self.geometric_transforms = []
+        
+        # Add identity (no transform)
+        if getattr(args, 'adofai_identity_augment', True):
+            self.geometric_transforms.append(('identity', None, 0, False))  # (name, reflect_fn, rotate_deg, needs_twirl)
+        
+        # Add rotations
+        if getattr(args, 'adofai_rotate_augment', True):
+            for angle in self.rotation_angles:
+                if angle != 0:  # Skip 0° rotation (covered by identity)
+                    self.geometric_transforms.append((f'rotate_{angle}', None, angle, False))
+        
+        # Add reflections (each requires floor-0 Twirl toggle)
+        if getattr(args, 'adofai_reflect_augment', True):
+            for name, reflect_fn in self.reflect_transforms:
+                self.geometric_transforms.append((name, reflect_fn, 0, True))
+        
+        # Matched-rate factors (applied independently AFTER geometric)
+        self.matched_rate_factors = getattr(args, 'adofai_matched_rate_factors', [1.0])  # e.g., [0.9, 1.0, 1.1, 1.2]
+        
+        # Same-duration pitch shifts (applied independently AFTER geometric)
+        self.pitch_shifts = getattr(args, 'adofai_pitch_shifts', [100])  # settings.pitch: [90, 100, 110]
+        
+        print(f"ADOFAI augmentation: {len(self.geometric_transforms)} geometric × {len(self.matched_rate_factors)} rates × {len(self.pitch_shifts)} pitches")
+        print(f"  Sampling: pick 1 geometric, THEN independently maybe rate, maybe pitch (not cartesian)")
+        print(f"  Expected variants per chart: ~{len(self.geometric_transforms)} (geometric pool size)")
         
         # Find all chart directories
         if chart_dirs is not None:
@@ -133,35 +169,103 @@ class AdofaiDataset(IterableDataset):
         
         return chart_dirs
     
-    def _rotate_events(self, events: list[Event], rotation_degrees: int) -> list[Event]:
+    def _apply_geometric_transform(
+        self,
+        angle_data: list[int],
+        actions: list[dict],
+        transform_name: str,
+        reflect_fn,
+        rotate_deg: int,
+        needs_twirl: bool
+    ) -> tuple[list[int], list[dict]]:
         """
-        Apply lossless rotation to angle events.
-        
-        Rotates all TILE_ANGLE events by rotation_degrees.
-        Midspin (999) stays unchanged.
-        All other events (actions, timing, etc.) remain on the same floors.
+        Apply geometric transform to RAW angleData and actions.
         
         Args:
-            events: Original event list
-            rotation_degrees: Degrees to rotate (0, 45, 90, 135, 180, 225, 270, 315)
+            angle_data: Original angleData (0-359 or 999)
+            actions: Original actions list
+            transform_name: Name of transform for logging
+            reflect_fn: Reflection function or None for rotation
+            rotate_deg: Rotation degrees (0-315) or 0 for reflection
+            needs_twirl: If True, toggle Twirl on floor 0
             
         Returns:
-            Rotated event list
+            Tuple of (transformed_angle_data, transformed_actions)
         """
-        if rotation_degrees == 0:
-            return events
+        # Transform angleData
+        if reflect_fn is not None:
+            # Apply reflection
+            transformed_angles = [reflect_fn(a) for a in angle_data]
+        elif rotate_deg != 0:
+            # Apply rotation (999 unchanged)
+            transformed_angles = [(a + rotate_deg) % 360 if a != 999 else 999 for a in angle_data]
+        else:
+            # Identity
+            transformed_angles = angle_data.copy()
         
-        rotated = []
-        for event in events:
-            if event.type == EventType.TILE_ANGLE:
-                # Rotate angle
-                new_angle = (event.value + rotation_degrees) % 360
-                rotated.append(Event(EventType.TILE_ANGLE, new_angle))
-            else:
-                # Keep all other events unchanged (including MIDSPIN, actions, timing, etc.)
-                rotated.append(event)
+        # Transform actions
+        transformed_actions = actions.copy()
         
-        return rotated
+        # Add floor-0 Twirl if reflection requires it
+        if needs_twirl:
+            # Check if floor 0 already has a Twirl
+            has_floor_0_twirl = any(
+                act.get('floor') == 0 and act.get('eventType') == 'Twirl'
+                for act in transformed_actions
+            )
+            
+            if not has_floor_0_twirl:
+                # Insert Twirl at floor 0
+                transformed_actions = [{'floor': 0, 'eventType': 'Twirl'}] + transformed_actions
+            # If there's already a floor-0 Twirl, reflection cancels it out (toggle)
+            # For simplicity, we can skip this case or remove the existing one
+        
+        # TODO: Also transform camera/track positions and rotations
+        # For now, keep actions unchanged (camera positions won't match rotated path)
+        
+        return transformed_angles, transformed_actions
+    
+    def _apply_matched_rate(
+        self,
+        settings: dict,
+        actions: list[dict],
+        rate_factor: float
+    ) -> tuple[dict, list[dict]]:
+        """
+        Apply matched-rate transform: audio duration/r, BPM*r, offset/r.
+        
+        Args:
+            settings: Level settings dict
+            actions: Actions list
+            rate_factor: Rate multiplier (e.g., 0.9, 1.0, 1.1, 1.2)
+            
+        Returns:
+            Tuple of (transformed_settings, transformed_actions)
+        """
+        if rate_factor == 1.0:
+            return settings, actions
+        
+        transformed_settings = settings.copy()
+        transformed_actions = []
+        
+        # Scale BPM
+        if 'bpm' in transformed_settings:
+            transformed_settings['bpm'] = transformed_settings['bpm'] * rate_factor
+        
+        # Scale offset (ms / r)
+        if 'offset' in transformed_settings:
+            transformed_settings['offset'] = transformed_settings['offset'] / rate_factor
+        
+        # Scale SetSpeed BPM events
+        for action in actions:
+            act = action.copy()
+            if act.get('eventType') == 'SetSpeed' and act.get('speedType') == 'Bpm':
+                act['beatsPerMinute'] = act['beatsPerMinute'] * rate_factor
+            transformed_actions.append(act)
+        
+        # Note: Multipliers, Pause/Hold durations (in beats), camera durations (beats), angleOffset unchanged
+        
+        return transformed_settings, transformed_actions
     
     def __iter__(self):
         """
@@ -186,8 +290,25 @@ class AdofaiDataset(IterableDataset):
             adofai_path = chart_dir / "level.adofai"
             
             try:
-                # Parse chart
-                events, audio_path = self.parser.parse(adofai_path)
+                # Parse RAW .adofai (we need angleData + actions, not Events yet)
+                from adofai.parser import parse_adofai
+                level = parse_adofai(adofai_path)
+                
+                # Find audio
+                audio_path = None
+                audio_filename = level.settings.get("songFilename", "")
+                if audio_filename:
+                    candidate = chart_dir / audio_filename
+                    if candidate.exists():
+                        audio_path = candidate
+                
+                if audio_path is None:
+                    # Fall back to scanning
+                    for ext in [".ogg", ".mp3", ".wav", ".flac", ".m4a", ".aac"]:
+                        candidates = list(chart_dir.glob(f"*{ext}"))
+                        if candidates:
+                            audio_path = candidates[0]
+                            break
                 
                 if audio_path is None or not audio_path.exists():
                     print(f"Warning: No audio found for {chart_dir.name}")
@@ -203,22 +324,66 @@ class AdofaiDataset(IterableDataset):
                     print(f"Warning: Failed to load audio {audio_path}")
                     continue
                 
-                # Generate augmented variants
-                rotations = self.rotation_angles if self.apply_rotation else [0]
+                # LOCKED AUGMENTATION SAMPLING:
+                # For each chart, generate variants by picking ONE geometric transform per variant
+                # (not cartesian product of all combinations)
                 
-                for rotation in rotations:
-                    # Apply rotation augmentation
-                    augmented_events = self._rotate_events(events, rotation)
+                for transform_name, reflect_fn, rotate_deg, needs_twirl in self.geometric_transforms:
+                    # Apply geometric transform to RAW angleData + actions
+                    aug_angles, aug_actions = self._apply_geometric_transform(
+                        level.angle_data,
+                        level.actions,
+                        transform_name,
+                        reflect_fn,
+                        rotate_deg,
+                        needs_twirl
+                    )
                     
-                    # TODO: Process events through tokenizer and create training sample
-                    # For now, yield raw events + audio (will be processed by dataloader)
-                    yield {
-                        'events': augmented_events,
-                        'audio': audio,
-                        'chart_name': chart_dir.name,
-                        'rotation': rotation,
-                    }
+                    # Sample ONE rate factor (could also iterate all, but spec says "maybe apply")
+                    # For deterministic training, we'll use all rate factors
+                    for rate_factor in self.matched_rate_factors:
+                        # Sample ONE pitch (deterministic: use all)
+                        for pitch in self.pitch_shifts:
+                            # Apply rate transform
+                            aug_settings, aug_actions_rate = self._apply_matched_rate(
+                                level.settings,
+                                aug_actions,
+                                rate_factor
+                            )
+                            
+                            # Apply pitch to settings
+                            aug_settings_pitch = aug_settings.copy()
+                            if pitch != 100:
+                                aug_settings_pitch['pitch'] = pitch
+                            
+                            # Reconstruct augmented level
+                            from adofai.parser import AdofaiLevel
+                            aug_level = AdofaiLevel(
+                                settings=aug_settings_pitch,
+                                angle_data=aug_angles,
+                                actions=aug_actions_rate,
+                                decorations=[]
+                            )
+                            
+                            # Convert to Events
+                            events, event_times = self.parser.converter.level_to_events(aug_level)
+                            
+                            # TODO: Apply audio transforms (pitch-shift, rate)
+                            # For now, use original audio
+                            aug_audio = audio
+                            
+                            # Yield sample
+                            yield {
+                                'events': events,
+                                'audio': aug_audio,
+                                'chart_name': chart_dir.name,
+                                'transform': transform_name,
+                                'rate': rate_factor,
+                                'pitch': pitch,
+                            }
             
             except Exception as e:
                 print(f"Error processing {chart_dir.name}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue

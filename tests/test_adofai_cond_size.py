@@ -32,8 +32,8 @@ def _model_section_cond_size(yaml_path: Path) -> int | None:
 def test_cond_size_helper_difficulty_only_is_128():
     import sys
 
-    sys.path.insert(0, str(REPO_ROOT / "osuT5"))
-    from osuT5.cond_size import cond_size_from_embeds
+    sys.path.insert(0, str(REPO_ROOT))
+    from osuT5.osuT5.cond_size import cond_size_from_embeds
 
     assert (
         cond_size_from_embeds(

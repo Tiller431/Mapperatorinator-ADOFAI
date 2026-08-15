@@ -21,7 +21,11 @@ from osuT5.utils import (
     get_optimizer,
     get_dataloaders,
     get_shared_training_state,
+    allgather_ddp_reducer_counts,
     assert_model_ready_for_ddp,
+    assert_same_ddp_reducer_counts,
+    bind_cuda_device_from_local_rank,
+    configure_nccl_for_pcie_multigpu,
     ddp_reducer_named_parameters,
     sync_registered_modules,
 )
@@ -60,10 +64,18 @@ def main(args: TrainConfig):
     args: TrainConfig = OmegaConf.to_object(args)
     checkpoint_iteration = get_next_checkpoint_iteration()
 
-    # Fork the Manager *before* Accelerator touches CUDA. Manager() after
-    # init_process_group is CUDA+fork UB and can leave rank 0 with a dead
-    # context whose reducer param list is empty.
+    # NCCL env *before* process-group init. 4×A40 PIX/PXB (no NVLink) hung
+    # on the first DDP verify ALLGATHER (NumelIn=1 NumelOut=4); all 4 ranks
+    # timed out together. 427-vs-0 after that timeout is not an empty module.
+    nccl_defaults = configure_nccl_for_pcie_multigpu()
+    if nccl_defaults:
+        print(f"NCCL PCIe defaults applied before Accelerator(): {nccl_defaults}")
+
+    # Fork the Manager *before* any CUDA / NCCL init. Manager() after
+    # Accelerator() is CUDA+fork UB and breaks the first NCCL collective
+    # on every rank (num_workers=0 does not avoid this).
     shared = get_shared_training_state()
+    bind_cuda_device_from_local_rank()
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
@@ -92,9 +104,8 @@ def main(args: TrainConfig):
     setup_args(args)
 
     # Build on CPU so every rank materializes the same param set *before*
-    # DDP wrap. The pod already printed Embedding(95471, 768), 478,783,248
-    # params, and Muon 194 + AdamW 233 = 427; rank 0's module was empty at
-    # ``_verify_param_shape_across_processes`` (same 427-vs-0 on ranks 0/1/2).
+    # the NCCL verify allgather. All 4 A40 ranks already printed
+    # Embedding(95471, 768) / 478,783,248 / Muon 194 + AdamW 233 = 427.
     with torch.enable_grad():
         model, tokenizer = load_model(
             args.pretrained_path,
@@ -125,6 +136,13 @@ def main(args: TrainConfig):
         sync_registered_modules(model)
         ddp_signature = assert_model_ready_for_ddp(model)
 
+    # Move before creating the optimizer so Muon/AdamW hold the same
+    # Parameter objects DDP will wrap (not stale CPU tensors).
+    if accelerator.device.type != "cpu":
+        model.to(accelerator.device)
+        sync_registered_modules(model)
+        ddp_signature = assert_model_ready_for_ddp(model)
+
     optimizer = get_optimizer(model, args)
     scheduler = get_scheduler(optimizer, args, accelerator)
 
@@ -135,17 +153,16 @@ def main(args: TrainConfig):
 
     print(model)
     print_model_parameters(model)
-    # print / Muon+AdamW already ran on the pod; the empty tree appeared
-    # between those prints and DDP verify. Re-register children, move
-    # every rank the same way, and refuse an empty ``_modules`` here.
     sync_registered_modules(model)
-    if accelerator.device.type != "cpu":
-        model.to(accelerator.device)
-        sync_registered_modules(model)
     ddp_signature = assert_model_ready_for_ddp(model)
+    # Gloo (CPU) gather of the 427-split. Does not use NCCL, so it cannot
+    # be the PIX/PXB ALLGATHER hang. 427-vs-0 after an NCCL timeout is
+    # not this check.
+    reducer_counts = allgather_ddp_reducer_counts(len(ddp_signature))
+    assert_same_ddp_reducer_counts(reducer_counts)
     print(
         f"[rank {accelerator.process_index}/{accelerator.num_processes}] "
-        f"DDP reducer param tensors={len(ddp_signature)} "
+        f"Gloo reducer counts={reducer_counts} "
         f"immediately before accelerator.prepare()"
     )
     accelerator.wait_for_everyone()

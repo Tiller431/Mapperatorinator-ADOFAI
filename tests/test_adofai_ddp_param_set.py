@@ -1,24 +1,22 @@
-"""DDP reducer param-set must match across independent v31 constructions.
+"""DDP param-set + NCCL verify hang on 4×A40.
 
-v31 on 4×A40 died in ``accelerator.prepare()`` → DDP:
+Field data (main ``a38db9f``, ``num_workers=0``, same 4×A40):
 
-    Rank 3 has 427 params, while rank 0 has inconsistent 0 params
+- All 4 ranks printed ``Model loaded`` / ``Embedding(95471, 768)`` first.
+- Hung at ``accelerator.prepare`` → DDP ``_verify_param_shape_across_processes``.
+- First collective: ``WorkNCCL SeqNum=1 ALLGATHER NumelIn=1 NumelOut=4``,
+  timeout 600000 ms. All 4 ranks timed out together (~600065–600086 ms).
+- ``427-vs-0`` printed *after* the timeout — garbage from the failed
+  ALLGATHER, not a real empty rank-0 model.
+- 1419 MiB / 100% util on all 4. Topology PIX/PXB, no NVLink.
 
-The 427 is the optimizer split of the *full* 478,783,248-param model
-(Muon 194 + AdamW 233), not a tiny net. The pod had already printed
-``Embedding(95471, 768)``, that 478.8M ``numel``, and the 194+233 split
-(compile=false, batch 8). Same 427-vs-0 on ranks 0/1/2.
+427 is the Muon 194 + AdamW 233 optimizer-split of the 478,783,248-param
+model. Every rank must still build that same set. The live hang is NCCL
+P2P on PIX/PXB during the 1-int verify allgather.
 
-``_verify_param_shape_across_processes`` walks ``named_modules()`` →
-``_modules``. Rank 0's module was empty there. Unfreezing
-``requires_grad`` does nothing when ``_modules`` has no children.
-
-Two-process Gloo ``accelerator.prepare`` of the real 478.8M model is not
-run here: it needs ~4 GiB plus a broadcast of every tensor and is not a
-unit-test cost. The cheap Gloo cases use a tiny stand-in of the empty
-rank-0 module; the real v31 model is checked by two sequential
-constructions (same signature, 427 tensors) plus
-``assert_model_ready_for_ddp``.
+Two-process Gloo wrap of the real 478.8M model is not run here (~4 GiB
+plus a full-state broadcast). v31 is checked by two sequential
+constructions (427 tensors, ``Embedding(95471, 768)``).
 """
 
 from __future__ import annotations
@@ -61,20 +59,58 @@ def _compose_adofai_v31():
         return OmegaConf.to_object(compose(config_name="adofai_v31"))
 
 
-def test_train_py_builds_cpu_model_and_asserts_before_prepare():
-    """Guard the train.py order that left rank 0 with an empty module."""
+def test_train_py_configures_nccl_before_accelerator_and_gathers_on_gloo():
+    """NCCL env + Manager fork + Gloo count gather must happen before DDP wrap."""
     src = (REPO_ROOT / "osuT5" / "train.py").read_text(encoding="utf-8")
+    assert "configure_nccl_for_pcie_multigpu" in src
+    assert "bind_cuda_device_from_local_rank" in src
+    assert "allgather_ddp_reducer_counts" in src
+    assert "assert_same_ddp_reducer_counts" in src
     assert "assert_model_ready_for_ddp" in src
     assert "sync_registered_modules" in src
     assert 'device="cpu"' in src
-    assert "accelerator.wait_for_everyone()" in src
-    assert src.index("get_shared_training_state()") < src.index("Accelerator(")
-    assert src.index("sync_registered_modules") < src.index("accelerator.prepare")
-    assert src.rindex("assert_model_ready_for_ddp") < src.index("accelerator.prepare")
+    assert src.index("configure_nccl_for_pcie_multigpu()") < src.index("get_shared_training_state()")
+    assert src.index("get_shared_training_state()") < src.index("bind_cuda_device_from_local_rank()")
+    assert src.index("bind_cuda_device_from_local_rank()") < src.index("accelerator = Accelerator(")
+    assert src.index("model.to(accelerator.device)") < src.index("optimizer = get_optimizer")
+    assert src.index("allgather_ddp_reducer_counts") < src.index("accelerator.prepare")
     assert src.index("accelerator.prepare") < src.index("init_trackers")
     assert "python osuT5/train.py -cn adofai_v31" in (
         REPO_ROOT / "adofai" / "train.py"
     ).read_text(encoding="utf-8")
+
+
+def test_configure_nccl_sets_p2p_level_nvl_when_unset(monkeypatch):
+    ddp_utils = _load_ddp_utils()
+    monkeypatch.delenv("NCCL_P2P_LEVEL", raising=False)
+    monkeypatch.delenv("NCCL_P2P_DISABLE", raising=False)
+    monkeypatch.delenv("NCCL_IB_DISABLE", raising=False)
+    applied = ddp_utils.configure_nccl_for_pcie_multigpu()
+    assert applied["NCCL_P2P_LEVEL"] == "NVL"
+    assert applied["NCCL_IB_DISABLE"] == "1"
+    assert os.environ["NCCL_P2P_LEVEL"] == "NVL"
+    assert os.environ["NCCL_IB_DISABLE"] == "1"
+
+
+def test_configure_nccl_does_not_override_user_p2p(monkeypatch):
+    ddp_utils = _load_ddp_utils()
+    monkeypatch.setenv("NCCL_P2P_DISABLE", "0")
+    monkeypatch.setenv("NCCL_IB_DISABLE", "0")
+    monkeypatch.delenv("NCCL_P2P_LEVEL", raising=False)
+    applied = ddp_utils.configure_nccl_for_pcie_multigpu()
+    assert "NCCL_P2P_LEVEL" not in applied
+    assert "NCCL_IB_DISABLE" not in applied
+    assert os.environ["NCCL_P2P_DISABLE"] == "0"
+    assert os.environ["NCCL_IB_DISABLE"] == "0"
+
+
+def test_same_reducer_counts_rejects_zero_and_mismatch():
+    ddp_utils = _load_ddp_utils()
+    ddp_utils.assert_same_ddp_reducer_counts([427, 427, 427, 427])
+    with pytest.raises(RuntimeError, match="0 DDP reducer"):
+        ddp_utils.assert_same_ddp_reducer_counts([427, 0, 427, 427])
+    with pytest.raises(RuntimeError, match="disagree"):
+        ddp_utils.assert_same_ddp_reducer_counts([427, 426, 427, 427])
 
 
 def test_mapperatorinator_does_not_slot_child_modules():
@@ -88,7 +124,7 @@ def test_mapperatorinator_does_not_slot_child_modules():
 
 
 def test_empty_modules_is_the_zero_param_ddp_bug_shape():
-    """Rank 0 empty ``_modules`` — the trainer's read of the 427-vs-0 crash."""
+    """Hardening: empty ``_modules`` is a real 0-param set, not the NCCL hang."""
     torch = pytest.importorskip("torch")
     ddp_utils = _load_ddp_utils()
     assert_model_ready_for_ddp = ddp_utils.assert_model_ready_for_ddp
@@ -251,6 +287,61 @@ def test_gloo_ddp_two_process_rejects_frozen_rank0():
         result[0][0],
         result[1][0],
     }
+
+
+def _gloo_count_worker(rank: int, world_size: int, port: int, rank0_count: int, result):
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        ddp_utils = _load_ddp_utils()
+        count = rank0_count if rank == 0 else 427
+        try:
+            gathered = ddp_utils.allgather_ddp_reducer_counts(count)
+            ddp_utils.assert_same_ddp_reducer_counts(gathered)
+            result[rank] = ("ok", gathered)
+        except Exception as exc:  # noqa: BLE001
+            result[rank] = ("err", str(exc))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_gloo_allgather_reducer_counts_agree():
+    """CPU Gloo gather of the 427-split — the check that must not use NCCL."""
+    pytest.importorskip("torch")
+    mp = pytest.importorskip("torch.multiprocessing")
+
+    port = _free_port()
+    manager = mp.Manager()
+    result = manager.dict()
+    mp.spawn(
+        _gloo_count_worker,
+        args=(2, port, 427, result),
+        nprocs=2,
+        join=True,
+    )
+    assert result[0][0] == "ok"
+    assert result[1][0] == "ok"
+    assert result[0][1] == [427, 427]
+
+
+def test_gloo_allgather_reducer_counts_rejects_mismatch():
+    pytest.importorskip("torch")
+    mp = pytest.importorskip("torch.multiprocessing")
+
+    port = _free_port()
+    manager = mp.Manager()
+    result = manager.dict()
+    mp.spawn(
+        _gloo_count_worker,
+        args=(2, port, 0, result),
+        nprocs=2,
+        join=True,
+    )
+    messages = " ".join(str(item) for item in result.values())
+    assert "0 DDP reducer" in messages or result[0][0] == "err" or result[1][0] == "err"
 
 
 def test_gloo_ddp_two_process_accepts_identical_unfrozen_models():

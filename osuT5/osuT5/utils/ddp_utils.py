@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from collections import OrderedDict
 
 import torch
+
+_GLOO_GROUP = None
 
 
 # Child names Mapperatorinator used to declare in incomplete ``__slots__``.
@@ -93,11 +96,10 @@ def ddp_reducer_named_parameters(model: torch.nn.Module) -> list[tuple[str, torc
     ``requires_grad`` only, skip ``_ddp_params_and_buffers_to_ignore``,
     dedupe shared/tied tensors.
 
-    The v31 4×A40 failure was **not** a tiny model and **not** a frozen-only
-    leftover. The pod had already printed ``Embedding(95471, 768)``,
-    478,783,248 params, and Muon 194 + AdamW 233 = 427. Rank 0's ``_modules``
-    was empty at ``_verify_param_shape_across_processes``, so the reducer
-    list was 0 while ranks 1/2/3 still had that 427-tensor split.
+    427 is the Muon 194 + AdamW 233 optimizer-split of the 478,783,248-param
+    model, not a tiny net. The 4×A40 hang was NCCL ALLGATHER during DDP
+    verify (all 4 ranks together). A 427-vs-0 line *after* that timeout is
+    not evidence that rank 0 built an empty module.
     """
     ignore = set(getattr(model, "_ddp_params_and_buffers_to_ignore", []))
     seen: set[int] = set()
@@ -121,7 +123,7 @@ def ddp_param_signature(model: torch.nn.Module) -> tuple[tuple[str, tuple[int, .
 
 
 def assert_model_ready_for_ddp(model: torch.nn.Module) -> tuple[tuple[str, tuple[int, ...]], ...]:
-    """Fail before ``accelerator.prepare`` if this rank's module is empty at verify."""
+    """Fail before ``accelerator.prepare`` if this rank's param set is empty."""
     children = _module_children(model)
     try:
         total = sum(1 for _ in model.parameters())
@@ -169,6 +171,95 @@ def assert_model_ready_for_ddp(model: torch.nn.Module) -> tuple[tuple[str, tuple
             f"(empty module on this rank): {meta[:8]}"
         )
     return signature
+
+
+def configure_nccl_for_pcie_multigpu() -> dict[str, str]:
+    """Set NCCL defaults *before* ``Accelerator()`` / ``init_process_group``.
+
+    4×A40 field data (main ``a38db9f``, ``num_workers=0``):
+
+    - All 4 ranks printed ``Model loaded`` / ``Embedding(95471, 768)`` first.
+    - Hung in DDP ``_verify_param_shape_across_processes`` on the **first**
+      collective: ``WorkNCCL SeqNum=1 ALLGATHER NumelIn=1 NumelOut=4``.
+    - All 4 ranks timed out together at ~600065–600086 ms (not a straggler).
+    - ``427-vs-0`` printed **after** that timeout — garbage from the failed
+      ALLGATHER, not a real empty rank-0 module.
+    - 1419 MiB / 100% util on all 4; topology PIX/PXB, no NVLink.
+
+    ``accelerate launch`` only auto-sets ``NCCL_P2P_DISABLE`` for RTX 4000.
+    A40 is not in that list. Official command is
+    ``python osuT5/train.py -cn adofai_v31``. ``NCCL_P2P_LEVEL=NVL`` keeps
+    NVLink P2P and disables the PIX/PXB P2P path that hangs the 1-int
+    allgather. Do not override an explicit user setting.
+    """
+    applied: dict[str, str] = {}
+    if "NCCL_P2P_DISABLE" not in os.environ and "NCCL_P2P_LEVEL" not in os.environ:
+        os.environ["NCCL_P2P_LEVEL"] = "NVL"
+        applied["NCCL_P2P_LEVEL"] = "NVL"
+    if "NCCL_IB_DISABLE" not in os.environ:
+        os.environ["NCCL_IB_DISABLE"] = "1"
+        applied["NCCL_IB_DISABLE"] = "1"
+    return applied
+
+
+def bind_cuda_device_from_local_rank() -> str | None:
+    """Pin this process to its GPU before NCCL init. No-op without LOCAL_RANK."""
+    if not torch.cuda.is_available() or "LOCAL_RANK" not in os.environ:
+        return None
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device_index = 0 if torch.cuda.device_count() == 1 else local_rank
+    torch.cuda.set_device(device_index)
+    return f"cuda:{device_index}"
+
+
+def _gloo_process_group():
+    """Side Gloo group so param-count gather does not use NCCL."""
+    global _GLOO_GROUP
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        return None
+    if dist.get_backend() == "gloo":
+        return dist.group.WORLD
+    if _GLOO_GROUP is not None:
+        return _GLOO_GROUP
+    _GLOO_GROUP = dist.new_group(backend="gloo")
+    return _GLOO_GROUP
+
+
+def allgather_ddp_reducer_counts(count: int) -> list[int]:
+    """Gather reducer-tensor counts on Gloo (CPU). Does not touch NCCL.
+
+    The live 4×A40 hang was NCCL ALLGATHER of a 1-int count. This check
+    proves every rank has the same 427-split *before* DDP's NCCL verify.
+    """
+    import torch.distributed as dist
+
+    value = int(count)
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return [value]
+    group = _gloo_process_group()
+    gathered: list[object | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, value, group=group)
+    return [int(item) for item in gathered]
+
+
+def assert_same_ddp_reducer_counts(counts: list[int]) -> None:
+    """Every rank must report the same non-zero reducer count (v31: 427)."""
+    if not counts:
+        raise RuntimeError("DDP reducer-count allgather returned no ranks")
+    if any(count <= 0 for count in counts):
+        raise RuntimeError(
+            "A rank reported 0 DDP reducer tensors before NCCL verify: "
+            f"{counts}. This is a real empty/frozen module, not the "
+            "post-timeout 427-vs-0 garbage from a hung ALLGATHER."
+        )
+    if len(set(counts)) != 1:
+        raise RuntimeError(
+            "Ranks disagree on DDP reducer tensor count before NCCL verify: "
+            f"{counts}. Expected one shared split (Muon 194 + AdamW 233 = 427 "
+            "on adofai_v31), not a tiny model."
+        )
 
 
 def assert_identical_ddp_param_sets(

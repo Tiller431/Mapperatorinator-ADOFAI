@@ -27,8 +27,12 @@ from ..tokenizer import Tokenizer
 from ..config import TrainConfig
 from ..cond_size import cond_size_from_embeds
 from .ddp_utils import (
+    allgather_ddp_reducer_counts,
     assert_identical_ddp_param_sets,
     assert_model_ready_for_ddp,
+    assert_same_ddp_reducer_counts,
+    bind_cuda_device_from_local_rank,
+    configure_nccl_for_pcie_multigpu,
     ddp_param_signature,
     ddp_reducer_named_parameters,
     sync_registered_modules,

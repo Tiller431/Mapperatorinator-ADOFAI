@@ -186,8 +186,117 @@ def test_encode_move_camera_and_vfx_chart_without_valueerror():
     assert all(isinstance(token_id, int) for token_id in token_ids)
 
 
+def _high_real_vfx_level() -> AdofaiLevel:
+    """Workshop/HF values that overflowed the old EventRange tables."""
+    return AdofaiLevel(
+        settings={"bpm": 140, "offset": 0, "pitch": 100, "difficulty": 8},
+        angle_data=[0, 90, 180],
+        actions=[
+            {
+                "floor": 0,
+                "eventType": "MoveCamera",
+                "position": [4, -2],
+                "rotation": -10,
+                "zoom": 1000,
+                "duration": 16.0,
+                "ease": "Linear",
+                "relativeTo": "Player",
+                "angleOffset": 540,
+            },
+            {"floor": 1, "eventType": "RepeatEvents", "repetitions": 48},
+            {
+                "floor": 1,
+                "eventType": "SetFilter",
+                "filter": "Grayscale",
+                "enabled": "Enabled",
+                "intensity": 500,
+                "disableOthers": False,
+            },
+            {
+                "floor": 1,
+                "eventType": "Bloom",
+                "enabled": "Enabled",
+                "intensity": 3000,
+                "threshold": 40,
+                "color": "ffffff",
+            },
+            {"floor": 1, "eventType": "ShakeScreen", "intensity": 222, "strength": 300},
+            {
+                "floor": 1,
+                "eventType": "Flash",
+                "duration": 32.0,
+                "plane": "Foreground",
+                "startColor": "ffffff",
+                "startOpacity": 100,
+                "endColor": "000000",
+                "endOpacity": 0,
+                "angleOffset": -540,
+                "ease": "Linear",
+            },
+        ],
+        decorations=[],
+    )
+
+
+def test_encode_move_camera_zoom_1000():
+    events, _ = AdofaiConverter().level_to_events(_high_real_vfx_level())
+    zoom = next(event for event in events if event.type == EventType.CAMERA_ZOOM)
+    assert zoom.value == 1000
+    token_ids = encode_adofai_events(events)
+    assert len(token_ids) == len(events)
+
+
+def test_encode_repeat_events_48():
+    events, _ = AdofaiConverter().level_to_events(_high_real_vfx_level())
+    repeat = next(event for event in events if event.type == EventType.REPEAT_EVENTS)
+    assert repeat.value == 48
+    encode_adofai_events([repeat])
+
+
+def test_encode_vfx_intensity_500():
+    events, _ = AdofaiConverter().level_to_events(_high_real_vfx_level())
+    intensity = next(event for event in events if event.type == EventType.VFX_INTENSITY)
+    assert intensity.value == 500
+    encode_adofai_events([intensity])
+
+
+def test_encode_other_high_real_vfx_values():
+    """Rotation, duration, angleOffset, bloom, shake — real file extrema."""
+    from osuT5.osuT5.event import Event
+
+    events, _ = AdofaiConverter().level_to_events(_high_real_vfx_level())
+    by_type = {}
+    for event in events:
+        by_type.setdefault(event.type, []).append(event.value)
+    assert 1000 in by_type[EventType.CAMERA_ZOOM]
+    assert any(value < 0 for value in by_type[EventType.CAMERA_ROTATION])
+    assert any(value > 100 for value in by_type[EventType.CAMERA_DURATION])
+    assert 3000 in by_type[EventType.BLOOM]
+    assert 222 in by_type[EventType.SHAKE_SCREEN]
+    assert 300 in by_type[EventType.VFX_STRENGTH]
+    encode_adofai_events(events)
+    extras = [
+        Event(EventType.CAMERA_ZOOM, 2000),
+        Event(EventType.CAMERA_ROTATION, -1440),
+        Event(EventType.CAMERA_DURATION, 1280),
+        Event(EventType.ANGLE_OFFSET, 9360),
+        Event(EventType.VFX_INTENSITY, -60),
+        Event(EventType.SET_SPEED_BPM, 2332),
+        Event(EventType.REPEAT_EVENTS, 1000),
+    ]
+    encode_adofai_events(extras)
+
+
 if __name__ == "__main__":
     test_converter_emits_move_camera_and_flash()
     print("converter emits MOVE_CAMERA+FLASH: ok")
     test_encode_move_camera_and_vfx_chart_without_valueerror()
     print("encode MOVE_CAMERA+VFX chart: ok")
+    test_encode_move_camera_zoom_1000()
+    print("encode zoom=1000: ok")
+    test_encode_repeat_events_48()
+    print("encode repeat=48: ok")
+    test_encode_vfx_intensity_500()
+    print("encode intensity=500: ok")
+    test_encode_other_high_real_vfx_values()
+    print("encode high real VFX: ok")

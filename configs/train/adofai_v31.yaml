@@ -12,6 +12,9 @@ model:
   do_style_embed: false
   do_mapper_embed: false
   do_song_position_embed: false
+  # whisper_*_v2.yaml is 384 (diff+mapper+song_pos). ADOFAI prefix is
+  # difficulty only → 128. Else Whisper conv1 is n_mels+384 vs n_mels+128.
+  cond_size: 128
 
 data:                  # Data settings
   dataset_type: "adofai"

@@ -9,6 +9,7 @@ angleData + actions, then convert to osuT5 Events.
 from __future__ import annotations
 
 import random
+import sys
 from multiprocessing.managers import Namespace
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,10 @@ from typing import Optional
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.append(str(_REPO_ROOT))
 
 from .data_utils import SequenceDatasetMixin, get_song_length, load_audio_file
 from .adofai_parser import AdofaiParser

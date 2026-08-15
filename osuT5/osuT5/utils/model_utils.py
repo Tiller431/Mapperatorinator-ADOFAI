@@ -25,6 +25,7 @@ from ..model.configuration_mapperatorinator import MapperatorinatorConfig
 from ..model.modeling_mapperatorinator import Mapperatorinator
 from ..tokenizer import Tokenizer
 from ..config import TrainConfig
+from ..cond_size import cond_size_from_embeds
 
 
 LORA_METADATA_FILENAME = "mapperatorinator_lora_metadata.json"
@@ -65,7 +66,17 @@ def _get_model_config(
         do_mapper_embed=args.model.do_mapper_embed,
         do_song_position_embed=args.model.do_song_position_embed,
         cond_dim=args.model.cond_dim,
-        cond_size=args.model.cond_size,
+        cond_size=(
+            cond_size_from_embeds(
+                do_difficulty_embed=args.model.do_difficulty_embed,
+                do_mapper_embed=args.model.do_mapper_embed,
+                do_song_position_embed=args.model.do_song_position_embed,
+                do_style_embed=args.model.do_style_embed,
+                cond_dim=args.model.cond_dim,
+            )
+            if getattr(args.data, "dataset_type", None) == "adofai"
+            else args.model.cond_size
+        ),
         spectrogram_implementation=args.model.spectrogram.implementation,
         spectrogram_log_scale=args.model.spectrogram.log_scale,
         sample_rate=args.model.spectrogram.sample_rate,

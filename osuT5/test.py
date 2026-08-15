@@ -1,3 +1,7 @@
+from repo_path import ensure_repo_root_on_sys_path
+
+ensure_repo_root_on_sys_path()
+
 import time
 from typing import Optional
 

@@ -79,6 +79,25 @@ def forward_eval(model: Mapperatorinator, batch):
     return outputs
 
 
+def predictions_from_logits(logits, device=None):
+    """Argmax over vocab without the CUDA empty-last-dim / device-mismatch assert.
+
+    Whisper returns ``[batch, seq, vocab]``. A prior kernel (wrong cond
+    channels, OOB embed) can surface at the next sync, which was this
+    argmax. Keep eval running: require a tensor, align device, contiguous.
+    """
+    if logits is None:
+        raise RuntimeError("eval_model: model returned no logits")
+    if not torch.is_tensor(logits):
+        raise TypeError(f"eval_model: logits is {type(logits)}")
+    if device is not None and logits.device != device:
+        logits = logits.to(device)
+    logits = logits.contiguous()
+    if logits.numel() == 0 or logits.shape[-1] == 0:
+        return logits.new_empty(logits.shape[:-1], dtype=torch.long)
+    return torch.argmax(logits, dim=-1)
+
+
 def add_prefix(prefix: str, stats: dict[str, float]):
     if prefix == "":
         return stats
@@ -270,11 +289,11 @@ def eval_model(
         loss = outputs.loss
         loss = accelerator.reduce(loss, reduction="mean")
 
-        # Gether labels and predictions over all processes and drop duplicates
+        # Do not gather full logits (vocab × seq); only preds/labels for metrics.
         logits = outputs.logits
-        preds = torch.argmax(logits, dim=-1)
         labels = batch["labels"]
-        accelerator.gather_for_metrics((logits, preds, labels))
+        preds = predictions_from_logits(logits, device=labels.device)
+        accelerator.gather_for_metrics((preds, labels))
 
         # Calculate accuracy metrics
         if len(args.data.context_types) > 0:

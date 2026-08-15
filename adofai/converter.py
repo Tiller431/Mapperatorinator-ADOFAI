@@ -508,7 +508,7 @@ class AdofaiConverter:
             else:
                 events.append(Event(EventType.TIME_SHIFT, int(current_time)))
                 event_times.append(current_time)
-                events.append(Event(EventType.TILE_ANGLE, tile_angle))
+                events.append(Event(EventType.TILE_ANGLE, int(round(float(tile_angle))) % 360))
                 event_times.append(current_time)
 
             # Pause is a wait on this tile after arrival, before leaving for the next tile.

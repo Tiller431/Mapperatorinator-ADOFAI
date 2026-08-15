@@ -56,8 +56,43 @@ def test_converter_imports_with_osut5_dir_on_sys_path():
     _import_converter([str(OSUT5_DIR), str(REPO_ROOT)])
 
 
+def test_adofai_importable_from_osut5_train_layout_without_pythonpath():
+    """Official launch: sys.path is osuT5/ only, cwd is not repo root, no env.
+
+    ``train.py`` must put the repo root on ``sys.path`` itself.
+    """
+    import importlib.util
+    import os
+
+    saved_path = sys.path[:]
+    saved_cwd = os.getcwd()
+    saved_modules = _purge_import_cache()
+    try:
+        os.chdir(OSUT5_DIR)
+        sys.path = [str(OSUT5_DIR)] + [
+            p for p in saved_path if p not in (str(OSUT5_DIR), str(REPO_ROOT), "")
+        ]
+        spec = importlib.util.spec_from_file_location("repo_path", OSUT5_DIR / "repo_path.py")
+        repo_path = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(repo_path)
+        repo_path.ensure_repo_root_on_sys_path()
+        import adofai
+
+        assert adofai.__file__
+        import adofai.converter as converter
+
+        assert converter.AdofaiConverter is not None
+    finally:
+        _purge_import_cache()
+        sys.path[:] = saved_path
+        os.chdir(saved_cwd)
+        sys.modules.update(saved_modules)
+
+
 if __name__ == "__main__":
     test_converter_imports_with_repo_root_on_sys_path()
     print("repo-root converter import: ok")
     test_converter_imports_with_osut5_dir_on_sys_path()
     print("osuT5/ converter import: ok")
+    test_adofai_importable_from_osut5_train_layout_without_pythonpath()
+    print("osuT5/ train layout without PYTHONPATH: ok")

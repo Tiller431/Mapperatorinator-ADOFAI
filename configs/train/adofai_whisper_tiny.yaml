@@ -12,6 +12,8 @@ model:
   do_style_embed: false
   do_mapper_embed: false
   do_song_position_embed: false
+  # Same as adofai_v31: difficulty-only prefix, not the v2 384 triple-embed.
+  cond_size: 128
 
 data:                  # Data settings
   dataset_type: "adofai"

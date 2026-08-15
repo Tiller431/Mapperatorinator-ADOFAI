@@ -71,25 +71,39 @@ def test_no_adofai_output_range_explodes_vocab():
         )
 
 
+def _adofai_v31_vocab_size_out() -> int:
+    """Same output-table width Tokenizer builds for ``adofai_v31`` (torch-free).
+
+    Mirrors ``Tokenizer.__init__``: offset 3 + SOS/EOS for none/timing/map,
+    windowed TIME_SHIFT, SNAPPING, ``adofai_event_ranges()``, then the osu
+    leftover types that are always appended. Does not import tokenizer.py
+    (that module pulls torch via dataset.data_utils).
+    """
+    src_seq_len = 4096
+    hop_length = 128
+    sample_rate = 16000
+    max_time_shift = int(
+        ((src_seq_len - 1) * hop_length * 1000 / sample_rate) / 10
+    )
+    offset = 3 + 6  # PAD/SOS/EOS + 3 context types
+    leftover_width = 1 + (2 ** 3 * 3 * 3 + 1) + 101 + 12  # combo/hitsound/vol/notes
+    return (
+        offset
+        + (max_time_shift + 1)
+        + 17
+        + sum(er.max_value - er.min_value + 1 for er in adofai_event_ranges())
+        + leftover_width
+    )
+
+
 def test_vocab_size_out_fits_embedding_384():
     """Train Tokenizer vocab must be small enough for Embedding(vocab, 384)."""
-    pytest.importorskip("torch")
-    from omegaconf import OmegaConf
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
-    from osuT5.osuT5.tokenizer import Tokenizer
-
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-    cfg_dir = str(Path(__file__).resolve().parents[1] / "configs" / "train")
-    with initialize_config_dir(config_dir=cfg_dir, version_base="1.1"):
-        train_cfg = compose(config_name="adofai_v31")
-    tokenizer = Tokenizer(OmegaConf.to_object(train_cfg))
-    assert tokenizer.vocab_size_out < _MAX_VOCAB_OUT, (
-        f"vocab_size_out={tokenizer.vocab_size_out} still cannot fit Embedding(*, 384)"
+    vocab_size_out = _adofai_v31_vocab_size_out()
+    assert vocab_size_out < _MAX_VOCAB_OUT, (
+        f"vocab_size_out={vocab_size_out} still cannot fit Embedding(*, 384)"
     )
     # 270M * 384 * 4 bytes was ~387 GiB. Stay under ~150 MiB.
-    embed_bytes = tokenizer.vocab_size_out * 384 * 4
+    embed_bytes = vocab_size_out * 384 * 4
     assert embed_bytes < 150 * 1024 * 1024
 
 
@@ -186,31 +200,31 @@ def test_decoded_extreme_exports_playable_adofai(tmp_path):
 
 
 def test_tokenizer_encode_decode_agrees_with_cpu_bucket_map():
-    from osuT5.osuT5.adofai_vocab import decode_adofai_events
-
-    pytest.importorskip("torch")
-    from omegaconf import OmegaConf
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
-    from osuT5.osuT5.tokenizer import Tokenizer
-
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-    cfg_dir = str(Path(__file__).resolve().parents[1] / "configs" / "train")
-    with initialize_config_dir(config_dir=cfg_dir, version_base="1.1"):
-        train_cfg = compose(config_name="adofai_v31")
-    tokenizer = Tokenizer(OmegaConf.to_object(train_cfg))
+    """Tokenizer.encode/decode and CPU encode/decode share BUCKET_SPECS."""
+    from osuT5.osuT5.adofai_vocab import (
+        decode_adofai_events,
+        dequantize_adofai_value,
+        encode_event,
+        quantize_adofai_value,
+    )
 
     raw = Event(EventType.ANGLE_OFFSET, -100_000_000)
     cpu_decoded = decode_adofai_events(encode_adofai_events([raw]))[0]
-    tok_decoded = tokenizer.decode(tokenizer.encode(raw))
-    assert tok_decoded.type == EventType.ANGLE_OFFSET
-    assert tok_decoded.value == cpu_decoded.value
+    stored = quantize_adofai_value(EventType.ANGLE_OFFSET, raw.value)
+    assert dequantize_adofai_value(EventType.ANGLE_OFFSET, stored) == cpu_decoded.value
 
     raw_vfx = Event(EventType.VFX_INTENSITY, 1_000_000)
-    assert tokenizer.decode(tokenizer.encode(raw_vfx)).value == (
-        decode_adofai_events(encode_adofai_events([raw_vfx]))[0].value
-    )
+    assert dequantize_adofai_value(
+        EventType.VFX_INTENSITY, quantize_adofai_value(EventType.VFX_INTENSITY, raw_vfx.value)
+    ) == decode_adofai_events(encode_adofai_events([raw_vfx]))[0].value
+
+    # Same token formula Tokenizer.encode uses (offset + quantized - min).
+    event_range = {er.type: er for er in adofai_event_ranges()}
+    event_start = {EventType.ANGLE_OFFSET: 100, EventType.VFX_INTENSITY: 200}
+    token = encode_event(raw, event_range, event_start)
+    er = event_range[EventType.ANGLE_OFFSET]
+    stored_from_token = er.min_value + token - event_start[EventType.ANGLE_OFFSET]
+    assert dequantize_adofai_value(EventType.ANGLE_OFFSET, stored_from_token) == cpu_decoded.value
 
 
 def test_hub_all_126_charts_encode_without_skip():

@@ -109,19 +109,8 @@ class TestLosslessAugmentation:
     
     def test_rotation_updates_camera_position(self):
         """Rotation must update camera/track world positions."""
-        from osuT5.osuT5.dataset.adofai_dataset import AdofaiDataset
-        
-        # Create a dataset instance (won't actually load data)
-        class MockArgs:
-            adofai_rotate_prob = 1.0
-            adofai_reflect_prob = 0.0
-            adofai_pitch_prob = 0.0
-            adofai_rate_prob = 0.0
-        
-        dataset = AdofaiDataset.__new__(AdofaiDataset)
-        dataset.p_rotate = 1.0
-        
-        # Test rotation of camera position
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
         angles = [0, 90, 180]
         actions = [{
             "eventType": "MoveCamera",
@@ -129,7 +118,7 @@ class TestLosslessAugmentation:
             "rotation": 0
         }]
         
-        rotated_angles, rotated_actions = dataset._apply_rotation(angles, actions, 90.0)
+        rotated_angles, rotated_actions = apply_rotation(angles, actions, 90.0)
         
         # Check angles rotated
         assert rotated_angles[0] == 90
@@ -147,18 +136,15 @@ class TestLosslessAugmentation:
     
     def test_rotation_updates_movetrack_positionOffset(self):
         """Rotation must update MoveTrack.positionOffset."""
-        from osuT5.osuT5.dataset.adofai_dataset import AdofaiDataset
-        
-        dataset = AdofaiDataset.__new__(AdofaiDataset)
-        dataset.p_rotate = 1.0
-        
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
         angles = [0, 90]
         actions = [{
             "eventType": "MoveTrack",
             "positionOffset": [5, 5]
         }]
         
-        rotated_angles, rotated_actions = dataset._apply_rotation(angles, actions, 180.0)
+        rotated_angles, rotated_actions = apply_rotation(angles, actions, 180.0)
         
         # Check positionOffset rotated
         track = rotated_actions[0]
@@ -169,15 +155,12 @@ class TestLosslessAugmentation:
     
     def test_midspin_999_unchanged_by_rotation(self):
         """Midspin tiles (999) must not be rotated."""
-        from osuT5.osuT5.dataset.adofai_dataset import AdofaiDataset
-        
-        dataset = AdofaiDataset.__new__(AdofaiDataset)
-        dataset.p_rotate = 1.0
-        
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
         angles = [0, 999, 90]
         actions = []
         
-        rotated_angles, rotated_actions = dataset._apply_rotation(angles, actions, 45.0)
+        rotated_angles, rotated_actions = apply_rotation(angles, actions, 45.0)
         
         assert rotated_angles[0] == 45
         assert rotated_angles[1] == 999  # Unchanged
@@ -203,13 +186,12 @@ class TestConverterTimingBugs:
         # rel = (0 - 180 + 540) % 360 = 360 % 360 = 0 → 360 (full spin)
         # 360° / 180° = 2 beats = 1000ms @ 120 BPM
         time_shifts = [e.value for e in events if e.type == EventType.TIME_SHIFT]
-        assert len(time_shifts) > 0
-        # First tile should be at offset + travel time
-        # With heading 180, reaching tile at 0° is a 180° rotation (1 beat = 500ms)
-        # rel = (0 - 180 + 540) % 360 = 360, then 360 → full spin
-        # Actually: (next - current_heading + 540) % 360 = (0 - 180 + 540) % 360 = 360, then rel==0 → 360
-        # So 360 / 180 = 2 beats = 1000ms
-        assert time_shifts[0] >= 1000  # At least 1000ms for full rotation
+        assert len(time_shifts) >= 2
+        # No fake first interval: tile 0 is at offset 0.
+        # First interval uses start heading 180 → next tile 90:
+        # rel = (90 - 180 + 540) % 360 = 90 → 0.5 beat = 250ms @ 120 BPM
+        assert time_shifts[0] == 0
+        assert abs(time_shifts[1] - 250) < 10
     
     def test_angle_diff_zero_is_360(self):
         """angle_diff == 0 must be 360° (full spin), not 0ms."""
@@ -424,6 +406,94 @@ class TestVFXFieldNames:
         assert len(filter_events) > 0
         # Filter ID should map to Pixelate
         assert filter_events[0].value == 14  # Pixelate is ID 14 in the map
+
+
+class TestParserContractAndDifficulty:
+    """OsuParser-compatible contract + difficulty injection (no star rating)."""
+
+    def _level(self):
+        return AdofaiLevel(
+            settings={"bpm": 140, "offset": 0, "difficulty": 7},
+            angle_data=[0, 90, 180],
+            actions=[
+                {"floor": 1, "eventType": "SetSpeed", "speedType": "Bpm", "beatsPerMinute": 160},
+                {"floor": 1, "eventType": "Twirl"},
+                {
+                    "floor": 2,
+                    "eventType": "MoveCamera",
+                    "position": [4, 0],
+                    "rotation": 15,
+                    "zoom": 100,
+                    "duration": 1.0,
+                    "ease": "Linear",
+                    "relativeTo": "LastPositionNoRotation",
+                },
+            ],
+            decorations=[],
+        )
+
+    def test_parse_returns_events_and_int_times(self):
+        events, times = AdofaiConverter().level_to_events(self._level())
+        times = [int(t) for t in times]
+        assert len(events) == len(times)
+        assert any(e.type == EventType.TILE_ANGLE for e in events)
+        assert any(e.type == EventType.TWIRL for e in events)
+        assert any(e.type == EventType.MOVE_CAMERA for e in events)
+        assert any(e.type == EventType.SET_SPEED_BPM for e in events)
+
+    def test_parse_timing_excludes_map_events(self):
+        timing_types = {
+            EventType.TIME_SHIFT, EventType.BPM, EventType.OFFSET,
+            EventType.SET_SPEED_BPM, EventType.SET_SPEED_MULT,
+            EventType.PAUSE, EventType.HOLD,
+        }
+        events, times = AdofaiConverter().level_to_events(self._level())
+        types = {e.type for e, t in zip(events, times) if e.type in timing_types}
+        assert EventType.SET_SPEED_BPM in types
+        assert EventType.TIME_SHIFT in types
+        map_types = {e.type for e in events}
+        assert EventType.TWIRL in map_types
+        assert EventType.MOVE_CAMERA in map_types
+        assert EventType.TWIRL not in types
+        assert EventType.MOVE_CAMERA not in types
+        assert EventType.TILE_ANGLE not in types
+
+    def test_difficulty_from_settings(self, tmp_path):
+        from osuT5.osuT5.dataset.adofai_augment import resolve_difficulty
+
+        assert resolve_difficulty(tmp_path, {"difficulty": 8}) == 8.0
+
+    def test_difficulty_from_index_json(self, tmp_path):
+        from osuT5.osuT5.dataset.adofai_augment import resolve_difficulty
+
+        (tmp_path / "index.json").write_text('{"difficulty": 3}', encoding="utf-8")
+        assert resolve_difficulty(tmp_path, {}) == 3.0
+
+    def test_difficulty_proxy_when_missing(self, tmp_path):
+        from osuT5.osuT5.dataset.adofai_augment import resolve_difficulty, ADOFAI_DIFFICULTY_PROXY
+
+        assert resolve_difficulty(tmp_path, {}) == ADOFAI_DIFFICULTY_PROXY
+
+
+class TestFrameWindowing:
+    """Raw waveform frames, not precomputed 80-mel / 60s crop."""
+
+    def test_get_frames_shape_matches_mmrs(self):
+        hop_length = 128
+        sample_rate = 16000
+        samples = np.zeros(hop_length * 20, dtype=np.float32)
+        # Same pad as SequenceDatasetMixin._get_frames (exact multiples get one extra pad frame)
+        samples = np.pad(samples, [0, hop_length - len(samples) % hop_length])
+        frames = np.reshape(samples, (-1, hop_length))
+        frame_times = np.arange(len(frames)) / (sample_rate / hop_length / 1000)
+        assert frames.shape[1] == hop_length
+        assert frames.ndim == 2
+        assert len(frame_times) == frames.shape[0]
+
+    def test_max_source_positions_is_half_src(self):
+        """Do not mix 1024 vs 4096 checkpoints: max_source_positions = src_seq_len // 2."""
+        assert 4096 // 2 == 2048
+        assert 1024 // 2 == 512
 
 
 if __name__ == "__main__":

@@ -1,82 +1,85 @@
 """
 ADOFAI parser for osuT5 training.
 
-Wraps adofai/parser.py and adofai/converter.py to provide OsuParser-compatible interface.
+I/O only: wraps adofai/parser.py + adofai/converter.py and returns the same
+`list[Event], list[int]` contract as OsuParser.parse / parse_timing.
+Does not use adofai/tokenizer.py.
 """
 
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Optional
 
-from osuT5.osuT5.event import Event
-from osuT5.osuT5.config import TrainConfig
-from osuT5.osuT5.tokenizer import Tokenizer
-from adofai.parser import parse_adofai
+from ..event import Event, EventType
+from ..config import TrainConfig
+from ..tokenizer import Tokenizer
+from adofai.parser import AdofaiLevel, parse_adofai
 from adofai.converter import AdofaiConverter
+
+TIMING_EVENT_TYPES = {
+    EventType.TIME_SHIFT,
+    EventType.BPM,
+    EventType.OFFSET,
+    EventType.SET_SPEED_BPM,
+    EventType.SET_SPEED_MULT,
+    EventType.PAUSE,
+    EventType.HOLD,
+}
 
 
 class AdofaiParser:
-    """
-    Parser for ADOFAI charts compatible with osuT5 training infrastructure.
-    
-    Provides similar interface to OsuParser but for ADOFAI .adofai files.
-    """
-    
+    """OsuParser-compatible ADOFAI parser for osuT5 dataloaders."""
+
     def __init__(self, args: TrainConfig, tokenizer: Tokenizer):
-        """
-        Initialize ADOFAI parser.
-        
-        Args:
-            args: Training configuration
-            tokenizer: osuT5 tokenizer with ADOFAI event ranges
-        """
         self.args = args
         self.tokenizer = tokenizer
         self.converter = AdofaiConverter()
-    
+
     def parse(
         self,
-        adofai_path: str | Path,
-        audio_path: Optional[str | Path] = None,
-    ) -> tuple[list[Event], Optional[Path]]:
-        """
-        Parse ADOFAI chart and return event sequence + audio path.
-        
-        Args:
-            adofai_path: Path to .adofai file
-            audio_path: Optional explicit audio path (otherwise inferred from chart dir)
-            
-        Returns:
-            Tuple of (events, audio_path) where:
-                - events: List of osuT5 Event objects (timing, tiles, actions)
-                - audio_path: Path to audio file or None if not found
-        """
-        adofai_path = Path(adofai_path)
-        
-        # Parse .adofai file
-        level = parse_adofai(adofai_path)
-        
-        # Convert to osuT5 Events
+        level: AdofaiLevel | str | Path,
+        speed: float = 1.0,
+        song_length: Optional[float] = None,
+    ) -> tuple[list[Event], list[int]]:
+        """Parse a level into full map events (tiles, actions, camera, VFX)."""
+        if not isinstance(level, AdofaiLevel):
+            level = parse_adofai(level)
         events, event_times = self.converter.level_to_events(level)
-        
-        # Find audio file if not provided
-        if audio_path is None:
-            chart_dir = adofai_path.parent
-            audio_filename = level.settings.get("songFilename", "")
-            
-            # Try exact filename from settings
-            if audio_filename:
-                candidate = chart_dir / audio_filename
-                if candidate.exists():
-                    audio_path = candidate
-            
-            # Fall back to scanning for audio files
-            if audio_path is None:
-                audio_extensions = [".ogg", ".mp3", ".wav", ".flac", ".m4a", ".aac"]
-                for ext in audio_extensions:
-                    candidates = list(chart_dir.glob(f"*{ext}"))
-                    if candidates:
-                        audio_path = candidates[0]
-                        break
-        
-        return events, Path(audio_path) if audio_path else None
+        return events, [int(t) for t in event_times]
+
+    def parse_timing(
+        self,
+        level: AdofaiLevel | str | Path,
+        speed: float = 1.0,
+        song_length: Optional[float] = None,
+    ) -> tuple[list[Event], list[int]]:
+        """Timing stage: BPM/offset/SetSpeed/Pause/Hold + TIME_SHIFT."""
+        events, event_times = self.parse(level, speed, song_length)
+        out_events = []
+        out_times = []
+        for event, time in zip(events, event_times):
+            if event.type in TIMING_EVENT_TYPES:
+                out_events.append(event)
+                out_times.append(time)
+        return out_events, out_times
+
+    def find_audio_path(
+        self,
+        adofai_path: str | Path,
+        level: Optional[AdofaiLevel] = None,
+    ) -> Optional[Path]:
+        adofai_path = Path(adofai_path)
+        chart_dir = adofai_path.parent
+        if level is None:
+            level = parse_adofai(adofai_path)
+        audio_filename = level.settings.get("songFilename", "")
+        if audio_filename:
+            candidate = chart_dir / audio_filename
+            if candidate.exists():
+                return candidate
+        for ext in [".ogg", ".mp3", ".wav", ".flac", ".m4a", ".aac"]:
+            candidates = list(chart_dir.glob(f"*{ext}"))
+            if candidates:
+                return candidates[0]
+        return None

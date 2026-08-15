@@ -58,7 +58,7 @@ ADOFAI charts are stored as JSON-like files with the following structure:
   - `Pause`: Pause movement for duration
   - `Hold`: Hold input for duration
   - `MultiPlanet`: Multiple orbiting planets
-  - Camera/VFX events (not yet supported in v1)
+  - Camera/VFX events (MoveCamera, MoveTrack, Flash, Bloom, ShakeScreen, SetFilter)
 - **`decorations`** — Visual decorations (not yet supported in v1)
 
 ### Format Quirks
@@ -102,7 +102,7 @@ The `adofai/event.py` module defines intermediate events for model training/infe
 1. **Integer angles (0-359)** — No quantization to preserve expressiveness
 2. **Midspin as distinct event** — `999` is a special tile type, not an angle
 3. **Floor-to-time conversion** — Actions use floor indices; we convert to/from timestamps using BPM and angle rotation math
-4. **v1 excludes camera/VFX** — Deferred to focus on playable rhythm mechanics
+4. **Camera/VFX are in this train** — MoveCamera, MoveTrack, Flash/Bloom/ShakeScreen/SetFilter use SharpFAI on-disk keys. Decorations stay deferred.
 
 ## Timing Calculations
 
@@ -276,25 +276,22 @@ Metrics to assess generated ADOFAI charts:
 
 Manual playtesting is essential — ADOFAI is very sensitive to timing precision.
 
-## Current Limitations (v1)
+## Current Limitations
 
-- ❌ Model NOT trained on ADOFAI data (export/inference is stub/placeholder only)
-- ❌ LSTM proof-of-concept (Whisper encoder integration TODO)
-- ❌ No camera events (MoveCamera, MoveTrack)
-- ❌ No VFX events (Flash, Bloom, ShakeScreen)
-- ❌ No decorations
-- ❌ No multi-file level support (separate audio/image files)
-- ✅ Training pipeline complete (dataset, tokenizer, model, checkpoints)
-- ✅ Memory-optimized for T4 GPU (log-mel spectrograms, 60s audio cap)
-- ✅ Basic playable mechanics ready for training (tiles, speed, twirl, hold)
+- Production train path is `python osuT5/train.py -cn adofai_v31` (Whisper-small / v31). `adofai/train.py` LSTM is a deprecated stub.
+- Audio input is raw waveform frames `[src_seq_len-1, hop_length]`. The model owns the Mel. Do not use the old 60s T4 crop.
+- Difficulty is `settings.difficulty` (1–10), else `index.json` / `metadata.json`, else documented proxy `5.0`. There is no osu star rating.
+- `max_source_positions = src_seq_len // 2`. Do not mix tiny (`src 1024`) and v31 (`src 4096`) checkpoints.
+- 126 Workshop charts are enough to smoke the pipeline, not enough for osu-quality generalization.
+- Decorations / particles / editor-only events are deferred.
+- `adofai/inference.py`, `adofai/tokenizer.py`, and `adofai/osu_to_adofai.py` are not the infer path.
 
 ## Next Steps
 
-1. **Collect ADOFAI dataset** — gather 100+ Workshop charts + audio ✅ (you can start now)
-2. **Run training** — use Colab notebook or local GPU ✅ (pipeline ready)
-3. **Integrate Whisper encoder** — adapt from upstream osuT5 (future work)
-4. **Evaluate** — playtest generated charts and iterate
-5. **Extend to v2** — add camera, VFX, decorations
+1. Collect a serious ADOFAI set (orders of magnitude more chart+audio pairs than 126).
+2. Smoke: `python osuT5/train.py -cn adofai_whisper_tiny`
+3. Full train on Colab Pro A100/L4 or 4090: `python osuT5/train.py -cn adofai_v31 data.train_dataset_path=/path/to/charts`
+4. Generate with the trained Whisper checkpoint, then `events_to_level` export.
 
 ## References
 

@@ -209,6 +209,13 @@ class Tokenizer(PushToHubMixin):
                 self.event_ranges.append(EventRange(EventType.COLOR_TRACK, 0, 10))
                 self.event_ranges.append(EventRange(EventType.ANIMATE_TRACK, 0, 10))
                 self.event_ranges.append(EventRange(EventType.MOVE_CAMERA, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CAMERA_POSITION_X, -200, 200))
+                self.event_ranges.append(EventRange(EventType.CAMERA_POSITION_Y, -200, 200))
+                self.event_ranges.append(EventRange(EventType.CAMERA_ROTATION, 0, 359))
+                self.event_ranges.append(EventRange(EventType.CAMERA_ZOOM, 0, 400))
+                self.event_ranges.append(EventRange(EventType.CAMERA_DURATION, 0, 100))
+                self.event_ranges.append(EventRange(EventType.CAMERA_EASE, 0, 40))
+                self.event_ranges.append(EventRange(EventType.CAMERA_RELATIVE, 0, 4))
                 
                 # Audio events
                 self.event_ranges.append(EventRange(EventType.SET_HITSOUND, 0, 10))
@@ -224,7 +231,7 @@ class Tokenizer(PushToHubMixin):
                 self.event_ranges.append(EventRange(EventType.FLASH, 0, 100))  # Duration in 0.1 beat steps
                 self.event_ranges.append(EventRange(EventType.BLOOM, 0, 200))  # Intensity 0-200
                 self.event_ranges.append(EventRange(EventType.SHAKE_SCREEN, 0, 200))  # Intensity
-                self.event_ranges.append(EventRange(EventType.SET_FILTER, 0, 10))  # Filter type enum
+                self.event_ranges.append(EventRange(EventType.SET_FILTER, 0, 40))  # MagicShaper filter enum
                 
                 # Metadata (prefix tokens)
                 self.input_event_ranges.append(EventRange(EventType.BPM, 40, 300))

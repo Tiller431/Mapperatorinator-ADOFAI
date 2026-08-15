@@ -197,9 +197,9 @@ class AdofaiConverter:
                         events.append(Event(EventType.CAMERA_ZOOM, int(zoom)))
                         event_times.append(current_time)
                         
-                        # Duration in beats
+                        # Duration in beats, quantized to 0.1-beat steps
                         duration = action.get("duration", 1.0)
-                        events.append(Event(EventType.CAMERA_DURATION, duration))
+                        events.append(Event(EventType.CAMERA_DURATION, int(round(float(duration) * 10))))
                         event_times.append(current_time)
                         
                         # Ease type (string -> enum ID)
@@ -380,16 +380,11 @@ class AdofaiConverter:
             if tile_angle == 999:
                 events.append(Event(EventType.MIDSPIN, 999))
                 event_times.append(current_time)
-                # Midspin: outgoing heading = incoming heading (NOT incoming + 180)
-                # Don't update current_heading, planet continues in same direction
-                continue
-            
-            # Add tile angle event
-            events.append(Event(EventType.TIME_SHIFT, int(current_time)))
-            event_times.append(current_time)
-            
-            events.append(Event(EventType.TILE_ANGLE, tile_angle))
-            event_times.append(current_time)
+            else:
+                events.append(Event(EventType.TIME_SHIFT, int(current_time)))
+                event_times.append(current_time)
+                events.append(Event(EventType.TILE_ANGLE, tile_angle))
+                event_times.append(current_time)
             
             # Calculate time to next tile using community formula
             # rel = (next_angle - current_heading + 540) % 360
@@ -398,37 +393,30 @@ class AdofaiConverter:
             # ms = (rel / 180) * (60000 / bpm)
             
             if floor_idx < len(level.angle_data) - 1:
-                next_angle = float(tile_angle)
-                
-                # Calculate relative angle from current heading to next tile
+                next_angle = float(level.angle_data[floor_idx + 1])
+                if next_angle == 999:
+                    # Midspin next: outgoing heading = this tile angle, not this+180.
+                    # Midspin itself does not consume a travel interval.
+                    if tile_angle != 999:
+                        current_heading = float(tile_angle)
+                    continue
+
+                # Community formula: rel=(next-this+540)%360
                 rel = (next_angle - current_heading + 540) % 360
-                
-                # Apply twirl
                 if not twirl_clockwise:
                     rel = 360 - rel
-                
-                # angle_diff == 0 must be 360° (full spin), not 0ms
                 if rel == 0:
                     rel = 360
-                
-                # Convert to time: 180° = 1 beat
+
                 beats = rel / 180.0
-                
-                # Apply Hold: add extra beats
                 beats += hold_duration
-                hold_duration = 0.0  # Reset for next tile
-                
-                # Apply MultiPlanet: divide by planet count
+                hold_duration = 0.0
                 beats /= multiplanet_count
-                multiplanet_count = 1  # Reset to normal
-                
-                ms_per_beat = 60000.0 / current_bpm
-                time_delta = beats * ms_per_beat
-                
-                current_time += time_delta
-                
-                # Update heading: after hitting this tile, planet heads out at tile's angle
-                current_heading = next_angle
+                multiplanet_count = 1
+
+                current_time += beats * (60000.0 / current_bpm)
+                if tile_angle != 999:
+                    current_heading = float(tile_angle)
         
         return events, event_times
     
@@ -581,7 +569,7 @@ class AdofaiConverter:
                     elif events[j].type == EventType.CAMERA_ZOOM:
                         camera_action["zoom"] = events[j].value
                     elif events[j].type == EventType.CAMERA_DURATION:
-                        camera_action["duration"] = events[j].value
+                        camera_action["duration"] = events[j].value / 10.0
                     elif events[j].type == EventType.CAMERA_EASE:
                         camera_action["ease"] = self._id_to_ease(int(events[j].value))
                     elif events[j].type == EventType.CAMERA_RELATIVE:

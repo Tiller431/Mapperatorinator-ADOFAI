@@ -4,7 +4,14 @@ defaults:
   - _self_
 
 compile: false         # Disable for smoke test
-mixed_precision: 'no'  # Disable for smoke test
+mixed_precision: 'no'
+precision: 'fp32'
+
+model:
+  do_difficulty_embed: true
+  do_style_embed: false
+  do_mapper_embed: false
+  do_song_position_embed: false
 
 data:                  # Data settings
   dataset_type: "adofai"
@@ -45,8 +52,8 @@ data:                  # Data settings
   num_diff_classes: 24
   max_diff: 20
   
-  timing_random_offset: 2
-  src_seq_len: 1024            # Tiny: shorter context for speed
+  timing_random_offset: 0  # Forbidden jitter; do not mix with v31 4096 checkpoints
+  src_seq_len: 1024            # Tiny only. max_source_positions = src_seq_len // 2 = 512
   tgt_seq_len: 2048
   rhythm_weight: 1.0
   

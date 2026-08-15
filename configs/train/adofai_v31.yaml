@@ -4,7 +4,14 @@ defaults:
   - _self_
 
 compile: true          # PyTorch 2.0 optimization
-mixed_precision: 'bf16'         # Enable mixed precision (no/fp16/bf16)
+mixed_precision: 'bf16'
+precision: 'bf16'
+
+model:
+  do_difficulty_embed: true   # RBF encoder embed (from whisper_small_v2)
+  do_style_embed: false
+  do_mapper_embed: false
+  do_song_position_embed: false
 
 data:                  # Data settings
   dataset_type: "adofai"
@@ -53,6 +60,7 @@ data:                  # Data settings
   # ---
   timing_random_offset: 0  # ADOFAI: no timing jitter (forbidden augmentation)
   src_seq_len: 4096            # v31: longer context (32.8s @ 16kHz, hop 128)
+  # max_source_positions = src_seq_len // 2 = 2048. Do not mix with tiny (src 1024 → 512).
   tgt_seq_len: 8192            # v31: longer target
   rhythm_weight: 1.0           # v31/v29: Weight of rhythm tokens in loss
   

@@ -62,6 +62,7 @@ class AdofaiTokenizer:
         
         self.pad_token_id = self.token_to_id['<pad>']
         self.sos_token_id = self.token_to_id['<sos>']
+        self.bos_token_id = self.sos_token_id  # Alias for consistency
         self.eos_token_id = self.token_to_id['<eos>']
         self.unk_token_id = self.token_to_id['<unk>']
         
@@ -212,6 +213,75 @@ class AdofaiTokenizer:
         
         tokens.append(self.eos_token_id)
         return tokens
+    
+    def token_to_event(self, token_id: int) -> Optional[AdofaiEvent]:
+        """
+        Convert single token ID back to event.
+        
+        Returns None for special tokens or unrecognized tokens.
+        """
+        if token_id not in self.id_to_token:
+            return None
+        
+        token_str = self.id_to_token[token_id]
+        
+        # Special tokens
+        if token_str in ['<pad>', '<sos>', '<eos>', '<unk>']:
+            return None
+        
+        # Time shift
+        if token_str.startswith('time'):
+            time_ms = int(token_str[4:])
+            return AdofaiEvent(AdofaiEventType.TIME_SHIFT, time_ms)
+        
+        # Angle
+        if token_str.startswith('angle'):
+            angle = int(token_str[5:])
+            return AdofaiEvent(AdofaiEventType.TILE_ANGLE, angle)
+        
+        # Midspin
+        if token_str == 'midspin':
+            return AdofaiEvent(AdofaiEventType.MIDSPIN, 999)
+        
+        # BPM
+        if token_str.startswith('bpm'):
+            bpm = int(token_str[3:])
+            return AdofaiEvent(AdofaiEventType.SET_SPEED_BPM, bpm)
+        
+        # Speed multiplier
+        if token_str.startswith('speedmult'):
+            mult = float(token_str[9:])
+            return AdofaiEvent(AdofaiEventType.SET_SPEED_MULT, mult)
+        
+        # Twirl
+        if token_str == 'twirl':
+            return AdofaiEvent(AdofaiEventType.TWIRL, 0)
+        
+        # Pause (duration follows)
+        if token_str == 'pause':
+            return AdofaiEvent(AdofaiEventType.PAUSE, 0.0)
+        
+        # Hold (duration follows)
+        if token_str == 'hold':
+            return AdofaiEvent(AdofaiEventType.HOLD, 0.0)
+        
+        # Duration
+        if token_str.startswith('dur'):
+            # This is a duration value that modifies previous pause/hold
+            # Return as a special marker that caller can handle
+            return None
+        
+        # MultiPlanet
+        if token_str == 'multiplanet':
+            return AdofaiEvent(AdofaiEventType.MULTI_PLANET, 2)
+        
+        # Offset
+        if token_str.startswith('offset'):
+            offset = int(token_str[6:])
+            return AdofaiEvent(AdofaiEventType.OFFSET, offset)
+        
+        # Unknown
+        return None
     
     def save(self, path: str):
         """Save tokenizer to file."""

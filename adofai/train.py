@@ -100,8 +100,84 @@ class SimpleADOFAIModel(nn.Module):
             
             return logits
         else:
-            # Autoregressive generation (not implemented for smoke test)
-            raise NotImplementedError("Inference not implemented in smoke model")
+            # Autoregressive generation for inference
+            return audio_context  # Return context for use by generate() method
+    
+    def generate(
+        self,
+        audio,
+        max_length: int = 512,
+        bos_token_id: int = 0,
+        eos_token_id: int = 1,
+        pad_token_id: int = 2,
+        temperature: float = 1.0,
+        top_k: int = 50,
+    ):
+        """
+        Generate tokens autoregressively from audio.
+        
+        Args:
+            audio: [batch, time_frames, n_mels] log-mel spectrogram
+            max_length: Maximum sequence length to generate
+            bos_token_id: Begin-of-sequence token ID
+            eos_token_id: End-of-sequence token ID
+            pad_token_id: Padding token ID
+            temperature: Sampling temperature (1.0 = no change, <1 = more confident, >1 = more random)
+            top_k: Only sample from top k most likely tokens (0 = no filtering)
+        
+        Returns:
+            generated_tokens: [batch, seq_len] generated token IDs
+        """
+        batch_size = audio.shape[0]
+        device = audio.device
+        
+        # Get audio context
+        audio_context = self.forward(audio, target_tokens=None)  # [batch, 1, hidden]
+        
+        # Start with BOS token
+        generated = torch.full((batch_size, 1), bos_token_id, dtype=torch.long, device=device)
+        
+        # LSTM hidden state
+        lstm_hidden = None
+        
+        for step in range(max_length):
+            # Get embeddings for current sequence
+            if step == 0:
+                # First step: use audio context
+                decoder_input = audio_context  # [batch, 1, hidden]
+            else:
+                # Subsequent steps: embed last generated token
+                last_token = generated[:, -1:]  # [batch, 1]
+                token_embed = self.decoder_embedding(last_token)  # [batch, 1, hidden]
+                decoder_input = token_embed
+            
+            # LSTM forward
+            decoder_output, lstm_hidden = self.decoder_lstm(decoder_input, lstm_hidden)
+            
+            # Get logits for next token
+            logits = self.output_head(decoder_output[:, -1, :])  # [batch, vocab_size]
+            
+            # Apply temperature
+            if temperature != 1.0:
+                logits = logits / temperature
+            
+            # Apply top-k filtering
+            if top_k > 0:
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+                logits[indices_to_remove] = float('-inf')
+            
+            # Sample next token
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)  # [batch, 1]
+            
+            # Append to generated sequence
+            generated = torch.cat([generated, next_token], dim=1)
+            
+            # Check if all sequences have generated EOS
+            if (next_token == eos_token_id).all():
+                break
+        
+        return generated
 
 
 def train_epoch(
@@ -277,6 +353,12 @@ def main():
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'train_loss': train_loss,
+            'model_config': {
+                'vocab_size': tokenizer.vocab_size,
+                'hidden_size': hidden_size,
+                'num_layers': num_layers,
+                'n_mels': 80,
+            },
         }, checkpoint_path)
         print(f"Saved checkpoint: {checkpoint_path}")
     

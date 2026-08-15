@@ -17,6 +17,23 @@ def rotate_xy(x: float, y: float, rotate_deg: float) -> list[float]:
     return [x * cos_r - y * sin_r, x * sin_r + y * cos_r]
 
 
+def _numeric_xy(pos) -> tuple[float, float] | None:
+    """Return (x, y) only when both coords are finite numbers; else leave the field alone."""
+    if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+        return None
+    x, y = pos[0], pos[1]
+    if x is None or y is None:
+        return None
+    try:
+        xf = float(x)
+        yf = float(y)
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(xf) and np.isfinite(yf)):
+        return None
+    return xf, yf
+
+
 def apply_rotation(angle_data: list, actions: list[dict], rotate_deg: float) -> tuple[list, list[dict]]:
     rotated_angles = [(int(a + rotate_deg) % 360) if a != 999 else 999 for a in angle_data]
     rotated_actions = []
@@ -24,15 +41,15 @@ def apply_rotation(angle_data: list, actions: list[dict], rotate_deg: float) -> 
         act = dict(action)
         event_type = act.get("eventType", "")
         if event_type in ("MoveCamera", "PositionTrack", "AnimateTrack"):
-            pos = act.get("position", [0, 0])
-            if isinstance(pos, (list, tuple)) and len(pos) == 2:
-                act["position"] = rotate_xy(float(pos[0]), float(pos[1]), rotate_deg)
+            xy = _numeric_xy(act.get("position"))
+            if xy is not None:
+                act["position"] = rotate_xy(xy[0], xy[1], rotate_deg)
             if "rotation" in act:
                 act["rotation"] = (float(act["rotation"]) + rotate_deg) % 360
         elif event_type == "MoveTrack":
-            pos_offset = act.get("positionOffset", [0, 0])
-            if isinstance(pos_offset, (list, tuple)) and len(pos_offset) == 2:
-                act["positionOffset"] = rotate_xy(float(pos_offset[0]), float(pos_offset[1]), rotate_deg)
+            xy = _numeric_xy(act.get("positionOffset"))
+            if xy is not None:
+                act["positionOffset"] = rotate_xy(xy[0], xy[1], rotate_deg)
         rotated_actions.append(act)
     return rotated_angles, rotated_actions
 
@@ -68,15 +85,15 @@ def apply_reflection(angle_data: list, actions: list[dict], axis: str = "x_flip"
         act = dict(action)
         event_type = act.get("eventType", "")
         if event_type in ("MoveCamera", "PositionTrack", "AnimateTrack"):
-            pos = act.get("position", [0, 0])
-            if isinstance(pos, (list, tuple)) and len(pos) == 2:
-                act["position"] = reflect_xy(float(pos[0]), float(pos[1]))
+            xy = _numeric_xy(act.get("position"))
+            if xy is not None:
+                act["position"] = reflect_xy(xy[0], xy[1])
             if "rotation" in act:
                 act["rotation"] = reflect_fn(float(act["rotation"]))
         elif event_type == "MoveTrack":
-            pos_offset = act.get("positionOffset", [0, 0])
-            if isinstance(pos_offset, (list, tuple)) and len(pos_offset) == 2:
-                act["positionOffset"] = reflect_xy(float(pos_offset[0]), float(pos_offset[1]))
+            xy = _numeric_xy(act.get("positionOffset"))
+            if xy is not None:
+                act["positionOffset"] = reflect_xy(xy[0], xy[1])
         reflected_actions.append(act)
     has_floor_0_twirl = any(
         act.get("floor") == 0 and act.get("eventType") == "Twirl" for act in reflected_actions

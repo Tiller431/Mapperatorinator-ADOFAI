@@ -37,15 +37,54 @@ def apply_rotation(angle_data: list, actions: list[dict], rotate_deg: float) -> 
     return rotated_angles, rotated_actions
 
 
-def apply_reflection(angle_data: list, actions: list[dict], reflect_fn) -> tuple[list, list[dict]]:
+REFLECT_AXES = {
+    # Angle formulas from the lock list; matching XY / camera rotation transforms.
+    "x_flip": {
+        "angle": lambda a: (-a) % 360 if a != 999 else 999,
+        "xy": lambda x, y: [x, -y],
+    },
+    "y_flip": {
+        "angle": lambda a: (180 - a) % 360 if a != 999 else 999,
+        "xy": lambda x, y: [-x, y],
+    },
+    "diag_y_eq_x": {
+        "angle": lambda a: (90 - a) % 360 if a != 999 else 999,
+        "xy": lambda x, y: [y, x],
+    },
+    "diag_y_eq_neg_x": {
+        "angle": lambda a: (270 - a) % 360 if a != 999 else 999,
+        "xy": lambda x, y: [-y, -x],
+    },
+}
+
+
+def apply_reflection(angle_data: list, actions: list[dict], axis: str = "x_flip") -> tuple[list, list[dict]]:
+    spec = REFLECT_AXES[axis]
+    reflect_fn = spec["angle"]
+    reflect_xy = spec["xy"]
     reflected_angles = [reflect_fn(a) for a in angle_data]
+    reflected_actions = []
+    for action in actions:
+        act = dict(action)
+        event_type = act.get("eventType", "")
+        if event_type in ("MoveCamera", "PositionTrack", "AnimateTrack"):
+            pos = act.get("position", [0, 0])
+            if isinstance(pos, (list, tuple)) and len(pos) == 2:
+                act["position"] = reflect_xy(float(pos[0]), float(pos[1]))
+            if "rotation" in act:
+                act["rotation"] = reflect_fn(float(act["rotation"]))
+        elif event_type == "MoveTrack":
+            pos_offset = act.get("positionOffset", [0, 0])
+            if isinstance(pos_offset, (list, tuple)) and len(pos_offset) == 2:
+                act["positionOffset"] = reflect_xy(float(pos_offset[0]), float(pos_offset[1]))
+        reflected_actions.append(act)
     has_floor_0_twirl = any(
-        act.get("floor") == 0 and act.get("eventType") == "Twirl" for act in actions
+        act.get("floor") == 0 and act.get("eventType") == "Twirl" for act in reflected_actions
     )
     if not has_floor_0_twirl:
-        return reflected_angles, [{"floor": 0, "eventType": "Twirl"}] + list(actions)
+        return reflected_angles, [{"floor": 0, "eventType": "Twirl"}] + reflected_actions
     return reflected_angles, [
-        act for act in actions
+        act for act in reflected_actions
         if not (act.get("floor") == 0 and act.get("eventType") == "Twirl")
     ]
 

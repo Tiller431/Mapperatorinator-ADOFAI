@@ -231,11 +231,35 @@ class Tokenizer(PushToHubMixin):
                 self.event_ranges.append(EventRange(EventType.FLASH, 0, 100))  # Duration in 0.1 beat steps
                 self.event_ranges.append(EventRange(EventType.BLOOM, 0, 200))  # Intensity 0-200
                 self.event_ranges.append(EventRange(EventType.SHAKE_SCREEN, 0, 200))  # Intensity
-                self.event_ranges.append(EventRange(EventType.SET_FILTER, 0, 40))  # MagicShaper filter enum
+                self.event_ranges.append(EventRange(EventType.SET_FILTER, 0, 50))
+                self.event_ranges.append(EventRange(EventType.SET_FILTER_ADVANCED, 0, 50))
+                self.event_ranges.append(EventRange(EventType.FILTER_PROPERTIES, 0, 1))
+                self.event_ranges.append(EventRange(EventType.BOOKMARK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.EDITOR_COMMENT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CALL_METHOD, 0, 0))
+                self.event_ranges.append(EventRange(EventType.ADD_COMPONENT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CHANGE_TRACK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM_WARNING, 0, 0))
+                self.event_ranges.append(EventRange(EventType.PAUSE_COUNTDOWN, 0, 20))
+                self.event_ranges.append(EventRange(EventType.PAUSE_ANGLE_DIR, 0, 2))
+                self.event_ranges.append(EventRange(EventType.HOLD_DISTANCE, 0, 400))
+                self.event_ranges.append(EventRange(EventType.HOLD_LANDING, 0, 1))
+                self.event_ranges.append(EventRange(EventType.TRACK_START_TILE, 0, 519))
+                self.event_ranges.append(EventRange(EventType.TRACK_END_TILE, 0, 519))
+                self.event_ranges.append(EventRange(EventType.VFX_PLANE, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_COLOR, 0, 4095))
+                self.event_ranges.append(EventRange(EventType.VFX_OPACITY, 0, 100))
+                self.event_ranges.append(EventRange(EventType.VFX_ENABLED, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_DISABLE_OTHERS, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_INTENSITY, 0, 200))
+                self.event_ranges.append(EventRange(EventType.VFX_STRENGTH, 0, 200))
+                self.event_ranges.append(EventRange(EventType.VFX_THRESHOLD, 0, 100))
+                self.event_ranges.append(EventRange(EventType.ANGLE_OFFSET, -180, 180))
                 
                 # Metadata (prefix tokens)
                 self.input_event_ranges.append(EventRange(EventType.BPM, 40, 300))
                 self.input_event_ranges.append(EventRange(EventType.OFFSET, -1000, 1000))
+                self.input_event_ranges.append(EventRange(EventType.PITCH, 50, 200))
 
         self.event_ranges: list[EventRange] = self.event_ranges + [
             EventRange(EventType.NEW_COMBO, 0, 0),

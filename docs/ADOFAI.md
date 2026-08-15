@@ -167,6 +167,7 @@ Each chart yields **ONE augmented variant per epoch** with random sampling. Tran
 - **Reflection:** With probability p_reflect (default 0.5), pick one axis from proven family
   - Axes: X-flip (−a % 360), Y-flip (180−a), y=x (90−a), y=−x (270−a)
   - Add floor-0 Twirl (toggle if already exists)
+  - Camera/track world positions and camera rotation are reflected; angleOffset unchanged
   - 999 unchanged
 
 - **Matched-rate:** With probability p_rate (default 0.5), sample r ~ Uniform[0.85, 1.25]
@@ -193,10 +194,11 @@ Each chart yields **ONE augmented variant per epoch** with random sampling. Tran
 - **Gameplay:** Checkpoint, AutoPlayTiles, SetPlanetRotation, FreeRoam*, ScaleMargin, ScaleRadius, Multitap, Hide, KillPlayer
 - **Audio:** SetHitsound, PlaySound, SetHoldSound
 - **Control flow:** RepeatEvents, SetConditionalEvents, SetInputEvent
-- **VFX:** Flash, Bloom, ShakeScreen, SetFilter
-- **Conditioning:** Difficulty prefix token (from `settings.difficulty` or index JSON)
+- **VFX:** Flash, Bloom, ShakeScreen, SetFilter, SetFilterAdvanced (`filterProperties` presence only)
+- **Rare (tokenize only):** Bookmark, EditorComment, CallMethod, AddComponent, ChangeTrack, FreeRoamWarning
+- **Conditioning:** Difficulty prefix token (from `settings.difficulty` or index JSON); settings `bpm` / `offset` / `pitch`
 
-**NOT included:** Decorations, particles, editor-only events. No style/descriptor tags.
+**NOT included:** Decorations, particles. No style/descriptor/year/mapper tags. `filterProperties` string payload is not lossless (empty vs present).
 
 ### Hardware Requirements
 

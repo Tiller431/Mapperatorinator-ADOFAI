@@ -166,6 +166,90 @@ class TestLosslessAugmentation:
         assert rotated_angles[1] == 999  # Unchanged
         assert rotated_angles[2] == 135
 
+    def test_reflect_axis_formulas(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_reflection
+
+        assert apply_reflection([40, 999], [], "x_flip")[0] == [320, 999]
+        assert apply_reflection([40, 999], [], "y_flip")[0] == [140, 999]
+        assert apply_reflection([40, 999], [], "diag_y_eq_x")[0] == [50, 999]
+        assert apply_reflection([40, 999], [], "diag_y_eq_neg_x")[0] == [230, 999]
+
+    def test_reflect_toggles_floor0_twirl_only(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_reflection
+
+        angles, actions = apply_reflection(
+            [10, 999],
+            [{"floor": 1, "eventType": "Twirl"}],
+            "x_flip",
+        )
+        assert angles[0] == 350
+        assert angles[1] == 999
+        assert actions[0] == {"floor": 0, "eventType": "Twirl"}
+        assert actions[1]["floor"] == 1
+        angles2, actions2 = apply_reflection(angles, actions, "x_flip")
+        assert not any(a.get("floor") == 0 and a.get("eventType") == "Twirl" for a in actions2)
+
+    def test_reflect_updates_camera_and_track_positions(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_reflection
+
+        angles, actions = apply_reflection(
+            [30],
+            [
+                {"eventType": "MoveCamera", "position": [10, 4], "rotation": 30, "angleOffset": 12},
+                {"eventType": "MoveTrack", "positionOffset": [6, 2], "angleOffset": 8},
+                {"floor": 2, "eventType": "Twirl"},
+            ],
+            "x_flip",
+        )
+        assert angles[0] == 330
+        cam = actions[1] if actions[0]["eventType"] == "Twirl" else actions[0]
+        track = next(a for a in actions if a["eventType"] == "MoveTrack")
+        assert cam["position"] == [10, -4]
+        assert cam["rotation"] == 330
+        assert cam["angleOffset"] == 12
+        assert track["positionOffset"] == [6, -2]
+        assert track["angleOffset"] == 8
+
+    def test_rotation_leaves_twirl_and_angleOffset(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
+        angles, actions = apply_rotation(
+            [10, 999],
+            [
+                {"floor": 0, "eventType": "Twirl"},
+                {"eventType": "MoveCamera", "position": [0, 0], "rotation": 10, "angleOffset": 15},
+            ],
+            90.0,
+        )
+        assert angles == [100, 999]
+        assert actions[0] == {"floor": 0, "eventType": "Twirl"}
+        assert actions[1]["angleOffset"] == 15
+
+    def test_matched_rate_scales_bpm_not_multipliers_or_beats(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_matched_rate
+
+        settings, actions = apply_matched_rate(
+            {"bpm": 120, "offset": 200, "pitch": 100},
+            [
+                {"eventType": "SetSpeed", "speedType": "Bpm", "beatsPerMinute": 140, "angleOffset": 9},
+                {"eventType": "SetSpeed", "speedType": "Multiplier", "bpmMultiplier": 1.5, "angleOffset": 3},
+                {"eventType": "Pause", "duration": 2.0},
+                {"eventType": "Hold", "duration": 1.0},
+                {"eventType": "MoveCamera", "duration": 4.0, "angleOffset": 11},
+            ],
+            2.0,
+        )
+        assert settings["bpm"] == 240
+        assert settings["offset"] == 100
+        assert settings["pitch"] == 100
+        assert actions[0]["beatsPerMinute"] == 280
+        assert actions[0]["angleOffset"] == 9
+        assert actions[1]["bpmMultiplier"] == 1.5
+        assert actions[2]["duration"] == 2.0
+        assert actions[3]["duration"] == 1.0
+        assert actions[4]["duration"] == 4.0
+        assert actions[4]["angleOffset"] == 11
+
 
 class TestConverterTimingBugs:
     """Test that converter timing bugs are fixed."""
@@ -216,26 +300,26 @@ class TestConverterTimingBugs:
             assert abs(time_delta - 1000) < 10  # Allow small rounding error
     
     def test_midspin_heading_unchanged(self):
-        """Midspin outgoing heading = incoming heading (not incoming + 180)."""
+        """Midspin outgoing heading = this tile angle (not this+180); midspin consumes no travel."""
         converter = AdofaiConverter()
+        # Distinguishes heading=90 (correct, 250ms) from heading=180 (wrong, 1000ms).
         level = AdofaiLevel(
             settings={"bpm": 120, "offset": 0},
-            angle_data=[0, 999, 180],  # Tile, midspin, tile
+            angle_data=[90, 999, 0],
             actions=[],
             decorations=[]
         )
         
         events, event_times = converter.level_to_events(level)
         
-        # Find midspin and check it's emitted
         midspin_events = [e for e in events if e.type == EventType.MIDSPIN]
         assert len(midspin_events) > 0
+        assert midspin_events[0].value == 0
         
-        # After midspin, planet should continue toward next tile
-        # from the same heading (not flipped)
         time_shifts = [e.value for e in events if e.type == EventType.TIME_SHIFT]
-        # Midspin doesn't advance time
-        assert len(time_shifts) >= 2
+        assert len(time_shifts) == 2
+        assert time_shifts[0] == 0
+        assert abs(time_shifts[1] - 250) < 10
     
     def test_pause_adds_time(self):
         """Pause adds extra time (duration in beats)."""
@@ -256,8 +340,10 @@ class TestConverterTimingBugs:
         pause_events = [(e, t) for e, t in zip(events, event_times) if e.type == EventType.PAUSE]
         assert len(pause_events) > 0
         
-        # Pause should add 2 beats = 1000ms @ 120 BPM
-        # Check that time advances correctly
+        time_shifts = [e.value for e in events if e.type == EventType.TIME_SHIFT]
+        # Tile 0 stays at offset; pause 2 beats = 1000ms is added before travel.
+        assert time_shifts[0] == 0
+        assert abs((time_shifts[1] - time_shifts[0]) - 1250) < 10
     
     def test_hold_extends_travel_time(self):
         """Hold extends travel time by duration beats."""
@@ -280,10 +366,11 @@ class TestConverterTimingBugs:
         hold_events = [e for e in events if e.type == EventType.HOLD]
         assert len(hold_events) > 0
         
-        # TODO: Verify time delta is extended
+        time_shifts = [e.value for e in events if e.type == EventType.TIME_SHIFT]
+        assert abs((time_shifts[1] - time_shifts[0]) - 750) < 10
     
     def test_multiplanet_divides_travel_time(self):
-        """MultiPlanet divides travel time by planet count."""
+        """TwoPlanets is default (2 planets); interval matches the no-event baseline."""
         converter = AdofaiConverter()
         # Normal: 0→180 is 180° = 1 beat = 500ms
         # With TwoPlanets: 1 / 2 = 0.5 beats = 250ms
@@ -303,7 +390,9 @@ class TestConverterTimingBugs:
         multiplanet_events = [e for e in events if e.type == EventType.MULTI_PLANET]
         assert len(multiplanet_events) > 0
         
-        # TODO: Verify time delta is divided
+        # TwoPlanets is the game default, so the interval matches the no-event baseline.
+        time_shifts = [e.value for e in events if e.type == EventType.TIME_SHIFT]
+        assert abs((time_shifts[1] - time_shifts[0]) - 500) < 10
 
 
 class TestVFXFieldNames:
@@ -406,6 +495,10 @@ class TestVFXFieldNames:
         assert len(filter_events) > 0
         # Filter ID should map to Pixelate
         assert filter_events[0].value == 14  # Pixelate is ID 14 in the map
+        forbidden = {"Pixellate", "Bloom", "Warp", "RadialBlur", "Custom"}
+        assert forbidden.isdisjoint(converter.filter_types)
+        assert "PetalsInstant" in converter.filter_types
+        assert "Pixelate" in converter.filter_types
 
 
 class TestParserContractAndDifficulty:
@@ -494,6 +587,225 @@ class TestFrameWindowing:
         """Do not mix 1024 vs 4096 checkpoints: max_source_positions = src_seq_len // 2."""
         assert 4096 // 2 == 2048
         assert 1024 // 2 == 512
+
+
+class TestSharpFAIRoundTrip:
+    """Locked on-disk keys survive level → events → level."""
+
+    def _roundtrip(self, actions, settings=None):
+        converter = AdofaiConverter()
+        level = AdofaiLevel(
+            settings=settings or {"bpm": 120, "offset": 0, "pitch": 110, "difficulty": 6},
+            angle_data=[0, 90, 180],
+            actions=actions,
+            decorations=[],
+        )
+        events, times = converter.level_to_events(level)
+        return events, converter.events_to_level(events, times, level.settings)
+
+    def test_setspeed_locked_keys(self):
+        events, out = self._roundtrip([{
+            "floor": 1,
+            "eventType": "SetSpeed",
+            "speedType": "Bpm",
+            "beatsPerMinute": 160,
+            "bpmMultiplier": 1.0,
+            "angleOffset": 15,
+        }])
+        act = next(a for a in out.actions if a["eventType"] == "SetSpeed")
+        assert act["speedType"] == "Bpm"
+        assert act["beatsPerMinute"] == 160
+        assert "bpmMultiplier" in act
+        assert act["angleOffset"] == 15
+        assert "easing" not in act and "tag" not in act
+
+    def test_pause_hold_multiplanet_locked_keys(self):
+        _, out = self._roundtrip([
+            {"floor": 0, "eventType": "Pause", "duration": 2.0, "countdownTicks": 3, "angleCorrectionDir": 1},
+            {"floor": 1, "eventType": "Hold", "duration": 1.5, "distanceMultiplier": 80, "landingAnimation": True},
+            {"floor": 2, "eventType": "MultiPlanet", "planets": "ThreePlanets"},
+        ])
+        pause = next(a for a in out.actions if a["eventType"] == "Pause")
+        hold = next(a for a in out.actions if a["eventType"] == "Hold")
+        planets = next(a for a in out.actions if a["eventType"] == "MultiPlanet")
+        assert pause["duration"] == pytest.approx(2.0)
+        assert pause["countdownTicks"] == 3
+        assert pause["angleCorrectionDir"] == 1
+        assert hold["duration"] == pytest.approx(1.5)
+        assert hold["distanceMultiplier"] == 80
+        assert hold["landingAnimation"] is True
+        assert planets["planets"] == "ThreePlanets"
+
+    def test_movecamera_and_movetrack_locked_keys(self):
+        _, out = self._roundtrip([
+            {
+                "floor": 1,
+                "eventType": "MoveCamera",
+                "duration": 2.0,
+                "relativeTo": "LastPositionNoRotation",
+                "position": [3, -2],
+                "rotation": 45,
+                "zoom": 120,
+                "angleOffset": 15,
+                "ease": "OutQuad",
+                "eventTag": "cam1",
+            },
+            {
+                "floor": 2,
+                "eventType": "MoveTrack",
+                "startTile": [0, "ThisTile"],
+                "endTile": [2, "End"],
+                "duration": 1.0,
+                "positionOffset": [4, 5],
+                "angleOffset": 10,
+                "ease": "Linear",
+                "eventTag": "",
+            },
+        ])
+        cam = next(a for a in out.actions if a["eventType"] == "MoveCamera")
+        track = next(a for a in out.actions if a["eventType"] == "MoveTrack")
+        assert cam["relativeTo"] == "LastPositionNoRotation"
+        assert cam["ease"] == "OutQuad"
+        assert cam["angleOffset"] == 15
+        assert "easing" not in cam and "eventTag" in cam
+        assert track["positionOffset"] == [4, 5]
+        assert track["startTile"] == [0, "ThisTile"]
+        assert track["endTile"] == [2, "End"]
+        assert "position" not in track
+        assert track["ease"] == "Linear"
+        assert track["angleOffset"] == 10
+
+    def test_flash_bloom_shake_filter_advanced(self):
+        events, out = self._roundtrip([
+            {
+                "floor": 1,
+                "eventType": "Flash",
+                "duration": 1.0,
+                "plane": "Background",
+                "startColor": "ff0000",
+                "startOpacity": 80,
+                "endColor": "00ff00",
+                "endOpacity": 10,
+                "ease": "Linear",
+                "angleOffset": 0,
+                "eventTag": "",
+            },
+            {
+                "floor": 1,
+                "eventType": "Bloom",
+                "enabled": "Enabled",
+                "threshold": 40,
+                "intensity": 70,
+                "color": "aabbcc",
+            },
+            {
+                "floor": 1,
+                "eventType": "ShakeScreen",
+                "duration": 1.0,
+                "strength": 40,
+                "intensity": 25,
+                "fadeOut": "Enabled",
+            },
+            {
+                "floor": 2,
+                "eventType": "SetFilter",
+                "filter": "Pixelate",
+                "enabled": "Enabled",
+                "intensity": 90,
+                "disableOthers": "Enabled",
+            },
+            {
+                "floor": 2,
+                "eventType": "SetFilterAdvanced",
+                "filter": "PetalsInstant",
+                "enabled": "Disabled",
+                "disableOthers": "Enabled",
+                "filterProperties": "intensity:1",
+            },
+        ])
+        types = {e.type for e in events}
+        assert EventType.SET_FILTER_ADVANCED in types
+        flash = next(a for a in out.actions if a["eventType"] == "Flash")
+        bloom = next(a for a in out.actions if a["eventType"] == "Bloom")
+        shake = next(a for a in out.actions if a["eventType"] == "ShakeScreen")
+        filt = next(a for a in out.actions if a["eventType"] == "SetFilter")
+        adv = next(a for a in out.actions if a["eventType"] == "SetFilterAdvanced")
+        assert flash["plane"] == "Background"
+        assert "startColor" in flash and "startOpacity" in flash
+        assert "color" not in flash and "speed" not in shake
+        assert bloom["enabled"] == "Enabled"
+        assert bloom["intensity"] == 70
+        assert bloom["threshold"] == 40
+        assert "color" in bloom
+        assert shake["strength"] == 40
+        assert shake["intensity"] == 25
+        assert "speed" not in shake
+        assert filt["filter"] == "Pixelate"
+        assert filt["disableOthers"] == "Enabled"
+        assert adv["filter"] == "PetalsInstant"
+        assert "filterProperties" in adv
+        assert adv["enabled"] == "Disabled"
+
+    def test_rare_events_tokenized(self):
+        events, out = self._roundtrip([
+            {"floor": 0, "eventType": "Checkpoint"},
+            {"floor": 1, "eventType": "KillPlayer"},
+            {"floor": 1, "eventType": "Bookmark"},
+            {"floor": 2, "eventType": "EditorComment"},
+            {"floor": 2, "eventType": "CallMethod"},
+            {"floor": 2, "eventType": "AddComponent"},
+            {"floor": 2, "eventType": "ChangeTrack"},
+            {"floor": 2, "eventType": "FreeRoamWarning"},
+        ])
+        types = {e.type for e in events}
+        for needed in (
+            EventType.CHECKPOINT, EventType.KILL_PLAYER, EventType.BOOKMARK,
+            EventType.EDITOR_COMMENT, EventType.CALL_METHOD, EventType.ADD_COMPONENT,
+            EventType.CHANGE_TRACK, EventType.FREE_ROAM_WARNING,
+        ):
+            assert needed in types
+        names = {a["eventType"] for a in out.actions}
+        assert names >= {"Checkpoint", "KillPlayer", "Bookmark", "EditorComment", "CallMethod", "AddComponent", "ChangeTrack", "FreeRoamWarning"}
+
+    def test_settings_pitch_and_difficulty(self):
+        events, out = self._roundtrip([], {"bpm": 100, "offset": 20, "pitch": 115, "difficulty": 8})
+        assert any(e.type == EventType.PITCH and e.value == 115 for e in events)
+        assert out.settings["pitch"] == 115
+        assert out.settings.get("difficulty") == 8
+
+
+class TestConverterTimingDeltas:
+    def test_pause_hold_multiplanet_change_ms(self):
+        converter = AdofaiConverter()
+        base = AdofaiLevel(settings={"bpm": 120, "offset": 0}, angle_data=[0, 90], actions=[], decorations=[])
+        pause = AdofaiLevel(settings={"bpm": 120, "offset": 0}, angle_data=[0, 90], actions=[{"floor": 0, "eventType": "Pause", "duration": 2.0}], decorations=[])
+        hold = AdofaiLevel(settings={"bpm": 120, "offset": 0}, angle_data=[0, 90], actions=[{"floor": 0, "eventType": "Hold", "duration": 1.0}], decorations=[])
+        multi = AdofaiLevel(settings={"bpm": 120, "offset": 0}, angle_data=[0, 90], actions=[{"floor": 0, "eventType": "MultiPlanet", "planets": "TwoPlanets"}], decorations=[])
+
+        def tile_times(level):
+            events, _ = converter.level_to_events(level)
+            return [e.value for e in events if e.type == EventType.TIME_SHIFT]
+
+        base_t = tile_times(base)
+        pause_t = tile_times(pause)
+        hold_t = tile_times(hold)
+        multi_t = tile_times(multi)
+        # heading 180 → 90 is 0.5 beat = 250ms; pause 2 beats adds 1000ms after tile 0
+        assert abs((base_t[1] - base_t[0]) - 250) < 10
+        assert pause_t[0] == 0
+        assert abs((pause_t[1] - pause_t[0]) - 1250) < 10
+        assert abs((hold_t[1] - hold_t[0]) - 750) < 10
+        # TwoPlanets is default gameplay (2 planets); interval matches baseline
+        assert abs((multi_t[1] - multi_t[0]) - 250) < 10
+
+        three = AdofaiLevel(
+            settings={"bpm": 120, "offset": 0},
+            angle_data=[0, 90],
+            actions=[{"floor": 0, "eventType": "MultiPlanet", "planets": "ThreePlanets"}],
+            decorations=[],
+        )
+        three_t = tile_times(three)
+        assert abs((three_t[1] - three_t[0]) - (250 * 2 / 3)) < 10
 
 
 if __name__ == "__main__":

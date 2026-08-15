@@ -25,6 +25,7 @@ from ..config import DataConfig
 from adofai.parser import AdofaiLevel, parse_adofai
 from .adofai_augment import (
     ADOFAI_DIFFICULTY_PROXY,
+    REFLECT_AXES,
     apply_matched_rate,
     apply_reflection,
     apply_rotation,
@@ -95,12 +96,7 @@ class AdofaiDataset(IterableDataset, SequenceDatasetMixin):
         self.p_rate = getattr(args, "adofai_rate_prob", 0.5)
         self.rate_range = getattr(args, "adofai_rate_range", [0.85, 1.25])
         self.default_difficulty = getattr(args, "adofai_default_difficulty", ADOFAI_DIFFICULTY_PROXY)
-        self.reflect_axes = [
-            ("x_flip", lambda a: (-a) % 360 if a != 999 else 999),
-            ("y_flip", lambda a: (180 - a) % 360 if a != 999 else 999),
-            ("diag_y_eq_x", lambda a: (90 - a) % 360 if a != 999 else 999),
-            ("diag_y_eq_neg_x", lambda a: (270 - a) % 360 if a != 999 else 999),
-        ]
+        self.reflect_axes = list(REFLECT_AXES.keys())
 
         if chart_dirs is not None:
             self.chart_dirs = chart_dirs
@@ -133,8 +129,8 @@ class AdofaiDataset(IterableDataset, SequenceDatasetMixin):
     def _apply_rotation(self, angle_data, actions, rotate_deg):
         return apply_rotation(angle_data, actions, rotate_deg)
 
-    def _apply_reflection(self, angle_data, actions, reflect_fn):
-        return apply_reflection(angle_data, actions, reflect_fn)
+    def _apply_reflection(self, angle_data, actions, axis):
+        return apply_reflection(angle_data, actions, axis)
 
     def _apply_matched_rate(self, settings, actions, rate_factor):
         return apply_matched_rate(settings, actions, rate_factor)
@@ -171,8 +167,8 @@ class AdofaiDataset(IterableDataset, SequenceDatasetMixin):
             rotate_deg = random.uniform(0, 360)
             aug_angles, aug_actions = apply_rotation(aug_angles, aug_actions, rotate_deg)
         if not self.test and random.random() < self.p_reflect:
-            _, reflect_fn = random.choice(self.reflect_axes)
-            aug_angles, aug_actions = apply_reflection(aug_angles, aug_actions, reflect_fn)
+            axis = random.choice(self.reflect_axes)
+            aug_angles, aug_actions = apply_reflection(aug_angles, aug_actions, axis)
 
         rate_factor = 1.0
         if not self.test and random.random() < self.p_rate:

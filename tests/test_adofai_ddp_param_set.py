@@ -26,6 +26,17 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _load_ddp_utils():
+    """Load ddp_utils without importing osuT5.utils (that pulls slider)."""
+    import importlib.util
+
+    path = REPO_ROOT / "osuT5" / "osuT5" / "utils" / "ddp_utils.py"
+    spec = importlib.util.spec_from_file_location("osuT5_ddp_utils", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _clear_hydra():
     from hydra.core.global_hydra import GlobalHydra
 
@@ -59,12 +70,11 @@ def test_train_py_builds_cpu_model_and_asserts_before_prepare():
 
 def test_frozen_rank0_is_the_zero_param_ddp_bug_shape():
     torch = pytest.importorskip("torch")
-    from osuT5.osuT5.utils.model_utils import (
-        assert_identical_ddp_param_sets,
-        assert_model_ready_for_ddp,
-        ddp_param_signature,
-        ddp_reducer_named_parameters,
-    )
+    ddp_utils = _load_ddp_utils()
+    assert_identical_ddp_param_sets = ddp_utils.assert_identical_ddp_param_sets
+    assert_model_ready_for_ddp = ddp_utils.assert_model_ready_for_ddp
+    ddp_param_signature = ddp_utils.ddp_param_signature
+    ddp_reducer_named_parameters = ddp_utils.ddp_reducer_named_parameters
 
     class Tiny(torch.nn.Module):
         def __init__(self):
@@ -171,11 +181,9 @@ def test_adofai_v31_two_constructions_same_ddp_param_set():
     """Simulates two ranks each calling load_model / _get_model independently."""
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
-    from osuT5.osuT5.utils.model_utils import (
-        assert_identical_ddp_param_sets,
-        assert_model_ready_for_ddp,
-        ddp_param_signature,
-    )
+    ddp_utils = _load_ddp_utils()
+    assert_identical_ddp_param_sets = ddp_utils.assert_identical_ddp_param_sets
+    assert_model_ready_for_ddp = ddp_utils.assert_model_ready_for_ddp
 
     try:
         model_a, tokenizer_a = _build_v31_model()
@@ -183,12 +191,13 @@ def test_adofai_v31_two_constructions_same_ddp_param_set():
         pytest.skip(f"cannot construct adofai_v31 model: {exc}")
 
     sig_a = assert_model_ready_for_ddp(model_a)
-    # PR #9 buckets: ~95471, not the 270M raw-range explosion.
+    # PR #9 buckets: 95471 out (Whisper embed/lm_head). decoder_embedder is
+    # vocab_size_in (out + prefix ranges) and is larger.
+    assert tokenizer_a.vocab_size_out == 95471
     assert 95_000 <= tokenizer_a.vocab_size_out <= 96_000
-    embed = dict(sig_a).get("decoder_embedder.weight")
-    if embed is None:
-        embed = next(shape for name, shape in sig_a if "decoder_embedder" in name)
-    assert embed[0] == tokenizer_a.vocab_size_out
+    out_tables = [shape for _, shape in sig_a if shape[:1] == (tokenizer_a.vocab_size_out,)]
+    assert (tokenizer_a.vocab_size_out, 768) in out_tables
+    assert len(sig_a) == 427
     del model_a
 
     model_b, tokenizer_b = _build_v31_model()

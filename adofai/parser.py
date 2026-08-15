@@ -68,7 +68,7 @@ def parse_adofai(file_path: str | Path) -> AdofaiLevel:
     Parse an ADOFAI level file.
     
     Supports both angleData (modern) and pathData (legacy) formats.
-    Handles non-standard JSON formatting (trailing commas, etc.).
+    Handles non-standard JSON formatting (trailing commas, UTF-8 BOM, etc.).
     
     Args:
         file_path: Path to .adofai file
@@ -85,8 +85,9 @@ def parse_adofai(file_path: str | Path) -> AdofaiLevel:
     if not file_path.exists():
         raise FileNotFoundError(f"ADOFAI file not found: {file_path}")
     
-    # Read file content
-    with open(file_path, 'r', encoding='utf-8') as f:
+    # Read file content with utf-8-sig to strip UTF-8 BOM if present
+    # Many Workshop .adofai files start with BOM
+    with open(file_path, 'r', encoding='utf-8-sig') as f:
         content = f.read()
     
     # Clean up non-standard JSON

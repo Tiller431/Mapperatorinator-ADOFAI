@@ -117,6 +117,30 @@ def test_trailing_comma_tolerance():
             tmp_path.unlink()
 
 
+def test_utf8_bom_handling():
+    """Test that parser handles UTF-8 BOM (common in Workshop files)."""
+    print("Testing utf8_bom_handling...")
+    
+    # Create a file with UTF-8 BOM at the start (like Steam Workshop files)
+    content = '\ufeff{\n    "settings": {\n        "bpm": 140,\n        "offset": 0,\n        "songFilename": "test.ogg"\n    },\n    "angleData": [0, 90, 180, 270],\n    "actions": [],\n    "decorations": []\n}'
+    
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.adofai', delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = Path(tmp.name)
+    
+    try:
+        # Should parse successfully despite BOM
+        level = parse_adofai(tmp_path)
+        assert level.settings["bpm"] == 140
+        assert level.angle_data == [0, 90, 180, 270]
+        
+        print("✓ UTF-8 BOM handling: PASSED")
+    
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 def test_event_conversion():
     """Test converting level to events and back."""
     print("Testing event_conversion...")
@@ -203,6 +227,7 @@ if __name__ == "__main__":
     test_roundtrip()
     test_path_data_conversion()
     test_trailing_comma_tolerance()
+    test_utf8_bom_handling()
     test_event_conversion()
     test_create_minimal_level()
     

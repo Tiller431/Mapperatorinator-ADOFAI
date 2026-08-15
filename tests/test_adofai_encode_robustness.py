@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from adofai.converter import AdofaiConverter
 from adofai.parser import AdofaiLevel, parse_adofai
 from osuT5.osuT5.adofai_vocab import encode_adofai_events
@@ -119,3 +121,44 @@ def test_time_shift_20082_encodes():
     tokens = encode_adofai_events([Event(EventType.TIME_SHIFT, 20082)])
     assert tokens
     assert all(isinstance(t, int) for t in tokens)
+
+
+HUB_CHARTS = Path("/workspace/adofai-dataset/hub-package/charts")
+
+
+def _hub_level(chart_dir: str) -> Path:
+    path = HUB_CHARTS / chart_dir / "level.adofai"
+    if not path.exists():
+        pytest.skip(f"hub-package chart not mounted: {path}")
+    return path
+
+
+def test_hub_2346220412_parses_missing_comma():
+    """Real first parse fail: Expecting ',' delimiter line 450."""
+    path = _hub_level("2346220412__main")
+    level = parse_adofai(path)
+    assert level.angle_data
+    events, _ = AdofaiConverter().level_to_events(level)
+    tokens = encode_adofai_events(events)
+    assert tokens
+
+
+def test_hub_2980908404_converts_int_none():
+    """Real first convert fail: int(None) on MoveCamera.position."""
+    path = _hub_level("2980908404__main")
+    level = parse_adofai(path)
+    events, _ = AdofaiConverter().level_to_events(level)
+    assert any(e.type == EventType.MOVE_CAMERA for e in events)
+    encode_adofai_events(events)
+
+
+def test_hub_2118291532_encodes_time_shift_4437():
+    """Real first TIME_SHIFT overflow: 4437 (chart also has values past 20082)."""
+    path = _hub_level("2118291532__main")
+    level = parse_adofai(path)
+    events, _ = AdofaiConverter().level_to_events(level)
+    time_shifts = [e.value for e in events if e.type == EventType.TIME_SHIFT]
+    assert any(v >= 4437 for v in time_shifts)
+    assert any(v >= 20082 for v in time_shifts)
+    tokens = encode_adofai_events(events)
+    assert tokens

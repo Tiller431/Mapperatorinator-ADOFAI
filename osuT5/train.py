@@ -23,6 +23,7 @@ from osuT5.utils import (
     get_shared_training_state,
     assert_model_ready_for_ddp,
     ddp_reducer_named_parameters,
+    sync_registered_modules,
 )
 
 
@@ -91,8 +92,9 @@ def main(args: TrainConfig):
     setup_args(args)
 
     # Build on CPU so every rank materializes the same param set *before*
-    # DDP wrap. Per-rank `.to(accelerator.device)` + rank-0 wandb.watch
-    # was the 4×A40 failure: Rank 3 had 427 reducer params, rank 0 had 0.
+    # DDP wrap. The pod already printed Embedding(95471, 768), 478,783,248
+    # params, and Muon 194 + AdamW 233 = 427; rank 0's module was empty at
+    # ``_verify_param_shape_across_processes`` (same 427-vs-0 on ranks 0/1/2).
     with torch.enable_grad():
         model, tokenizer = load_model(
             args.pretrained_path,
@@ -103,11 +105,12 @@ def main(args: TrainConfig):
             eval_mode=False,
             gamemode=args.pretrained_gamemode,
         )
+    sync_registered_modules(model)
     ddp_signature = assert_model_ready_for_ddp(model)
     print(
         f"[rank {accelerator.process_index}/{accelerator.num_processes}] "
         f"DDP reducer param tensors={len(ddp_signature)} "
-        f"before accelerator.prepare()"
+        f"(Muon+AdamW split of the full model) before device move"
     )
     train_dataloader, test_dataloader = get_dataloaders(tokenizer, args, shared)
 
@@ -119,6 +122,7 @@ def main(args: TrainConfig):
         # for n, p in lora_params.items():
         #     print(n, p.sum())
         model.print_trainable_parameters()
+        sync_registered_modules(model)
         ddp_signature = assert_model_ready_for_ddp(model)
 
     optimizer = get_optimizer(model, args)
@@ -131,6 +135,19 @@ def main(args: TrainConfig):
 
     print(model)
     print_model_parameters(model)
+    # print / Muon+AdamW already ran on the pod; the empty tree appeared
+    # between those prints and DDP verify. Re-register children, move
+    # every rank the same way, and refuse an empty ``_modules`` here.
+    sync_registered_modules(model)
+    if accelerator.device.type != "cpu":
+        model.to(accelerator.device)
+        sync_registered_modules(model)
+    ddp_signature = assert_model_ready_for_ddp(model)
+    print(
+        f"[rank {accelerator.process_index}/{accelerator.num_processes}] "
+        f"DDP reducer param tensors={len(ddp_signature)} "
+        f"immediately before accelerator.prepare()"
+    )
     accelerator.wait_for_everyone()
 
     # noinspection PyTypeChecker
@@ -144,8 +161,8 @@ def main(args: TrainConfig):
         model, optimizer, scheduler, train_dataloader, test_dataloader
     )
 
-    # Rank-0 wandb after DDP wrap so tracker hooks cannot freeze the
-    # unwrapped module (reducer would then see 0 params on rank 0).
+    # Rank-0 wandb after DDP wrap so tracker hooks cannot empty/freeze the
+    # unwrapped module before ``_verify_param_shape_across_processes``.
     accelerator.init_trackers(
         "osuT5",
         init_kwargs={

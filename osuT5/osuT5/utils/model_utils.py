@@ -31,6 +31,7 @@ from .ddp_utils import (
     assert_model_ready_for_ddp,
     ddp_param_signature,
     ddp_reducer_named_parameters,
+    sync_registered_modules,
 )
 
 
@@ -431,14 +432,21 @@ def load_model_loaders(
                 model = model.merge_and_unload()
                 print(f"Loaded LoRA weights from {lora_path}")
 
+            # Re-attach children that live as attributes but dropped out of
+            # ``_modules``. Unfreezing does nothing when the module tree is
+            # empty — that was rank 0 at ``_verify_param_shape_across_processes``.
+            sync_registered_modules(model)
             if eval_mode:
                 model.eval()
             else:
                 model.train()
-                # DDP reducer ignores requires_grad=False. If *every* tensor is
-                # frozen (rank-0 wandb / inference_mode leftover), unfreeze so
-                # this rank is not reported as 0 params. Partial freezes stay.
                 if not ddp_reducer_named_parameters(model):
+                    if sum(1 for _ in model.parameters()) == 0:
+                        raise RuntimeError(
+                            "load_model produced an empty module (no Parameter "
+                            "tensors). DDP would report 0 params on this rank "
+                            "against the Muon 194 + AdamW 233 = 427 split."
+                        )
                     for param in model.parameters():
                         param.requires_grad_(True)
 

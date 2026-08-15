@@ -4,21 +4,28 @@ v31 on 4×A40 died in ``accelerator.prepare()`` → DDP:
 
     Rank 3 has 427 params, while rank 0 has inconsistent 0 params
 
-PyTorch 2.8 ``_build_params_for_reducer`` counts only ``requires_grad``
-tensors. ``print_model_parameters`` sums *all* ``numel()``, so rank 0 can
-print Embedding 95471×768 / 478.8M and still hand DDP an empty list.
+The 427 is the optimizer split of the *full* 478,783,248-param model
+(Muon 194 + AdamW 233), not a tiny net. The pod had already printed
+``Embedding(95471, 768)``, that 478.8M ``numel``, and the 194+233 split
+(compile=false, batch 8). Same 427-vs-0 on ranks 0/1/2.
+
+``_verify_param_shape_across_processes`` walks ``named_modules()`` →
+``_modules``. Rank 0's module was empty there. Unfreezing
+``requires_grad`` does nothing when ``_modules`` has no children.
 
 Two-process Gloo ``accelerator.prepare`` of the real 478.8M model is not
 run here: it needs ~4 GiB plus a broadcast of every tensor and is not a
-unit-test cost. The cheap Gloo case below uses a tiny stand-in of the
-0-vs-N reducer bug; the real v31 model is checked by two sequential
-constructions (same signature) plus ``assert_model_ready_for_ddp``.
+unit-test cost. The cheap Gloo cases use a tiny stand-in of the empty
+rank-0 module; the real v31 model is checked by two sequential
+constructions (same signature, 427 tensors) plus
+``assert_model_ready_for_ddp``.
 """
 
 from __future__ import annotations
 
 import os
 import socket
+from collections import OrderedDict
 from pathlib import Path
 
 import pytest
@@ -55,20 +62,95 @@ def _compose_adofai_v31():
 
 
 def test_train_py_builds_cpu_model_and_asserts_before_prepare():
-    """Guard the train.py order that left rank 0 with 0 reducer params."""
+    """Guard the train.py order that left rank 0 with an empty module."""
     src = (REPO_ROOT / "osuT5" / "train.py").read_text(encoding="utf-8")
     assert "assert_model_ready_for_ddp" in src
+    assert "sync_registered_modules" in src
     assert 'device="cpu"' in src
     assert "accelerator.wait_for_everyone()" in src
     assert src.index("get_shared_training_state()") < src.index("Accelerator(")
-    assert src.index("assert_model_ready_for_ddp") < src.index("accelerator.prepare")
+    assert src.index("sync_registered_modules") < src.index("accelerator.prepare")
+    assert src.rindex("assert_model_ready_for_ddp") < src.index("accelerator.prepare")
     assert src.index("accelerator.prepare") < src.index("init_trackers")
     assert "python osuT5/train.py -cn adofai_v31" in (
         REPO_ROOT / "adofai" / "train.py"
     ).read_text(encoding="utf-8")
 
 
-def test_frozen_rank0_is_the_zero_param_ddp_bug_shape():
+def test_mapperatorinator_does_not_slot_child_modules():
+    """Incomplete __slots__ on child names hides them from DDP's _modules walk."""
+    src = (
+        REPO_ROOT / "osuT5" / "osuT5" / "model" / "modeling_mapperatorinator.py"
+    ).read_text(encoding="utf-8")
+    assert "class Mapperatorinator" in src
+    assert '__slots__ = ["spectrogram"' not in src
+    assert "__slots__ = ['spectrogram'" not in src
+
+
+def test_empty_modules_is_the_zero_param_ddp_bug_shape():
+    """Rank 0 empty ``_modules`` — the trainer's read of the 427-vs-0 crash."""
+    torch = pytest.importorskip("torch")
+    ddp_utils = _load_ddp_utils()
+    assert_model_ready_for_ddp = ddp_utils.assert_model_ready_for_ddp
+    sync_registered_modules = ddp_utils.sync_registered_modules
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = torch.nn.Embedding(16, 8)
+            self.lin = torch.nn.Linear(8, 8)
+
+    live = Tiny()
+    live_sig = assert_model_ready_for_ddp(live)
+    assert len(live_sig) > 0
+
+    emptied = Tiny()
+    saved = OrderedDict(emptied._modules)
+    emptied._modules = OrderedDict()
+    for name, child in saved.items():
+        emptied.__dict__[name] = child
+
+    assert list(emptied._modules) == []
+    assert sum(1 for _ in emptied.parameters()) == 0
+    with pytest.raises(RuntimeError, match="module is empty"):
+        assert_model_ready_for_ddp(emptied)
+
+    restored = sync_registered_modules(emptied)
+    assert "emb" in restored and "lin" in restored
+    assert_model_ready_for_ddp(emptied)
+    assert len(ddp_utils.ddp_reducer_named_parameters(emptied)) == len(live_sig)
+
+
+def test_slotted_child_desync_is_repaired_for_ddp():
+    """Slot holds the child, ``_modules`` does not — DDP would see 0 params."""
+    torch = pytest.importorskip("torch")
+    ddp_utils = _load_ddp_utils()
+    assert_model_ready_for_ddp = ddp_utils.assert_model_ready_for_ddp
+    sync_registered_modules = ddp_utils.sync_registered_modules
+
+    class Slotted(torch.nn.Module):
+        __slots__ = ("lin",)
+
+        def __init__(self):
+            super().__init__()
+            self.lin = torch.nn.Linear(8, 8)
+            object.__setattr__(self, "lin", self._modules["lin"])
+
+    slotted = Slotted()
+    child = slotted.lin
+    slotted._modules = OrderedDict()
+    assert child is object.__getattribute__(slotted, "lin")
+    assert sum(1 for _ in slotted.parameters()) == 0
+    with pytest.raises(RuntimeError, match="module is empty"):
+        assert_model_ready_for_ddp(slotted)
+
+    assert sync_registered_modules(slotted) == ["lin"]
+    assert slotted._modules["lin"] is child
+    assert_model_ready_for_ddp(slotted)
+
+
+def test_frozen_rank0_is_not_the_v31_empty_module_bug():
+    """Frozen tensors are a different 0-reducer shape; unfreeze cannot fill _modules."""
     torch = pytest.importorskip("torch")
     ddp_utils = _load_ddp_utils()
     assert_identical_ddp_param_sets = ddp_utils.assert_identical_ddp_param_sets
@@ -89,6 +171,7 @@ def test_frozen_rank0_is_the_zero_param_ddp_bug_shape():
     live_sig = assert_model_ready_for_ddp(live)
     assert len(live_sig) > 0
     assert len(ddp_reducer_named_parameters(frozen)) == 0
+    assert sum(1 for _ in frozen.parameters()) > 0
     with pytest.raises(RuntimeError, match="0 reducer params"):
         assert_model_ready_for_ddp(frozen)
 
@@ -102,7 +185,7 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _gloo_ddp_worker(rank: int, world_size: int, port: int, freeze_rank0: bool, result):
+def _gloo_ddp_worker(rank: int, world_size: int, port: int, mode: str, result):
     import torch
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
@@ -115,7 +198,9 @@ def _gloo_ddp_worker(rank: int, world_size: int, port: int, freeze_rank0: bool, 
             torch.nn.Embedding(16, 8),
             torch.nn.Linear(8, 8),
         )
-        if freeze_rank0 and rank == 0:
+        if mode == "empty_rank0" and rank == 0:
+            model._modules = OrderedDict()
+        elif mode == "freeze_rank0" and rank == 0:
             model.requires_grad_(False)
         try:
             DistributedDataParallel(model)
@@ -124,6 +209,27 @@ def _gloo_ddp_worker(rank: int, world_size: int, port: int, freeze_rank0: bool, 
             result[rank] = ("err", str(exc))
     finally:
         dist.destroy_process_group()
+
+
+def test_gloo_ddp_two_process_rejects_empty_rank0_module():
+    """Cheap CPU stand-in: rank 0 ``_modules`` cleared, others keep the full split."""
+    torch = pytest.importorskip("torch")
+    mp = pytest.importorskip("torch.multiprocessing")
+
+    port = _free_port()
+    manager = mp.Manager()
+    result = manager.dict()
+    mp.spawn(
+        _gloo_ddp_worker,
+        args=(2, port, "empty_rank0", result),
+        nprocs=2,
+        join=True,
+    )
+    messages = " ".join(str(item) for item in result.values())
+    assert "0 params" in messages or "inconsistent" in messages or "empty" in messages.lower() or "err" in {
+        result[0][0],
+        result[1][0],
+    }
 
 
 def test_gloo_ddp_two_process_rejects_frozen_rank0():
@@ -136,7 +242,7 @@ def test_gloo_ddp_two_process_rejects_frozen_rank0():
     result = manager.dict()
     mp.spawn(
         _gloo_ddp_worker,
-        args=(2, port, True, result),
+        args=(2, port, "freeze_rank0", result),
         nprocs=2,
         join=True,
     )
@@ -156,7 +262,7 @@ def test_gloo_ddp_two_process_accepts_identical_unfrozen_models():
     result = manager.dict()
     mp.spawn(
         _gloo_ddp_worker,
-        args=(2, port, False, result),
+        args=(2, port, "ok", result),
         nprocs=2,
         join=True,
     )
@@ -184,12 +290,18 @@ def test_adofai_v31_two_constructions_same_ddp_param_set():
     ddp_utils = _load_ddp_utils()
     assert_identical_ddp_param_sets = ddp_utils.assert_identical_ddp_param_sets
     assert_model_ready_for_ddp = ddp_utils.assert_model_ready_for_ddp
+    sync_registered_modules = ddp_utils.sync_registered_modules
 
     try:
         model_a, tokenizer_a = _build_v31_model()
     except Exception as exc:  # HF hub / missing backbone config
         pytest.skip(f"cannot construct adofai_v31 model: {exc}")
 
+    assert not hasattr(type(model_a), "__slots__") or "transformer" not in getattr(
+        type(model_a), "__slots__", ()
+    )
+    assert sync_registered_modules(model_a) == []
+    assert "transformer" in model_a._modules
     sig_a = assert_model_ready_for_ddp(model_a)
     # PR #9 buckets: 95471 out (Whisper embed/lm_head). decoder_embedder is
     # vocab_size_in (out + prefix ranges) and is larger.
@@ -197,14 +309,16 @@ def test_adofai_v31_two_constructions_same_ddp_param_set():
     assert 95_000 <= tokenizer_a.vocab_size_out <= 96_000
     out_tables = [shape for _, shape in sig_a if shape[:1] == (tokenizer_a.vocab_size_out,)]
     assert (tokenizer_a.vocab_size_out, 768) in out_tables
+    # 427 = Muon 194 + AdamW 233 optimizer-split of the 478.8M model.
     assert len(sig_a) == 427
     del model_a
 
     model_b, tokenizer_b = _build_v31_model()
+    sync_registered_modules(model_b)
     sig_b = assert_model_ready_for_ddp(model_b)
     assert tokenizer_b.vocab_size_out == tokenizer_a.vocab_size_out
     assert_identical_ddp_param_sets(sig_a, sig_b)
-    assert len(sig_b) > 0
+    assert len(sig_b) == 427
     del model_b
 
 

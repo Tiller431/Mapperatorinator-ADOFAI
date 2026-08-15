@@ -2,7 +2,87 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
+
+
+# Child names Mapperatorinator used to declare in incomplete ``__slots__``.
+# DDP's ``_verify_param_shape_across_processes`` walks ``named_modules()`` →
+# ``_modules`` only. A slot/attribute that is not in ``_modules`` is invisible
+# to the reducer, so rank 0 reports 0 params while ranks 1/2/3 still have the
+# Muon 194 + AdamW 233 = 427 optimizer-split of the 478,783,248-param model.
+MAPPERATORINATOR_CHILD_MODULE_NAMES: tuple[str, ...] = (
+    "spectrogram",
+    "decoder_embedder",
+    "encoder_embedder",
+    "transformer",
+    "style_embedder",
+    "difficulty_embedder",
+    "mapper_embedder",
+    "song_pos_embedder",
+    "loss_fn",
+)
+
+
+def _module_children(model: torch.nn.Module) -> OrderedDict[str, torch.nn.Module]:
+    modules = getattr(model, "_modules", None)
+    if modules is None:
+        return OrderedDict()
+    return OrderedDict((name, child) for name, child in modules.items() if child is not None)
+
+
+def iter_unregistered_modules(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
+    """nn.Module attributes that are not in ``_modules`` (empty-module desync)."""
+    registered = _module_children(model)
+    found: list[tuple[str, torch.nn.Module]] = []
+    seen: set[int] = set()
+
+    names: list[str] = list(MAPPERATORINATOR_CHILD_MODULE_NAMES)
+    instance_dict = getattr(model, "__dict__", None)
+    if isinstance(instance_dict, dict):
+        names.extend(name for name in instance_dict if not name.startswith("_"))
+    for name in getattr(type(model), "__slots__", ()):
+        if isinstance(name, str):
+            names.append(name)
+
+    for name in names:
+        if name in registered or name.startswith("_"):
+            continue
+        try:
+            value = getattr(model, name, None)
+        except Exception:  # noqa: BLE001 — slot/getattr can raise on a broken tree
+            continue
+        if not isinstance(value, torch.nn.Module):
+            continue
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+        found.append((name, value))
+    return found
+
+
+def sync_registered_modules(model: torch.nn.Module) -> list[str]:
+    """Put attribute-only children back into ``_modules`` so DDP can see them.
+
+    ``print(model)`` / Muon+AdamW 427 can succeed, then
+    ``_verify_param_shape_across_processes`` still see rank 0 as empty if
+    ``_modules`` was cleared or never received the slotted children.
+    """
+    instance_dict = getattr(model, "__dict__", None)
+    for state_name in ("_modules", "_parameters", "_buffers"):
+        current = getattr(model, state_name, None)
+        if current is None:
+            current = OrderedDict()
+            object.__setattr__(model, state_name, current)
+            if isinstance(instance_dict, dict):
+                instance_dict[state_name] = current
+    restored: list[str] = []
+    for name, child in iter_unregistered_modules(model):
+        model._modules[name] = child
+        restored.append(name)
+    return restored
 
 
 def ddp_reducer_named_parameters(model: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
@@ -13,10 +93,11 @@ def ddp_reducer_named_parameters(model: torch.nn.Module) -> list[tuple[str, torc
     ``requires_grad`` only, skip ``_ddp_params_and_buffers_to_ignore``,
     dedupe shared/tied tensors.
 
-    ``model.parameters()`` / ``print_model_parameters`` count *all* tensors
-    (including frozen). A rank can print Embedding 95471×768 and 478.8M
-    total weights, then DDP still report **0 params** if nothing requires
-    grad — the v31 4×A40 failure mode.
+    The v31 4×A40 failure was **not** a tiny model and **not** a frozen-only
+    leftover. The pod had already printed ``Embedding(95471, 768)``,
+    478,783,248 params, and Muon 194 + AdamW 233 = 427. Rank 0's ``_modules``
+    was empty at ``_verify_param_shape_across_processes``, so the reducer
+    list was 0 while ranks 1/2/3 still had that 427-tensor split.
     """
     ignore = set(getattr(model, "_ddp_params_and_buffers_to_ignore", []))
     seen: set[int] = set()
@@ -40,18 +121,42 @@ def ddp_param_signature(model: torch.nn.Module) -> tuple[tuple[str, tuple[int, .
 
 
 def assert_model_ready_for_ddp(model: torch.nn.Module) -> tuple[tuple[str, tuple[int, ...]], ...]:
-    """Fail before ``accelerator.prepare`` if this rank would hand DDP 0 params."""
+    """Fail before ``accelerator.prepare`` if this rank's module is empty at verify."""
+    children = _module_children(model)
+    try:
+        total = sum(1 for _ in model.parameters())
+    except AttributeError:
+        total = 0
+    unregistered = iter_unregistered_modules(model)
+    if not children:
+        detail = (
+            f"unregistered_module_attrs={[name for name, _ in unregistered]!r}"
+            if unregistered
+            else "no child modules on attributes either"
+        )
+        raise RuntimeError(
+            "DDP _verify_param_shape_across_processes walks named_modules() → "
+            "_modules. This rank's module is empty "
+            f"(model.parameters() count={total}; {detail}). "
+            "The 427 count from the pod is the optimizer split "
+            "(Muon 194 + AdamW 233) of the 478,783,248-param model, not a "
+            "tiny net. Unfreezing requires_grad does nothing when _modules "
+            "has no children."
+        )
+    if getattr(model, "transformer", None) is not None and children.get("transformer") is None:
+        raise RuntimeError(
+            "Mapperatorinator.transformer is missing from _modules on this rank. "
+            "DDP would treat the module as empty at "
+            "_verify_param_shape_across_processes (427-vs-0)."
+        )
     signature = ddp_param_signature(model)
-    total = sum(1 for _ in model.parameters())
     if not signature:
         raise RuntimeError(
             "DDP expects a non-empty requires_grad param set on every rank, but "
             f"this construction has 0 reducer params "
-            f"(model.parameters() count={total}, including frozen). "
-            "Rank 0 printing 478.8M total weights is not enough — the reducer "
-            "only sees requires_grad=True tensors. Typical causes: wandb / "
-            "inference_mode leftover on the main process, meta-device empty "
-            "modules, or a rank-only model build."
+            f"(model.parameters() count={total}, _modules children="
+            f"{list(children)!r}). If total==0 the module tree is empty of "
+            "Parameter tensors; if total>0 every tensor is frozen."
         )
     meta = [
         name

@@ -60,8 +60,15 @@ class AdofaiLevel:
         }
 
 
+_STRING_PLACEHOLDER = re.compile(r"\x00(\d+)\x00")
+
+
 def _escape_raw_breaks_in_strings(content: str) -> str:
-    """Turn raw CR/LF inside quotes into JSON escapes (Workshop levelDesc/author)."""
+    """Turn raw C0 controls inside quotes into JSON escapes (levelDesc/author).
+
+    Python json.loads(strict=True) rejects literal TAB/LF/CR in strings.
+    3469661239__main embeds a raw newline then a raw tab in levelDesc.
+    """
     out: list[str] = []
     in_string = False
     escape = False
@@ -86,6 +93,13 @@ def _escape_raw_breaks_in_strings(content: str) -> str:
             if ch == "\r":
                 out.append("\\r")
                 continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            code = ord(ch)
+            if code < 32:
+                out.append(f"\\u{code:04x}")
+                continue
             out.append(ch)
             continue
         if ch in "\"'":
@@ -95,25 +109,72 @@ def _escape_raw_breaks_in_strings(content: str) -> str:
     return "".join(out)
 
 
+def _mask_quoted_strings(content: str) -> tuple[str, list[str]]:
+    """Replace quoted strings with placeholders so regexes cannot see inside them.
+
+    `_UNQUOTED_KEY` otherwise matches `,https:` inside artistLinks URL lists
+    (2723436598 and four more) and rewrites them to `,"https"://...`.
+    """
+    held: list[str] = []
+    out: list[str] = []
+    in_string = False
+    escape = False
+    quote = ""
+    buf: list[str] = []
+    for ch in content:
+        if in_string:
+            buf.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                in_string = False
+                held.append("".join(buf))
+                out.append(f"\x00{len(held) - 1}\x00")
+                buf = []
+            continue
+        if ch in "\"'":
+            in_string = True
+            quote = ch
+            buf = [ch]
+            continue
+        out.append(ch)
+    if buf:
+        held.append("".join(buf))
+        out.append(f"\x00{len(held) - 1}\x00")
+    return "".join(out), held
+
+
+def _restore_quoted_strings(content: str, held: list[str]) -> str:
+    return _STRING_PLACEHOLDER.sub(lambda m: held[int(m.group(1))], content)
+
+
 def _clean_json_string(content: str) -> str:
     """Make Workshop .adofai text acceptable to json.loads / json5.loads.
 
     Real files mix trailing commas, unquoted keys, raw control chars, raw
-    newlines in strings, double commas, and missing commas between values
+    newlines/tabs in strings, double commas, and missing commas between values
     (2346220412__main line 449/450; `]\\n\"decorations\"`).
-    JSON5 covers trailing commas / unquoted keys / comments; the rest needs
-    this cleanup.
+    artistLinks often stores comma-joined https URLs in one string; key-quoting
+    must not run inside that string. JSON5 covers trailing commas / unquoted
+    keys / comments; the rest needs this cleanup. Cleanup must stay valid
+    without json5 (trainer CPU encode).
     """
     content = _CONTROL_CHARS.sub("", content)
     content = _escape_raw_breaks_in_strings(content)
-    content = _UNQUOTED_KEY.sub(r'\1"\2"\3:', content)
-    # Insert missing commas between adjacent values: `}\n{`, `]\n"key"`
-    content = re.sub(r'([}\]])(\s*)([{\["])', r"\1,\2\3", content)
+    masked, held = _mask_quoted_strings(content)
+    masked = _UNQUOTED_KEY.sub(r'\1"\2"\3:', masked)
+    # Insert missing commas between adjacent values: `}\n{`, `]\n"key"`,
+    # `"url1" "url2"`, `"url" [`  (placeholders stand in for quoted strings)
+    masked = re.sub(r'([}\]])(\s*)([{\[\x00])', r"\1,\2\3", masked)
+    masked = re.sub(r'(\x00\d+\x00)(\s*)(\x00)', r"\1,\2\3", masked)
+    masked = re.sub(r'(\x00\d+\x00)(\s*)([{\[])', r"\1,\2\3", masked)
     # Double commas: `"difficulty": 1, ,` / `4,,`
-    content = re.sub(r",(\s*),+", r",\1", content)
+    masked = re.sub(r",(\s*),+", r",\1", masked)
     # Trailing commas before } or ]
-    content = re.sub(r",(\s*[}\]])", r"\1", content)
-    return content
+    masked = re.sub(r",(\s*[}\]])", r"\1", masked)
+    return _restore_quoted_strings(masked, held)
 
 
 def _loads_adofai_json(content: str) -> Any:
@@ -139,7 +200,8 @@ def parse_adofai(file_path: str | Path) -> AdofaiLevel:
     
     Supports both angleData (modern) and pathData (legacy) formats.
     Handles Workshop JSON quirks: UTF-8 BOM, trailing commas, unquoted keys,
-    missing commas between objects, raw control chars (json5 + cleanup).
+    missing commas between objects/strings, raw control chars / newlines / tabs
+    in strings, and comma-joined https URLs in artistLinks (json5 + cleanup).
     
     Args:
         file_path: Path to .adofai file

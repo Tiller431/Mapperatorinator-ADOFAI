@@ -16,15 +16,16 @@ data:                  # Data settings
   test_dataset_end: 126
   num_classes: 0  # Not used for ADOFAI
   
-  # ADOFAI lossless augmentation (LOCKED SETS, not cartesian product)
-  # Sampling: pick ONE geometric (rotate/reflect/identity), THEN independently maybe rate, maybe pitch
-  adofai_identity_augment: true    # Include identity (no transform)
-  adofai_rotate_augment: true      # Include 8 rotations (0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°)
-  adofai_reflect_augment: true     # Include 4 reflections (X, Y, y=x, y=-x) + floor-0 Twirl
-  adofai_matched_rate_factors: [1.0]  # Matched rate: [0.9, 1.0, 1.1, 1.2] or [1.0] to disable
-  adofai_pitch_shifts: [100]       # Pitch (settings.pitch): [90, 100, 110] or [100] to disable
-  # Geometric pool size: 1 identity + 8 rotations + 4 reflects = 13
-  # Total variants per chart: 13 × len(rates) × len(pitches)
+  # ADOFAI lossless augmentation (continuous uniform, independent)
+  # Each chart yields ONE augmented variant per epoch with random sampling
+  # Transforms are INDEPENDENT (rotate AND reflect MAY both apply)
+  adofai_rotate_prob: 1.0          # Probability of rotation; R ~ Uniform[0, 360)
+  adofai_reflect_prob: 0.5         # Probability of reflection; axis ~ {X, Y, y=x, y=-x}
+  adofai_rate_prob: 0.5            # Probability of matched-rate; r ~ Uniform[0.85, 1.25]
+  adofai_rate_range: [0.85, 1.25]
+  adofai_pitch_prob: 0.5           # Probability of pitch-shift; settings.pitch ~ Uniform[80, 120]
+  adofai_pitch_range: [80, 120]
+  # Each transform is sampled independently; no discrete steps or XOR locks
   
   # Special Prefix Tokens (ADOFAI configuration)
   add_out_context_types: true  # Add tokens indicating types of the out context

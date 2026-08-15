@@ -16,13 +16,12 @@ data:                  # Data settings
   test_dataset_end: 10
   num_classes: 0
   
-  # ADOFAI augmentation (smoke: test geometric transforms only)
-  adofai_identity_augment: true
-  adofai_rotate_augment: true      # Test rotations
-  adofai_reflect_augment: false    # Disable reflects for smoke (keep it simple)
-  adofai_matched_rate_factors: [1.0]  # No rate augmentation in smoke
-  adofai_pitch_shifts: [100]       # No pitch augmentation in smoke
-  # Smoke: 5 charts × (1 identity + 8 rotations) × 1 rate × 1 pitch = 45 variants
+  # ADOFAI augmentation (smoke: test rotation only, keep simple)
+  adofai_rotate_prob: 1.0          # Always rotate for smoke test
+  adofai_reflect_prob: 0.0         # Disable reflection in smoke
+  adofai_rate_prob: 0.0            # Disable rate in smoke
+  adofai_pitch_prob: 0.0           # Disable pitch in smoke
+  # Smoke: 5 charts, each with random R ~ Uniform[0, 360) per epoch
   
   # Prefix tokens (same as adofai_v31)
   add_out_context_types: true

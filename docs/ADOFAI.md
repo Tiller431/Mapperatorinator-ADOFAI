@@ -155,30 +155,32 @@ Training expects Workshop-style folders:
     song.mp3
 ```
 
-**Lossless Augmentation (LOCKED SETS, not cartesian product):**
+**Lossless Augmentation (continuous uniform, independent):**
 
-Sampling rule: For each chart, pick **ONE** geometric transform, THEN independently maybe apply rate, maybe pitch.
+Each chart yields **ONE augmented variant per epoch** with random sampling. Transforms are **INDEPENDENT** (rotate AND reflect MAY both apply, not XOR).
 
-- **Geometric pool (pick ONE per variant):**
-  - Identity (no transform)
-  - 8 Rotations: {0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°} on all non-999 angles
-  - 4 Reflections: X-flip, Y-flip, y=x diagonal, y=-x diagonal (each adds floor-0 Twirl)
-  - Pool size: 1 + 8 + 4 = **13 geometric transforms**
+- **Rotation:** With probability p_rotate (default 1.0), sample R ~ Uniform[0, 360)
+  - Apply: a = (a + R) % 360 for non-999 angles; 999 unchanged
+  - Twirls unchanged; camera/track positions and rotations also rotated
+  - angleOffset unchanged
 
-- **Matched-rate (independent):** r ∈ {0.9, 1.0, 1.1, 1.2}
+- **Reflection:** With probability p_reflect (default 0.5), pick one axis from proven family
+  - Axes: X-flip (−a % 360), Y-flip (180−a), y=x (90−a), y=−x (270−a)
+  - Add floor-0 Twirl (toggle if already exists)
+  - 999 unchanged
+
+- **Matched-rate:** With probability p_rate (default 0.5), sample r ~ Uniform[0.85, 1.25]
   - Scales: BPM × r, SetSpeed BPM × r, offset ms / r
-  - Leaves unchanged: multipliers, Pause/Hold/camera durations (in beats), angleOffset
   - Audio duration → duration / r
+  - Leaves unchanged: multipliers, Pause/Hold/camera durations (in beats), angleOffset
 
-- **Same-duration pitch (independent):** settings.pitch ∈ {90, 100, 110}
-  - Changes audio timbre without duration change (waveform pitch-shift)
-  - 100 = no pitch change
+- **Same-duration pitch:** With probability p_pitch (default 0.5), sample settings.pitch ~ Uniform[80, 120]
+  - Waveform pitch-shift without duration change
+  - Chart events untouched; 100 = no pitch change
 
-- **Variants per chart:** 13 geometric × len(rates) × len(pitches)
-- **Example (default config):** 126 charts × 13 geometric × 1 rate × 1 pitch = **1638 training variants**
-- **Example (full augs):** 126 charts × 13 × 4 rates × 3 pitches = **19,656 variants**
+**Transforms are independent:** Each is sampled separately; no discrete steps, no XOR locks, no cartesian product. Chart sees different random augmentation each epoch.
 
-**NOT cartesian product:** We do NOT apply rotate+reflect+rate+pitch on every sample. Each sample gets one geometric transform.
+**Expected effective dataset size:** ~126 base charts with stochastic augmentation (infinite variants due to continuous sampling).
 
 **Dataset:** [Google Drive top-100 archive](https://drive.google.com/drive/folders/1lATJxQI8P3uLsRtiC7ay5u3SrFhH1cfd) (`adofai-top100.tar.gz`, ~126 charts)
 

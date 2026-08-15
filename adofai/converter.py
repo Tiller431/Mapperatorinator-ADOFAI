@@ -316,27 +316,44 @@ class AdofaiConverter:
                         events.append(Event(EventType.SET_INPUT_EVENT, 1))
                         event_times.append(current_time)
                     
-                    # VFX events (Tyler override)
+                    # VFX events (Tyler override) - SharpFAI/MagicShaper field names
                     elif event_type == "Flash":
+                        # SharpFAI fields: duration, plane, startColor, startOpacity, endColor, endOpacity, angleOffset, ease, eventTag
                         duration = action.get("duration", 1.0)
-                        events.append(Event(EventType.FLASH, duration))
+                        events.append(Event(EventType.FLASH, int(duration * 10)))  # Quantize to 0.1 beat steps
                         event_times.append(current_time)
                     
                     elif event_type == "Bloom":
+                        # SharpFAI fields: enabled, threshold, intensity, color, duration, ease, angleOffset, eventTag
+                        enabled = action.get("enabled", "Enabled")
+                        if isinstance(enabled, str):
+                            enabled = 1 if enabled == "Enabled" else 0
                         intensity = action.get("intensity", 100)
-                        events.append(Event(EventType.BLOOM, int(intensity)))
+                        events.append(Event(EventType.BLOOM, int(intensity) if enabled else 0))
                         event_times.append(current_time)
                     
                     elif event_type == "ShakeScreen":
+                        # SharpFAI fields: duration, strength, intensity, ease, fadeOut, angleOffset, eventTag
+                        # NOTE: Gitbook "Speed" field is actually "intensity" on-disk, NOT "speed"
                         intensity = action.get("intensity", 100)
                         events.append(Event(EventType.SHAKE_SCREEN, int(intensity)))
                         event_times.append(current_time)
                     
                     elif event_type == "SetFilter":
-                        filter_type = action.get("filter", "None")
-                        # Map common filters to IDs
-                        filter_map = {"None": 0, "Grayscale": 1, "Sepia": 2, "Invert": 3, "Arcade": 4}
-                        filter_id = filter_map.get(filter_type, 0)
+                        # SharpFAI fields: filter, enabled, intensity, duration, ease, disableOthers, angleOffset, eventTag
+                        # MagicShaper filter enum (NOT ADOFAI-JS wrong names like Bloom/Pixellate/etc.)
+                        filter_name = action.get("filter", "None")
+                        # Map MagicShaper filters to IDs (subset of 40+ filters)
+                        filter_map = {
+                            "None": 0, "Grayscale": 1, "Sepia": 2, "Invert": 3, "VHS": 4,
+                            "EightiesTV": 5, "FiftiesTV": 6, "Arcade": 7, "LED": 8, "Rain": 9,
+                            "Blizzard": 10, "PixelSnow": 11, "Compression": 12, "Glitch": 13,
+                            "Pixelate": 14, "Waves": 15, "Static": 16, "Grain": 17, "MotionBlur": 18,
+                            "Fisheye": 19, "Aberration": 20, "Drawing": 21, "Neon": 22, "Handheld": 23,
+                            "NightVision": 24, "Funk": 25, "Tunnel": 26, "Weird3D": 27, "Blur": 28,
+                            "GaussianBlur": 29, "Posterize": 30
+                        }
+                        filter_id = filter_map.get(filter_name, 0)
                         events.append(Event(EventType.SET_FILTER, filter_id))
                         event_times.append(current_time)
             

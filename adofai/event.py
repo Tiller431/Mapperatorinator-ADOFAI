@@ -26,9 +26,58 @@ class AdofaiEventType(Enum):
     PAUSE = "pause"               # Pause event
     HOLD = "hold"                 # Hold note duration
     
-    # Gameplay modifiers
-    TWIRL = "twirl"               # Direction change (twirl)
-    MULTI_PLANET = "multiplanet"  # MultiPlanet event
+    # Gameplay modifiers (MUST-HAVE)
+    TWIRL = "twirl"                     # Direction change (reverse)
+    MULTI_PLANET = "multiplanet"        # MultiPlanet (2 vs 3+)
+    CHECKPOINT = "checkpoint"           # Progress checkpoint
+    AUTO_PLAY_TILES = "autoplay"        # AutoPlayTiles
+    SET_PLANET_ROTATION = "planet_rot"  # SetPlanetRotation
+    FREE_ROAM = "freeroam"              # FreeRoam mode
+    FREE_ROAM_TWIRL = "freeroam_twirl"  # FreeRoamTwirl
+    FREE_ROAM_REMOVE = "freeroam_remove"  # FreeRoamRemove
+    SCALE_MARGIN = "scale_margin"       # ScaleMargin
+    SCALE_RADIUS = "scale_radius"       # ScaleRadius
+    MULTITAP = "multitap"               # Multitap
+    HIDE = "hide"                       # Hide event
+    KILL_PLAYER = "kill_player"         # KillPlayer
+    
+    # Track events (MUST-HAVE)
+    POSITION_TRACK = "position_track"   # PositionTrack
+    MOVE_TRACK = "move_track"           # MoveTrack
+    COLOR_TRACK = "color_track"         # ColorTrack
+    ANIMATE_TRACK = "animate_track"     # AnimateTrack
+    MOVE_CAMERA = "move_camera"         # MoveCamera
+    
+    # Audio events (MUST-HAVE)
+    SET_HITSOUND = "set_hitsound"       # SetHitsound
+    PLAY_SOUND = "play_sound"           # PlaySound
+    SET_HOLD_SOUND = "set_hold_sound"   # SetHoldSound
+    
+    # Control flow events (MUST-HAVE)
+    REPEAT_EVENTS = "repeat_events"     # RepeatEvents
+    SET_CONDITIONAL_EVENTS = "set_cond" # SetConditionalEvents
+    SET_INPUT_EVENT = "set_input"       # SetInputEvent
+    
+    # VFX events (Tyler override - keep these)
+    FLASH = "flash"                     # Flash effect
+    BLOOM = "bloom"                     # Bloom lighting
+    SHAKE_SCREEN = "shake_screen"       # ShakeScreen
+    SET_FILTER = "set_filter"           # SetFilter
+    
+    # Event parameters (quantized sub-events for camera/VFX)
+    CAMERA_POSITION_X = "cam_pos_x"     # Camera/track X position (quantized)
+    CAMERA_POSITION_Y = "cam_pos_y"     # Camera/track Y position (quantized)
+    CAMERA_ZOOM = "cam_zoom"            # Zoom level (quantized)
+    CAMERA_ROTATION = "cam_rotation"    # Rotation angle (quantized)
+    CAMERA_DURATION = "cam_duration"    # Duration in beats (quantized)
+    CAMERA_EASE = "cam_ease"            # Easing type (enum)
+    CAMERA_RELATIVE = "cam_relative"    # RelativeTo enum (Player/Tile/Global/etc)
+    
+    # VFX parameters
+    COLOR_RGB = "color_rgb"             # Color value (quantized RGB)
+    OPACITY = "opacity"                 # Opacity percentage
+    INTENSITY = "intensity"             # Effect intensity
+    FILTER_TYPE = "filter_type"         # Filter type enum
     
     # Metadata/conditioning tokens (used for generation control)
     BPM = "bpm"                   # Initial BPM

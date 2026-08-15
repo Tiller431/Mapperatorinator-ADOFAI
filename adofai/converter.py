@@ -26,6 +26,51 @@ class AdofaiConverter:
     def __init__(self):
         """Initialize converter with default settings."""
         self.time_precision = 10  # Time quantization in ms (match osu! convention)
+        
+        # Camera ease types (common ADOFAI easing functions)
+        self.ease_types = [
+            "Linear", "InSine", "OutSine", "InOutSine",
+            "InQuad", "OutQuad", "InOutQuad",
+            "InCubic", "OutCubic", "InOutCubic",
+            "InQuart", "OutQuart", "InOutQuart",
+            "InQuint", "OutQuint", "InOutQuint",
+            "InExpo", "OutExpo", "InOutExpo",
+            "InCirc", "OutCirc", "InOutCirc",
+            "InBack", "OutBack", "InOutBack",
+            "InElastic", "OutElastic", "InOutElastic",
+            "InBounce", "OutBounce", "InOutBounce"
+        ]
+        
+        # RelativeTo enum values
+        self.relative_to_types = [
+            "Player", "Tile", "Global", "LastPosition", "LastPositionNoRotation"
+        ]
+    
+    def _ease_to_id(self, ease: str) -> int:
+        """Convert ease type string to ID."""
+        try:
+            return self.ease_types.index(ease)
+        except ValueError:
+            return 0  # Default to Linear
+    
+    def _id_to_ease(self, ease_id: int) -> str:
+        """Convert ease ID to string."""
+        if 0 <= ease_id < len(self.ease_types):
+            return self.ease_types[ease_id]
+        return "Linear"
+    
+    def _relative_to_id(self, relative: str) -> int:
+        """Convert relativeTo string to ID."""
+        try:
+            return self.relative_to_types.index(relative)
+        except ValueError:
+            return 0  # Default to Player
+    
+    def _id_to_relative(self, relative_id: int) -> str:
+        """Convert relativeTo ID to string."""
+        if 0 <= relative_id < len(self.relative_to_types):
+            return self.relative_to_types[relative_id]
+        return "Player"
     
     def level_to_events(self, level: AdofaiLevel) -> tuple[list[AdofaiEvent], list[float]]:
         """
@@ -106,6 +151,187 @@ class AdofaiConverter:
                     elif event_type == "MultiPlanet":
                         planets = action.get("planets", 2)
                         events.append(AdofaiEvent(AdofaiEventType.MULTI_PLANET, planets))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "MoveCamera":
+                        # Camera movement: emit main event + parameters
+                        events.append(AdofaiEvent(AdofaiEventType.MOVE_CAMERA, 1))
+                        event_times.append(current_time)
+                        
+                        # Position (quantized to grid, default 0,0)
+                        pos = action.get("position", [0, 0])
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_POSITION_X, int(pos[0])))
+                        event_times.append(current_time)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_POSITION_Y, int(pos[1])))
+                        event_times.append(current_time)
+                        
+                        # Rotation (quantized to degrees)
+                        rotation = action.get("rotation", 0)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_ROTATION, int(rotation)))
+                        event_times.append(current_time)
+                        
+                        # Zoom (quantized to percentage)
+                        zoom = action.get("zoom", 100)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_ZOOM, int(zoom)))
+                        event_times.append(current_time)
+                        
+                        # Duration in beats
+                        duration = action.get("duration", 1.0)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_DURATION, duration))
+                        event_times.append(current_time)
+                        
+                        # Ease type (string -> enum ID)
+                        ease = action.get("ease", "Linear")
+                        ease_id = self._ease_to_id(ease)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_EASE, ease_id))
+                        event_times.append(current_time)
+                        
+                        # RelativeTo (string -> enum ID)
+                        relative_to = action.get("relativeTo", "Player")
+                        relative_id = self._relative_to_id(relative_to)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_RELATIVE, relative_id))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "MoveTrack":
+                        events.append(AdofaiEvent(AdofaiEventType.MOVE_TRACK, 1))
+                        event_times.append(current_time)
+                        pos = action.get("position", [0, 0])
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_POSITION_X, int(pos[0])))
+                        event_times.append(current_time)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_POSITION_Y, int(pos[1])))
+                        event_times.append(current_time)
+                    
+                    # Must-have gameplay events
+                    elif event_type == "Checkpoint":
+                        events.append(AdofaiEvent(AdofaiEventType.CHECKPOINT, 1))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "AutoPlayTiles":
+                        enabled = 1 if action.get("enabled", True) else 0
+                        events.append(AdofaiEvent(AdofaiEventType.AUTO_PLAY_TILES, enabled))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "SetPlanetRotation":
+                        ease_parts = action.get("easeParts", 1)
+                        events.append(AdofaiEvent(AdofaiEventType.SET_PLANET_ROTATION, ease_parts))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "FreeRoam":
+                        events.append(AdofaiEvent(AdofaiEventType.FREE_ROAM, 1))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "FreeRoamTwirl":
+                        events.append(AdofaiEvent(AdofaiEventType.FREE_ROAM_TWIRL, 1))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "FreeRoamRemove":
+                        events.append(AdofaiEvent(AdofaiEventType.FREE_ROAM_REMOVE, 1))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "ScaleMargin":
+                        scale = action.get("scale", 100)
+                        events.append(AdofaiEvent(AdofaiEventType.SCALE_MARGIN, int(scale)))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "ScaleRadius":
+                        scale = action.get("scale", 100)
+                        events.append(AdofaiEvent(AdofaiEventType.SCALE_RADIUS, int(scale)))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "Multitap":
+                        presses = action.get("presses", 2)
+                        events.append(AdofaiEvent(AdofaiEventType.MULTITAP, presses))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "Hide":
+                        hide_judge = 1 if action.get("hideJudgment", False) else 0
+                        events.append(AdofaiEvent(AdofaiEventType.HIDE, hide_judge))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "KillPlayer":
+                        events.append(AdofaiEvent(AdofaiEventType.KILL_PLAYER, 1))
+                        event_times.append(current_time)
+                    
+                    # Track events
+                    elif event_type == "PositionTrack":
+                        pos = action.get("position", [0, 0])
+                        events.append(AdofaiEvent(AdofaiEventType.POSITION_TRACK, 1))
+                        event_times.append(current_time)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_POSITION_X, int(pos[0])))
+                        event_times.append(current_time)
+                        events.append(AdofaiEvent(AdofaiEventType.CAMERA_POSITION_Y, int(pos[1])))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "ColorTrack":
+                        track_color_type = action.get("trackColorType", "Single")
+                        # Simplified: emit type as integer
+                        color_type_id = 0 if track_color_type == "Single" else 1
+                        events.append(AdofaiEvent(AdofaiEventType.COLOR_TRACK, color_type_id))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "AnimateTrack":
+                        track_anim = action.get("trackAnimation", "None")
+                        # Simplified: emit as binary flag
+                        anim_id = 0 if track_anim == "None" else 1
+                        events.append(AdofaiEvent(AdofaiEventType.ANIMATE_TRACK, anim_id))
+                        event_times.append(current_time)
+                    
+                    # Audio events
+                    elif event_type == "SetHitsound":
+                        hitsound = action.get("hitsound", "Kick")
+                        # Map common hitsounds to IDs (simplified)
+                        hitsound_map = {"Kick": 0, "Snare": 1, "Hat": 2, "Shaker": 3, "Sizzle": 4}
+                        hitsound_id = hitsound_map.get(hitsound, 0)
+                        events.append(AdofaiEvent(AdofaiEventType.SET_HITSOUND, hitsound_id))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "PlaySound":
+                        events.append(AdofaiEvent(AdofaiEventType.PLAY_SOUND, 1))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "SetHoldSound":
+                        hitsound = action.get("hitsound", "Kick")
+                        hitsound_map = {"Kick": 0, "Snare": 1, "Hat": 2, "Shaker": 3, "Sizzle": 4}
+                        hitsound_id = hitsound_map.get(hitsound, 0)
+                        events.append(AdofaiEvent(AdofaiEventType.SET_HOLD_SOUND, hitsound_id))
+                        event_times.append(current_time)
+                    
+                    # Control flow events
+                    elif event_type == "RepeatEvents":
+                        repetitions = action.get("repetitions", 1)
+                        events.append(AdofaiEvent(AdofaiEventType.REPEAT_EVENTS, repetitions))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "SetConditionalEvents":
+                        events.append(AdofaiEvent(AdofaiEventType.SET_CONDITIONAL_EVENTS, 1))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "SetInputEvent":
+                        events.append(AdofaiEvent(AdofaiEventType.SET_INPUT_EVENT, 1))
+                        event_times.append(current_time)
+                    
+                    # VFX events (Tyler override)
+                    elif event_type == "Flash":
+                        duration = action.get("duration", 1.0)
+                        events.append(AdofaiEvent(AdofaiEventType.FLASH, duration))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "Bloom":
+                        intensity = action.get("intensity", 100)
+                        events.append(AdofaiEvent(AdofaiEventType.BLOOM, int(intensity)))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "ShakeScreen":
+                        intensity = action.get("intensity", 100)
+                        events.append(AdofaiEvent(AdofaiEventType.SHAKE_SCREEN, int(intensity)))
+                        event_times.append(current_time)
+                    
+                    elif event_type == "SetFilter":
+                        filter_type = action.get("filter", "None")
+                        # Map common filters to IDs
+                        filter_map = {"None": 0, "Grayscale": 1, "Sepia": 2, "Invert": 3, "Arcade": 4}
+                        filter_id = filter_map.get(filter_type, 0)
+                        events.append(AdofaiEvent(AdofaiEventType.SET_FILTER, filter_id))
                         event_times.append(current_time)
             
             # Handle midspin tiles (999)

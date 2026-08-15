@@ -9,7 +9,10 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np
 
-from osuT5.osuT5.event import Event, EventType
+try:
+    from osuT5.event import Event, EventType
+except ModuleNotFoundError:
+    from osuT5.osuT5.event import Event, EventType
 from .parser import AdofaiLevel
 
 

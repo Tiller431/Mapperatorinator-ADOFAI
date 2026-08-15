@@ -58,7 +58,7 @@ ADOFAI charts are stored as JSON-like files with the following structure:
   - `Pause`: Pause movement for duration
   - `Hold`: Hold input for duration
   - `MultiPlanet`: Multiple orbiting planets
-  - Camera/VFX events (not yet supported in v1)
+  - Camera/VFX events (MoveCamera, MoveTrack, Flash, Bloom, ShakeScreen, SetFilter)
 - **`decorations`** — Visual decorations (not yet supported in v1)
 
 ### Format Quirks
@@ -102,7 +102,7 @@ The `adofai/event.py` module defines intermediate events for model training/infe
 1. **Integer angles (0-359)** — No quantization to preserve expressiveness
 2. **Midspin as distinct event** — `999` is a special tile type, not an angle
 3. **Floor-to-time conversion** — Actions use floor indices; we convert to/from timestamps using BPM and angle rotation math
-4. **v1 excludes camera/VFX** — Deferred to focus on playable rhythm mechanics
+4. **Camera/VFX are in this train** — MoveCamera, MoveTrack, Flash/Bloom/ShakeScreen/SetFilter use SharpFAI on-disk keys. Decorations stay deferred.
 
 ## Timing Calculations
 
@@ -120,141 +120,152 @@ time_delta = (angle_difference / 180) * (60000 / current_bpm)
 
 The `AdofaiConverter` class handles this calculation when converting between `.adofai` structure and event sequences.
 
-## Training Requirements
+## Training with Whisper Encoder-Decoder
 
-To generate quality ADOFAI charts, the model must be retrained. The current pretrained weights are for osu! and will not work well for ADOFAI.
+ADOFAI training uses the full osuT5 Whisper infrastructure (same as osu! Mapperatorinator).
+
+### Model Architecture
+
+**Production Model:**
+- **Encoder-Decoder:** Tiger14n/ropewhisper-small (~219M parameters, 12/12/768)
+- **Spectrogram:** torchaudio Mel (16kHz, hop 128, n_fft 1024, 80 mels, log scale)
+- **Context:** src 4096 frames (~32.8s), tgt 8192 tokens (staged: timing → notes/actions)
+- **Loss:** Token cross-entropy, rhythm_weight 1.0
+- **Optimizer:** Muon (lr 1e-2), 65536 steps, bf16, compile
+- **Conditioning:** Difficulty ON (encoder RBF embed + prefix token), NO style/descriptor/year tags
+
+**Smoke Model (testing only):**
+- **Encoder-Decoder:** Tiger14n/ropewhisper-tiny (~39M parameters)
+- **Context:** src 1024 frames (~8.2s), tgt 2048 tokens
+- **Optimizer:** AdamW (lr 1e-4), 100 steps, no bf16, no compile
+- **Purpose:** Verify training loop, vocab emission, augmentation — NOT for quality generation
 
 ### Dataset Layout
 
-The training pipeline expects charts in Workshop-style folders:
+Training expects Workshop-style folders:
 
 ```
 <data_root>/
   <workshopId>__<chartName>/
     level.adofai
-    <audio>.ogg|.mp3|.wav|.flac
+    audio.ogg  # or .mp3, .wav, .flac, .m4a, .aac
   
-  another_workshop_id__ChartName/
+  another_id__AnotherChart/
     level.adofai
-    song.ogg
-  
-  ...
+    song.mp3
 ```
 
-**Optional:** Create an index JSON with metadata:
-```json
-[
-  {
-    "workshop_id": "1234567890",
-    "chart_dir": "1234567890__MyChart",
-    "audio": "1234567890__MyChart/song.ogg",
-    "has_audio": true
-  },
-  ...
-]
-```
+**Lossless Augmentation (continuous uniform, independent):**
 
-### Dataset Needs
+Each chart yields **ONE augmented variant per epoch** with random sampling. Transforms are **INDEPENDENT** (rotate AND reflect MAY both apply, not XOR).
 
-1. **ADOFAI charts + audio pairs**:
-   - Collect `.adofai` files with corresponding audio
-   - Audio formats: `.ogg`, `.mp3`, `.wav`, `.flac`, `.m4a`, `.aac` (case-insensitive detection)
-   - Recommended: 100+ charts for initial training, 500+ for quality
-   - Cover variety of styles, BPMs, difficulties
-   - Sources: ADOFAI Workshop, community chart collections, custom levels
+- **Rotation:** With probability p_rotate (default 1.0), sample R ~ Uniform[0, 360)
+  - Apply: a = (a + R) % 360 for non-999 angles; 999 unchanged
+  - Twirls unchanged; camera/track positions and rotations also rotated
+  - angleOffset unchanged
 
-2. **Audio detection** (robust):
-   - Checks `songFilename` from `level.adofai` first
-   - Falls back to scanning directory for audio files (case-insensitive)
-   - No additional metadata files required
+- **Reflection:** With probability p_reflect (default 0.5), pick one axis from proven family
+  - Axes: X-flip (−a % 360), Y-flip (180−a), y=x (90−a), y=−x (270−a)
+  - Add floor-0 Twirl (toggle if already exists)
+  - Camera/track world positions and camera rotation are reflected; angleOffset unchanged
+  - 999 unchanged
 
-3. **Quality filtering**:
-   - Charts must have audio present
-   - UTF-8 BOM is handled automatically
-   - Remove broken/corrupted files
-   - Ensure charts parse correctly with `adofai.parser`
+- **Matched-rate:** With probability p_rate (default 0.5), sample r ~ Uniform[0.85, 1.25]
+  - Scales: BPM × r, SetSpeed BPM × r, offset ms / r
+  - Audio duration → duration / r
+  - Leaves unchanged: multipliers, Pause/Hold/camera durations (in beats), angleOffset
 
-### Training Options
+- **Same-duration pitch:** With probability p_pitch (default 0.5), sample settings.pitch ~ Uniform[80, 120]
+  - Waveform pitch-shift without duration change
+  - Chart events untouched; 100 = no pitch change
 
-**Option 1: Google Colab (Recommended for beginners)**
+**Transforms are independent:** Each is sampled separately; no discrete steps, no XOR locks, no cartesian product. Chart sees different random augmentation each epoch.
 
-Use the provided Colab notebook for easy cloud training:
+**Expected effective dataset size:** ~126 base charts with stochastic augmentation (infinite variants due to continuous sampling).
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Tiller431/Mapperatorinator-ADOFAI/blob/cursor/adofai-foundation-5317/colab/adofai_train_v1.ipynb)
+**Dataset:** [Google Drive top-100 archive](https://drive.google.com/drive/folders/1lATJxQI8P3uLsRtiC7ay5u3SrFhH1cfd) (`adofai-top100.tar.gz`, ~126 charts)
 
-**Features**:
-- Free GPU (T4) or upgrade to Colab Pro
-- No local setup required
-- Stores data and checkpoints on Google Drive
-- Step-by-step guided cells
-- Automatic checkpoint saving
+### Event Coverage
 
-**Requirements**:
-- Google account
-- ADOFAI charts: Upload `adofai-top100.tar.gz` to `MyDrive/adofai-dataset/` or access the [shared Drive folder](https://drive.google.com/drive/folders/1lATJxQI8P3uLsRtiC7ay5u3SrFhH1cfd) (notebook auto-extracts to `charts-top100/<id>__<name>/level.adofai` + audio)
+**Full vocab (all in this train):**
+- **Timing:** BPM, offset, TIME_SHIFT, SetSpeed (BPM + multiplier), Pause, Hold
+- **Path:** Tile angles 0–359, midspin 999, Twirl (reverse), MultiPlanet
+- **Camera/Track:** MoveCamera, PositionTrack, MoveTrack, ColorTrack, AnimateTrack
+- **Gameplay:** Checkpoint, AutoPlayTiles, SetPlanetRotation, FreeRoam*, ScaleMargin, ScaleRadius, Multitap, Hide, KillPlayer
+- **Audio:** SetHitsound, PlaySound, SetHoldSound
+- **Control flow:** RepeatEvents, SetConditionalEvents, SetInputEvent
+- **VFX:** Flash, Bloom, ShakeScreen, SetFilter, SetFilterAdvanced (`filterProperties` presence only)
+- **Rare (tokenize only):** Bookmark, EditorComment, CallMethod, AddComponent, ChangeTrack, FreeRoamWarning
+- **Conditioning:** Difficulty prefix token (from `settings.difficulty` or index JSON); settings `bpm` / `offset` / `pitch`
 
----
+**NOT included:** Decorations, particles. No style/descriptor/year/mapper tags. `filterProperties` string payload is not lossless (empty vs present).
 
-**Option 2: Local Training**
+### Hardware Requirements
 
-Test the training pipeline with minimal data:
+**Smoke test (Whisper-tiny):**
+- **GPU:** Any (4060 8GB, T4, etc.) or CPU
+- **VRAM:** ~4 GB
+- **Time:** ~5-10 minutes for 100 steps
+- **Purpose:** Verify pipeline, vocab emission (speed/twirl/camera/VFX/diff tokens)
+
+**Full training (Whisper-small production):**
+- **GPU:** Colab Pro A100/L4 (24GB VRAM) OR 4090 (24GB) OR 4× GPUs with 8GB+ each
+- **VRAM:** ~20-24 GB per GPU (single GPU: microbatch 8-16; multi-GPU: batch 32 per GPU)
+- **Time:** ~80-200 GPU-hours (depends on dataset size and convergence)
+- **NOT feasible:** Single 4060 8GB (insufficient VRAM for Whisper-small full batch)
+
+### Exact Training Commands
+
+**Smoke test (Whisper-tiny, CPU or any GPU):**
 
 ```bash
-# Create a small test dataset (3-5 charts)
-mkdir -p test_data/test1__SimpleChart
-cp your_chart.adofai test_data/test1__SimpleChart/level.adofai
-cp your_audio.ogg test_data/test1__SimpleChart/audio.ogg
+# Extract dataset
+tar -xzf adofai-top100.tar.gz -C datasets/
 
-# Run smoke training (tiny model, few steps)
-python3 -m adofai.train \
-  --data_dir test_data \
-  --output_dir adofai_smoke \
-  --smoke \
-  --device cpu
+# Run smoke (100 steps, tiny model, 5 charts × 8 rotations = 40 variants)
+python osuT5/train.py -cn adofai_whisper_tiny \
+  data.train_dataset_path=datasets/adofai-top100 \
+  data.test_dataset_path=datasets/adofai-top100
 ```
 
-This will:
-- Load 5 samples max
-- Train tiny model (64 hidden dim, 1 layer)
-- Run 2 epochs with batch size 2
-- Save checkpoint to `adofai_smoke/`
-
-### Running Full Training
-
-For real training on a larger dataset (T4 GPU-safe defaults):
+**Full production training (Whisper-small, A100/L4/4090):**
 
 ```bash
-python3 -m adofai.train \
-  --data_dir /path/to/workshop_charts \
-  --output_dir adofai_checkpoints \
-  --batch_size 2 \
-  --lr 1e-4 \
-  --epochs 50 \
-  --device cuda  # or cpu/mps
+# Single GPU (microbatch 8-16):
+python osuT5/train.py -cn adofai_v31 \
+  data.train_dataset_path=datasets/adofai-top100 \
+  data.test_dataset_path=datasets/adofai-top100 \
+  optim.batch_size=8
+
+# Multi-GPU (4 GPUs, batch 32 per GPU = 128 total):
+python osuT5/train.py -cn adofai_v31 \
+  data.train_dataset_path=datasets/adofai-top100 \
+  data.test_dataset_path=datasets/adofai-top100
 ```
 
-**T4 GPU Memory Settings:**
-- Audio: 60s max (center-cropped automatically)
-- Spectrogram: log-mel with 80 mel filterbanks
-- Batch size: 2 (default; reduce to 1 if OOM)
-- Warning printed if batch_size > 2 on CUDA
+**Output:**
+- Checkpoints: `outputs/<timestamp>/checkpoints/`
+- Logs: `tensorboard_logs/`
+- Final vocab size: ~10k-15k tokens (depends on event range quantization)
 
-Expected compute: 100-500 GPU hours depending on dataset size.
+### Generation (two-pass, like osu!)
 
-### Model Architecture (v1)
+After training, generate charts using osuT5 inference:
 
-The v1 training script (`adofai/train.py`) provides:
-- ✅ Dataset loading from Workshop folders (robust audio detection)
-- ✅ Log-mel spectrogram preprocessing (80 mels, 60s cap)
-- ✅ Event tokenization (vocab size ~2021)
-- ✅ Simple LSTM model for proof-of-concept
-- ✅ Per-epoch checkpointing (`checkpoint_epoch{N}.pt`, `tokenizer.pkl`)
-- ❌ **TODO:** Full Whisper encoder integration (like upstream osuT5)
+```bash
+python osuT5/inference.py \
+  checkpoint_path=outputs/<timestamp>/checkpoints/step_65536.pt \
+  audio_path=your_song.ogg \
+  output_path=./generated \
+  format=adofai \
+  difficulty=12
+```
 
-**Current architecture:** LSTM-based encoder-decoder consuming log-mel spectrograms
-**Future architecture:** Whisper-style encoder (like upstream Mapperatorinator for osu!)
+Generation is **staged** (v29/v31 style):
+1. **Pass 1:** Timing context (BPM, offset, SetSpeed, timing points)
+2. **Pass 2:** Full chart (tiles, angles, midspin, Twirl, camera, VFX) conditioned on Pass 1
 
-For full-scale production training, integrate with `osuT5/train.py` infrastructure and Whisper encoder.
+**Note:** Generation code for ADOFAI is in progress. Current path: osuT5 model outputs tokens → converter decodes to Events → `adofai/converter.py` events_to_level() → write .adofai file.
 
 ## Evaluation Ideas
 
@@ -267,25 +278,22 @@ Metrics to assess generated ADOFAI charts:
 
 Manual playtesting is essential — ADOFAI is very sensitive to timing precision.
 
-## Current Limitations (v1)
+## Current Limitations
 
-- ❌ Model NOT trained on ADOFAI data (export/inference is stub/placeholder only)
-- ❌ LSTM proof-of-concept (Whisper encoder integration TODO)
-- ❌ No camera events (MoveCamera, MoveTrack)
-- ❌ No VFX events (Flash, Bloom, ShakeScreen)
-- ❌ No decorations
-- ❌ No multi-file level support (separate audio/image files)
-- ✅ Training pipeline complete (dataset, tokenizer, model, checkpoints)
-- ✅ Memory-optimized for T4 GPU (log-mel spectrograms, 60s audio cap)
-- ✅ Basic playable mechanics ready for training (tiles, speed, twirl, hold)
+- Production train path is `python osuT5/train.py -cn adofai_v31` (Whisper-small / v31). `adofai/train.py` LSTM is a deprecated stub.
+- Audio input is raw waveform frames `[src_seq_len-1, hop_length]`. The model owns the Mel. Do not use the old 60s T4 crop.
+- Difficulty is `settings.difficulty` (1–10), else `index.json` / `metadata.json`, else documented proxy `5.0`. There is no osu star rating.
+- `max_source_positions = src_seq_len // 2`. Do not mix tiny (`src 1024`) and v31 (`src 4096`) checkpoints.
+- 126 Workshop charts are enough to smoke the pipeline, not enough for osu-quality generalization.
+- Decorations / particles / editor-only events are deferred.
+- `adofai/inference.py`, `adofai/tokenizer.py`, and `adofai/osu_to_adofai.py` are not the infer path.
 
 ## Next Steps
 
-1. **Collect ADOFAI dataset** — gather 100+ Workshop charts + audio ✅ (you can start now)
-2. **Run training** — use Colab notebook or local GPU ✅ (pipeline ready)
-3. **Integrate Whisper encoder** — adapt from upstream osuT5 (future work)
-4. **Evaluate** — playtest generated charts and iterate
-5. **Extend to v2** — add camera, VFX, decorations
+1. Collect a serious ADOFAI set (orders of magnitude more chart+audio pairs than 126).
+2. Smoke: `python osuT5/train.py -cn adofai_whisper_tiny`
+3. Full train on Colab Pro A100/L4 or 4090: `python osuT5/train.py -cn adofai_v31 data.train_dataset_path=/path/to/charts`
+4. Generate with the trained Whisper checkpoint, then `events_to_level` export.
 
 ## References
 

@@ -1,7 +1,16 @@
 """
-Tokenizer for ADOFAI events.
+DEPRECATED: String-based ADOFAI tokenizer (DO NOT USE).
 
-Converts ADOFAI events to/from token IDs for model training.
+This tokenizer uses string keys and pickle serialization, which conflicts with
+the osuT5 EventRange vocabulary system (e.g., "bpm*" collision with SET_SPEED_BPM).
+
+Production tokenizer: osuT5/osuT5/tokenizer.py with ADOFAI EventRange definitions
+    - Integrates ADOFAI events into osuT5 Tokenizer
+    - Uses EventType enum and EventRange quantization
+    - See osuT5/osuT5/event.py for ADOFAI event types
+    - See osuT5/osuT5/tokenizer.py __init__ for ADOFAI event ranges
+
+This file is kept for reference only.
 """
 
 from __future__ import annotations

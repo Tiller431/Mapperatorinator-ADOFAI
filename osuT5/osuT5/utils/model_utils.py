@@ -18,6 +18,8 @@ from torch.optim.lr_scheduler import (
 from transformers.utils import cached_file
 
 from ..dataset.osu_parser import OsuParser
+from ..dataset.adofai_dataset import AdofaiDataset
+from ..dataset.adofai_parser import AdofaiParser
 from ..event import EventType
 from ..model.configuration_mapperatorinator import MapperatorinatorConfig
 from ..model.modeling_mapperatorinator import Mapperatorinator
@@ -545,6 +547,8 @@ def get_dataset(args: TrainConfig, **kwargs) -> IterableDataset:
     elif args.data.dataset_type == "mmrs":
         from ..dataset.mmrs_dataset import MmrsDataset
         return MmrsDataset(args=args.data, **kwargs)
+    elif args.data.dataset_type == "adofai":
+        return AdofaiDataset(args=args.data, **kwargs)
     elif args.data.dataset_type == "web":
         from ..dataset.web_dataset import WebDataset
         return WebDataset(args=args.data, **kwargs)
@@ -553,7 +557,10 @@ def get_dataset(args: TrainConfig, **kwargs) -> IterableDataset:
 
 
 def get_dataloaders(tokenizer: Tokenizer, args: TrainConfig, shared: Namespace) -> tuple[DataLoader, DataLoader]:
-    parser = OsuParser(args, tokenizer)
+    if args.data.dataset_type == "adofai":
+        parser = AdofaiParser(args, tokenizer)
+    else:
+        parser = OsuParser(args, tokenizer)
     datasets = {
         "train": get_dataset(
             args=args,

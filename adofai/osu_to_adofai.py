@@ -1,7 +1,15 @@
 """
-Convert osuT5 events to ADOFAI format.
+DEPRECATED: osu → ADOFAI event conversion stub.
 
-Takes the event stream from osuT5 processor.generate() and converts it to ADOFAI tiles.
+This file attempts to convert osu! events to ADOFAI, which is NOT the production inference path.
+
+Production inference path:
+    1. Train a Whisper model on ADOFAI data: python osuT5/train.py -cn adofai_v31
+    2. Generate ADOFAI events directly using the trained checkpoint
+    3. Convert osuT5 Events → .adofai using adofai/converter.py events_to_level()
+
+This file's "osu hit times → ADOFAI beat-grid angles" approach does NOT produce
+valid ADOFAI charts and should NOT be used.
 """
 
 from __future__ import annotations

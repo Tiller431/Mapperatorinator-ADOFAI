@@ -175,6 +175,91 @@ class Tokenizer(PushToHubMixin):
 
             if args.data.add_global_sv_token:
                 self.input_event_ranges.append(EventRange(EventType.GLOBAL_SV, 40, 360))
+            
+            # ADOFAI-specific event ranges
+            if args.data.dataset_type == "adofai":
+                # Tile angles (0-359) and midspin
+                self.event_ranges.append(EventRange(EventType.TILE_ANGLE, 0, 359))
+                self.event_ranges.append(EventRange(EventType.MIDSPIN, 0, 0))
+                
+                # Speed/timing events
+                self.event_ranges.append(EventRange(EventType.SET_SPEED_BPM, 40, 300))  # BPM range
+                self.event_ranges.append(EventRange(EventType.SET_SPEED_MULT, 10, 50))  # 0.1 to 5.0 in 0.1 steps
+                self.event_ranges.append(EventRange(EventType.PAUSE, 0, 100))  # Duration in 0.1 beat steps
+                self.event_ranges.append(EventRange(EventType.HOLD, 0, 100))
+                
+                # Gameplay modifiers
+                self.event_ranges.append(EventRange(EventType.TWIRL, 0, 0))
+                self.event_ranges.append(EventRange(EventType.MULTI_PLANET, 2, 10))
+                self.event_ranges.append(EventRange(EventType.CHECKPOINT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.AUTO_PLAY_TILES, 0, 1))
+                self.event_ranges.append(EventRange(EventType.SET_PLANET_ROTATION, 0, 10))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM, 0, 0))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM_TWIRL, 0, 0))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM_REMOVE, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SCALE_MARGIN, 0, 200))
+                self.event_ranges.append(EventRange(EventType.SCALE_RADIUS, 0, 200))
+                self.event_ranges.append(EventRange(EventType.MULTITAP, 1, 10))
+                self.event_ranges.append(EventRange(EventType.HIDE, 0, 1))
+                self.event_ranges.append(EventRange(EventType.KILL_PLAYER, 0, 0))
+                
+                # Track events
+                self.event_ranges.append(EventRange(EventType.POSITION_TRACK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.MOVE_TRACK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.COLOR_TRACK, 0, 10))
+                self.event_ranges.append(EventRange(EventType.ANIMATE_TRACK, 0, 10))
+                self.event_ranges.append(EventRange(EventType.MOVE_CAMERA, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CAMERA_POSITION_X, -200, 200))
+                self.event_ranges.append(EventRange(EventType.CAMERA_POSITION_Y, -200, 200))
+                self.event_ranges.append(EventRange(EventType.CAMERA_ROTATION, 0, 359))
+                self.event_ranges.append(EventRange(EventType.CAMERA_ZOOM, 0, 400))
+                self.event_ranges.append(EventRange(EventType.CAMERA_DURATION, 0, 100))
+                self.event_ranges.append(EventRange(EventType.CAMERA_EASE, 0, 40))
+                self.event_ranges.append(EventRange(EventType.CAMERA_RELATIVE, 0, 4))
+                
+                # Audio events
+                self.event_ranges.append(EventRange(EventType.SET_HITSOUND, 0, 10))
+                self.event_ranges.append(EventRange(EventType.PLAY_SOUND, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SET_HOLD_SOUND, 0, 10))
+                
+                # Control flow
+                self.event_ranges.append(EventRange(EventType.REPEAT_EVENTS, 1, 20))
+                self.event_ranges.append(EventRange(EventType.SET_CONDITIONAL_EVENTS, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SET_INPUT_EVENT, 0, 0))
+                
+                # VFX events
+                self.event_ranges.append(EventRange(EventType.FLASH, 0, 100))  # Duration in 0.1 beat steps
+                self.event_ranges.append(EventRange(EventType.BLOOM, 0, 200))  # Intensity 0-200
+                self.event_ranges.append(EventRange(EventType.SHAKE_SCREEN, 0, 200))  # Intensity
+                self.event_ranges.append(EventRange(EventType.SET_FILTER, 0, 50))
+                self.event_ranges.append(EventRange(EventType.SET_FILTER_ADVANCED, 0, 50))
+                self.event_ranges.append(EventRange(EventType.FILTER_PROPERTIES, 0, 1))
+                self.event_ranges.append(EventRange(EventType.BOOKMARK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.EDITOR_COMMENT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CALL_METHOD, 0, 0))
+                self.event_ranges.append(EventRange(EventType.ADD_COMPONENT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CHANGE_TRACK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM_WARNING, 0, 0))
+                self.event_ranges.append(EventRange(EventType.PAUSE_COUNTDOWN, 0, 20))
+                self.event_ranges.append(EventRange(EventType.PAUSE_ANGLE_DIR, 0, 2))
+                self.event_ranges.append(EventRange(EventType.HOLD_DISTANCE, 0, 400))
+                self.event_ranges.append(EventRange(EventType.HOLD_LANDING, 0, 1))
+                self.event_ranges.append(EventRange(EventType.TRACK_START_TILE, 0, 519))
+                self.event_ranges.append(EventRange(EventType.TRACK_END_TILE, 0, 519))
+                self.event_ranges.append(EventRange(EventType.VFX_PLANE, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_COLOR, 0, 4095))
+                self.event_ranges.append(EventRange(EventType.VFX_OPACITY, 0, 100))
+                self.event_ranges.append(EventRange(EventType.VFX_ENABLED, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_DISABLE_OTHERS, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_INTENSITY, 0, 200))
+                self.event_ranges.append(EventRange(EventType.VFX_STRENGTH, 0, 200))
+                self.event_ranges.append(EventRange(EventType.VFX_THRESHOLD, 0, 100))
+                self.event_ranges.append(EventRange(EventType.ANGLE_OFFSET, -180, 180))
+                
+                # Metadata (prefix tokens)
+                self.input_event_ranges.append(EventRange(EventType.BPM, 40, 300))
+                self.input_event_ranges.append(EventRange(EventType.OFFSET, -1000, 1000))
+                self.input_event_ranges.append(EventRange(EventType.PITCH, 50, 200))
 
         self.event_ranges: list[EventRange] = self.event_ranges + [
             EventRange(EventType.NEW_COMBO, 0, 0),

@@ -1,0 +1,90 @@
+defaults:
+  - default
+  - ../model@model: whisper_tiny_v2
+  - _self_
+
+compile: false         # Disable for smoke test
+mixed_precision: 'no'
+precision: 'fp32'
+
+model:
+  do_difficulty_embed: true
+  do_style_embed: false
+  do_mapper_embed: false
+  do_song_position_embed: false
+
+data:                  # Data settings
+  dataset_type: "adofai"
+  train_dataset_path: "/workspace/datasets/adofai-top100"  # Placeholder
+  test_dataset_path: "/workspace/datasets/adofai-top100"
+  train_dataset_start: 0
+  train_dataset_end: 5   # Smoke: only 5 charts
+  test_dataset_start: 5
+  test_dataset_end: 10
+  num_classes: 0
+  
+  # ADOFAI augmentation (smoke: test rotation only, keep simple)
+  adofai_rotate_prob: 1.0          # Always rotate for smoke test
+  adofai_reflect_prob: 0.0         # Disable reflection in smoke
+  adofai_rate_prob: 0.0            # Disable rate in smoke
+  adofai_pitch_prob: 0.0           # Disable pitch in smoke
+  # Smoke: 5 charts, each with random R ~ Uniform[0, 360) per epoch
+  
+  # Prefix tokens (same as adofai_v31)
+  add_out_context_types: true
+  add_gamemode_token: false
+  add_style_token: false
+  add_diff_token: true         # Test difficulty emission
+  add_mapper_token: false
+  add_year_token: false
+  add_hitsounded_token: false
+  add_song_length_token: false
+  add_global_sv_token: false
+  add_cs_token: false
+  add_keycount_token: false
+  add_hold_note_ratio_token: false
+  add_scroll_speed_ratio_token: false
+  add_descriptors: false
+  add_sv_special_token: false
+  add_kiai_special_token: false
+  add_song_position_token: false
+  
+  num_diff_classes: 24
+  max_diff: 20
+  
+  timing_random_offset: 0  # Forbidden jitter; do not mix with v31 4096 checkpoints
+  src_seq_len: 1024            # Tiny only. max_source_positions = src_seq_len // 2 = 512
+  tgt_seq_len: 2048
+  rhythm_weight: 1.0
+  
+  context_types:
+    - "in": ['${context_type:none}']
+      "out": ['${context_type:timing}', '${context_type:map}']
+  
+  context_weights: [1]
+  add_timing: false
+  add_snapping: false
+  add_timing_points: false
+  add_hitsounds: false
+  add_pre_tokens: false
+  per_track: false
+  add_distances: false
+  add_positions: false
+  dt_augment_prob: 0.0
+  types_first: true
+  add_kiai: false
+  gamemodes: []
+  add_sv: false
+
+dataloader:
+  num_workers: 2       # Smoke: fewer workers
+
+optim:                 # Smoke: fast iteration
+  name: adamw          # Simpler optimizer for smoke
+  base_lr: 1e-4
+  batch_size: 2        # Small batch for smoke
+  grad_acc: 1
+  total_steps: 100     # Smoke: just 100 steps to verify training loop
+  warmup_steps: 10
+  final_cosine: 1e-5
+  weight_decay: 0.01

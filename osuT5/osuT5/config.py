@@ -54,7 +54,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    dataset_type: str = "mmrs"   # Dataset type (ors/mmrs)
+    dataset_type: str = "mmrs"   # Dataset type (ors/mmrs/adofai/web)
     train_dataset_path: str = "/workspace/datasets/MMRS39389"  # Training dataset directory
     train_dataset_start: int = 0  # Training dataset start index
     train_dataset_end: int = 38689  # Training dataset end index
@@ -160,6 +160,14 @@ class DataConfig:
     dataset_subset: Optional[str] = None
     train_dataset_streaming: bool = True  # Use streaming mode for training dataset
     test_dataset_streaming: bool = False  # Use streaming mode for testing/validation dataset
+    # ADOFAI lossless augmentation (continuous uniform, independent; not locked grids)
+    adofai_rotate_prob: float = 1.0
+    adofai_reflect_prob: float = 0.5
+    adofai_pitch_prob: float = 0.5
+    adofai_pitch_range: list[float] = field(default_factory=lambda: [80.0, 120.0])
+    adofai_rate_prob: float = 0.5
+    adofai_rate_range: list[float] = field(default_factory=lambda: [0.85, 1.25])
+    adofai_default_difficulty: float = 5.0  # Proxy when settings.difficulty and index JSON are missing (1–10 scale)
 
 
 @dataclass

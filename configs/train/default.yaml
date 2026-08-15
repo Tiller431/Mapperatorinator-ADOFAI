@@ -3,13 +3,16 @@ defaults:
 
 compile: true          # PyTorch 2.0 optimization
 device: gpu             # Training device (cpu/gpu)
-precision: 'bf16'         # Enable mixed precision (no/fp16/bf16/fp8)
+mixed_precision: 'bf16'         # Enable mixed precision (no/fp16/bf16)
+precision: 'fp32'               # Model weight precision (null/fp32/fp16/bf16)
+attn_implementation: 'sdpa'  # Attention implementation (eager/sdpa/flash_attention_2)
 seed: 42                # Project seed
-flash_attention: false  # Enable Flash Attention
 
 checkpoint_path: ''     # Project checkpoint directory (to resume training)
 pretrained_path: ''     # Path to pretrained model weights (to do transfer learning)
 pretrained_t5_compat: false  # Load weights from a T5 model with different vocab size
+pretrained_gamemode: null  # Only load weights for the specified gamemode from a multi-gamemode checkpoint
+enable_lora: false              # Use LoRA for finetuning
 mode: 'train'
 
 data:                  # Data settings
@@ -94,6 +97,8 @@ data:                  # Data settings
   dt_augment_prob: 0.0   # Probability of augmenting the dataset with DT
   dt_augment_range: [1.5, 1.5]  # Range of DT augmentation
   dt_augment_sqrt: false  # Sample DT augmentation from a square root distribution
+  flip_horizontal_prob: 0.0  # Probability of horizontally flipping beatmap positions during training
+  flip_vertical_prob: 0.0  # Probability of vertically flipping beatmap positions during training
   types_first: false       # Put the type token at the start of the group before the timeshift token
   add_kiai: false        # Add kiai times to map context
   gamemodes: [0]  # List of gamemodes to include in the dataset
@@ -105,12 +110,23 @@ data:                  # Data settings
   frame_offset_augment_prob: 1.0  # Probability of augmenting beatmap sequences with frame offset
   normalize_audio: true  # Normalize audio data
   slider_version: 1  # Slider version to use (1 or 2)
-
+  snapping_random_prob: 0.0  # Probability of randomizing hit object snapping in the dataset
+  sustain_interval: null  # Time in milliseconds between sustain tokens for held notes. Should be shorter than the lookback window.
+  position_refinement: null  # Add a second pass of position tokens with higher precision
+  descriptor_source: 'omdb'  # Source of beatmap descriptors (local/web/omdb/user_tags)
+  min_top_tag_count: 1  # Minimum count of a tag in the dataset to be included as a descriptor
+  tags_metadata_path: "../../../datasets/tags.json"       # Path to file with all beatmap mappers
+  ranked_statuses: [1, 2]  # List of ranked statuses to include in the dataset (-2 = graveyard, -1 = wip, 0 = pending, 1 = ranked, 2 = approved, 3 = qualified, 4 = loved)
+  dataset_subset: null  # Subset of the dataset to use for web dataset
+  train_dataset_streaming: true  # Use streaming mode for training dataset
+  test_dataset_streaming: false  # Use streaming mode for testing/validation dataset
 
 dataloader:             # Dataloader settings
   num_workers: 8
   pin_memory: true
   drop_last: false
+  balancer_buffer_size: 0  # Buffer size for the dataset balancer. Set to 0 to disable balancing.
+  balancer_prefetch_factor: 0.5  # Prefetch factor for the dataloader when using the dataset balancer. Determines how much of the balancer buffer is prefetched into the dataloader buffer.
 
 optim:                  # Optimizer settings
   name: adamwscale
@@ -132,6 +148,9 @@ eval:                   # Evaluation settings
 
 checkpoint:             # Checkpoint settings
   every_steps: 5000
+  local_total_limit: 2  # Number of local Accelerate checkpoints to retain on disk
+  cleanup_wandb_cache_before_save: true
+  wandb_cache_cleanup_size: '1GB'
 
 logging:                # Logging settings
   log_with: 'wandb'     # Logging service (wandb/tensorboard)
@@ -142,11 +161,19 @@ logging:                # Logging settings
 
 profile:                # Profiling settings
   do_profile: false
-  early_stop: false
-  wait: 8
+  early_stop: true
+  wait: 80
   warmup: 8
   active: 8
   repeat: 1
+
+lora:
+  r: 64
+  lora_alpha: 128
+  target_modules: ['k_proj', 'v_proj', 'q_proj', 'out_proj']
+  lora_dropout: 0.05
+  bias: "none"
+  init_lora_weights: "pissa"
 
 hydra:
   job:

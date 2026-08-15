@@ -14,13 +14,11 @@ from osu_diffusion.config import DiffusionTrainConfig
 @dataclass
 class InferenceConfig:
     model_path: str = ''  # Path to trained model
-    audio_path: str = ''  # Path to input audio
-    output_path: str = ''  # Path to output directory
-    beatmap_path: str = ''  # Path to .osu file to autofill metadata and use as reference
-    
-    # Format settings
-    format: str = 'adofai'  # Output format: 'adofai' or 'osu'
-    stub: bool = False  # Use stub generation (for ADOFAI format only)
+    audio_path: Optional[str] = None  # Path to input audio
+    output_path: Optional[str] = None  # Path to output directory
+    beatmap_path: Optional[str] = None  # Path to .osu file to autofill metadata and use as reference
+    lora_path: Optional[str] = None  # Path to LoRA weights
+    auto_select_gamemode_model: bool = True  # Automatically use a gamemode=<id> subdirectory in a local checkpoint or Hugging Face repo when available
 
     # Conditional generation settings
     gamemode: Optional[int] = None  # Gamemode of the beatmap
@@ -46,7 +44,10 @@ class InferenceConfig:
     # Inference settings
     seed: Optional[int] = None  # Random seed
     device: str = 'auto'  # Inference device (cpu/cuda/mps/auto)
+    precision: str = 'fp32'         # Lower precision for speed (fp32/bf16/fp16/amp); auto-falls back to fp32 where bf16 is unsupported
+    attn_implementation: str = 'auto'  # Attention implementation (auto/eager/sdpa/flash_attention_2)
     add_to_beatmap: bool = False  # Add generated content to the reference beatmap
+    overwrite_reference_beatmap: bool = False  # Overwrite the reference beatmap instead of creating a new one
     export_osz: bool = False  # Export beatmap as .osz file
     start_time: Optional[int] = None  # Start time of audio to generate beatmap for
     end_time: Optional[int] = None  # End time of audio to generate beatmap for
@@ -74,16 +75,23 @@ class InferenceConfig:
     use_server: bool = True  # Use server for optimized multiprocess inference
     max_batch_size: int = 16  # Maximum batch size for inference (only used for parallel sampling or super timing)
     resnap_events: bool = True  # Resnap notes to the timing after generation
+    snap_near_perfect_overlaps: bool = True  # Snap nearly overlapping positions to each other
+    fast_decoder_loop: bool = False  # Replace HF generate with a CUDA-graph decode loop; ~2-6x faster decode (fp16/bf16 > fp32), quality-equivalent. Requires CUDA; falls back to the stock loop where unsupported.
+    super_timing_fast_loop: bool = False  # Use the fast decoder loop for super timing instead of the batched-parallel path. Separate from fast_decoder_loop because super timing's parallel path may be faster on some GPUs; benchmark before enabling.
 
     # Metadata settings
-    bpm: int = 120  # Beats per minute of input audio
-    offset: int = 0  # Start of beat, in miliseconds, from the beginning of input audio
-    title: str = ''  # Song title
-    artist: str = ''  # Song artist
-    creator: str = ''  # Beatmap creator
-    version: str = ''  # Beatmap version
-    background: Optional[str] = None  # File name of background image
-    preview_time: int = -1  # Time in milliseconds to start previewing the song
+    bpm: Optional[int] = None  # Beats per minute of input audio
+    offset: Optional[int] = None  # Start of beat, in miliseconds, from the beginning of input audio
+    title: Optional[str] = None  # Song title
+    title_unicode: Optional[str] = None  # Song title in Unicode/Japanese
+    artist: Optional[str] = None  # Song artist
+    artist_unicode: Optional[str] = None  # Song artist in Unicode/Japanese
+    creator: Optional[str] = None  # Beatmap creator
+    version: Optional[str] = None  # Beatmap version
+    source: Optional[str] = None  # Source (anime, game, etc.)
+    tags: Optional[str] = None  # Tags for searching and categorizing
+    background: Optional[str] = None  # Full path to background image
+    preview_time: Optional[int] = None  # Time in milliseconds to start previewing the song
 
     # Diffusion settings
     generate_positions: bool = True  # Use diffusion to generate object positions
@@ -107,23 +115,31 @@ class InferenceConfig:
 
 @dataclass
 class FidConfig:
-    device: str = 'auto'  # Inference device (cpu/cuda/mps/auto)
-    compile: bool = True
     num_processes: int = 3
-    seed: int = 0
+    device: str = 'auto'
+    compile: bool = False
 
     skip_generation: bool = False
     fid: bool = True
+    fid_cm3p: bool = True
     rhythm_stats: bool = True
+    extra_stats: bool = True
 
     dataset_type: str = 'ors'
     dataset_path: str = '/workspace/datasets/ORS16291'
     dataset_start: int = 16200
     dataset_end: int = 16291
     gamemodes: list[int] = field(default_factory=lambda: [0])  # List of gamemodes to include in the dataset
+    min_year: Optional[int] = None
+    max_year: Optional[int] = None
+    min_difficulty: Optional[float] = None
+    max_difficulty: Optional[float] = None
 
     classifier_ckpt: str = 'OliBomby/osu-classifier'
     classifier_batch_size: int = 16
+
+    cm3p_ckpt: str = 'OliBomby/CM3P'
+    cm3p_batch_size: int = 16
 
     training_set_ids_path: Optional[str] = None  # Path to training set beatmap IDs
 
@@ -131,6 +147,17 @@ class FidConfig:
     hydra: Any = MISSING
 
 
+@dataclass
+class MaiModConfig:
+    beatmap_path: str = ''  # Path to .osu file
+    audio_path: str = ''  # Path to input audio
+    raw_output: bool = False
+    precision: str = 'fp32'         # Lower precision for speed (fp32/bf16/amp)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)  # Training settings for osuT5 model
+    hydra: Any = MISSING
+
+
 cs = ConfigStore.instance()
-cs.store(name="base_fid", node=FidConfig)
 cs.store(group="inference", name="base", node=InferenceConfig)
+cs.store(name="base_fid", node=FidConfig)
+cs.store(name="base_mai_mod", node=MaiModConfig)

@@ -18,16 +18,37 @@ class SuperTimingGenerator:
             args: InferenceConfig,
             model,
             tokenizer,
+            fast_loop: bool | None = None,
     ):
         self.args = args
         self.model = model
-        self.preprocessor = Preprocessor(args, parallel=True)
+        # The fast decoder loop is a single-window, batch-1 CUDA-graph loop: it
+        # cannot do beam search and does not use the batched-parallel path. When
+        # enabled we force greedy + num_beams=1 + the sequential path.
+        #
+        # This is gated by its OWN flag (super_timing_fast_loop), NOT
+        # fast_decoder_loop: super timing's default is the batched-parallel path,
+        # which better utilises GPUs with spare compute/VRAM and can be faster
+        # there than the batch-1 fast loop. On the flip side, the fast loop uses
+        # far less VRAM (no window batching). Benchmark on the target GPU before
+        # enabling; keeping it separate avoids silently regressing super timing
+        # when fast_decoder_loop is turned on for map generation.
+        if fast_loop is None:
+            fast_loop = getattr(args, "super_timing_fast_loop", False)
+        self.fast_loop = fast_loop
+        self.preprocessor = Preprocessor(args, parallel=not fast_loop)
         self.processor = Processor(args, model, tokenizer, cfg_scale=args.timer_cfg_scale)
         self.processor.do_sample = False
-        self.processor.parallel = True
-        self.processor.num_beams = args.timer_num_beams
+        if fast_loop:
+            self.processor.parallel = False
+            self.processor.num_beams = 1
+            self.processor.fast_decoder_loop = True
+        else:
+            self.processor.parallel = True
+            self.processor.num_beams = args.timer_num_beams
         self.processor.top_p = 1
         self.processor.top_k = 50
+        self.processor.add_to_beatmap = False
         self.bpm_change_threshold = args.timer_bpm_threshold
         self.types_first = args.train.data.types_first
         self.iterations = args.timer_iterations
@@ -56,7 +77,8 @@ class SuperTimingGenerator:
             print("Generating timing")
 
         iterations = self.iterations
-        iterator = tqdm(list(range(iterations))) if verbose else range(iterations)
+        tokens_per_second_meter = self.processor._create_tokens_per_second_meter()
+        iterator = tqdm(list(range(iterations)), smoothing=0.1, dynamic_ncols=True) if verbose else range(iterations)
         for _ in iterator:
             audio_offset = np.random.randint(-(self.miliseconds_per_sequence // 2), self.miliseconds_per_sequence // 2)
             begin_pad = max(0, audio_offset * self.sample_rate // MILISECONDS_PER_SECOND)
@@ -69,6 +91,8 @@ class SuperTimingGenerator:
                 out_context=[ContextType.MAP] if self.args.train.data.add_timing else [ContextType.TIMING],
                 verbose=False,
             )[0]
+            if verbose:
+                self.processor._update_tokens_per_second_meter(iterator, tokens_per_second_meter, self.processor.last_generation_stats)
             groups, _ = get_groups(events, types_first=self.types_first)
             last_beat_time = None
             last_group_type = None
@@ -206,16 +230,20 @@ class SuperTimingGenerator:
                     remove_range(previous_time, time)
                     break
 
-                nearest_peak: tuple = min(peaks, key=lambda x: loss(x, time))
-                if loss(nearest_peak, time) < 60:
-                    time = nearest_peak[0]
-                    period_ms = 60_000 / nearest_peak[2]
-                else:
-                    if loss(nearest_peak, time) < 300 and nearest_peak[3]:
-                        # There is a beat nearby, but it's likely on another BPM
-                        time -= direction * period_ms
-                        break
-                    # There is no beat nearby, so make an imaginary beat
+                # Limit the search to only peaks that progress forward in time,
+                # to prevent infinite loops of snapping to the same high prominence peak
+                next_peaks = [p for p in peaks if direction * (p[0] - previous_time) > 0]
+                if len(next_peaks) > 0:
+                    nearest_peak: tuple = min(next_peaks, key=lambda x: loss(x, time))
+                    if loss(nearest_peak, time) < 60:
+                        time = nearest_peak[0]
+                        period_ms = 60_000 / nearest_peak[2]
+                    else:
+                        if loss(nearest_peak, time) < 300 and nearest_peak[3]:
+                            # There is a beat nearby, but it's likely on another BPM
+                            time -= direction * period_ms
+                            break
+                        # There is no beat nearby, so make an imaginary beat
 
                 if any(t1 <= time <= t2 for t1, t2 in processed_regions):
                     # This beat has already been processed

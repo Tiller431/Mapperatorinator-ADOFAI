@@ -1,3 +1,14 @@
+import multiprocessing
+import traceback
+import atexit
+from dataclasses import asdict
+from pathlib import Path
+import json
+
+from hydra import initialize_config_dir, compose
+from omegaconf import OmegaConf
+
+import utils.excepthook  # noqa
 import functools
 import os
 import platform
@@ -5,23 +16,94 @@ import socket
 import subprocess
 import sys
 import threading
-import time
-import datetime
+import uuid
 from typing import Callable, Any, Tuple, Dict
+
+import io
+import hmac
+import multiprocessing as mp
+import queue as queue_mod
+import datetime
+import secrets
+import time
 
 import webview
 import werkzeug.serving
 from flask import Flask, render_template, request, Response, jsonify
 
+from utils import routed_pickle
 from config import InferenceConfig
-from inference import autofill_paths
+from osuT5.osuT5.event import ContextType
+from osuT5.osuT5.inference.server import InferenceClient
+from osuT5.osuT5.utils import load_model_loaders
+from inference import compile_args, get_server_address, main, should_load_separate_timing_model
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 template_folder = os.path.join(script_dir, 'template')
 static_folder = os.path.join(script_dir, 'static')
+descriptor_dataset_paths = {
+    'omdb': Path(script_dir) / 'datasets' / 'omdb_descriptors.json',
+    'user_tags': Path(script_dir) / 'datasets' / 'tags_2026.json',
+}
 
 if not os.path.isdir(static_folder):
     print(f"Warning: Static folder not found at {static_folder}. Ensure it exists and contains your CSS/images.")
+
+
+def format_descriptor_group_title(group_key: str) -> str:
+    return ' '.join(part.capitalize() for part in group_key.replace('_', ' ').split())
+
+
+def load_descriptor_set(dataset_path: Path, set_name: str) -> dict:
+    if not dataset_path.is_file():
+        print(f"Warning: Descriptor dataset not found at {dataset_path}.")
+        return {'groups': []}
+
+    with dataset_path.open('r', encoding='utf-8') as f:
+        tag_data = json.load(f)
+
+    groups = []
+    groups_by_key = {}
+
+    for tag in tag_data.get('tags', []):
+        full_name = (tag.get('name') or '').strip()
+        if not full_name:
+            continue
+
+        if '/' in full_name:
+            group_key, descriptor_name = full_name.split('/', 1)
+        else:
+            group_key, descriptor_name = 'other', full_name
+
+        group = groups_by_key.get(group_key)
+        if group is None:
+            group = {
+                'key': group_key,
+                'title': format_descriptor_group_title(group_key),
+                'items': [],
+            }
+            groups_by_key[group_key] = group
+            groups.append(group)
+
+        descriptor_value = (tag.get('value') or full_name).strip()
+        if not descriptor_value:
+            continue
+
+        group['items'].append({
+            'value': descriptor_value,
+            'label': descriptor_name,
+            'title': tag.get('description') or '',
+            'rulesetId': tag.get('ruleset_id'),
+            'translationKey': tag.get('translation_key') or (f"tag_{tag['id']}" if set_name == 'user_tags' else descriptor_value),
+        })
+
+    return {'groups': groups}
+
+
+DESCRIPTOR_SETS = {
+    set_name: load_descriptor_set(dataset_path, set_name)
+    for set_name, dataset_path in descriptor_dataset_paths.items()
+}
 
 
 # Set Flask environment to production before initializing Flask app to silence warning
@@ -47,13 +129,81 @@ def _ansi_style_supressor(func: Callable[..., Any]) -> Callable[..., Any]:
 werkzeug.serving._ansi_style = _ansi_style_supressor(werkzeug.serving._ansi_style)
 # --- End Patch ---
 
+if hasattr(webview, "FileDialog"):
+    OPEN_DIALOG = webview.FileDialog.OPEN
+    FOLDER_DIALOG = webview.FileDialog.FOLDER
+    SAVE_DIALOG = webview.FileDialog.SAVE
+else:
+    OPEN_DIALOG = webview.OPEN_DIALOG
+    FOLDER_DIALOG = webview.FOLDER_DIALOG
+    SAVE_DIALOG = webview.SAVE_DIALOG
+
+
+def parse_file_dialog_result(result):
+    if not result:
+        return None
+    return result[0] if isinstance(result, (list, tuple)) else result
+
 app = Flask(__name__, template_folder=template_folder, static_folder=static_folder)
 app.secret_key = os.urandom(24)  # Set a secret key for Flask
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Strict',
+)
+
+CSRF_HEADER_NAME = 'X-Mapperatorinator-CSRF-Token'
+LOCAL_UI_CSRF_TOKEN = secrets.token_urlsafe(32)
+CSRF_PROTECTED_ENDPOINTS = {
+    'start_inference',
+    'cancel_inference',
+    'save_config',
+    'validate_paths',
+    'open_folder',
+    'open_log_file',
+}
+
+
+def _is_authorized_ui_request() -> bool:
+    token = request.headers.get(CSRF_HEADER_NAME, '')
+    return bool(token) and hmac.compare_digest(token, LOCAL_UI_CSRF_TOKEN)
+
+
+@app.before_request
+def _protect_local_ui_endpoints():
+    if request.endpoint not in CSRF_PROTECTED_ENDPOINTS:
+        return None
+
+    if request.method != 'POST':
+        return jsonify({
+            "status": "error",
+            "message": "This endpoint only accepts authenticated POST requests."
+        }), 405
+
+    if not _is_authorized_ui_request():
+        return jsonify({
+            "status": "error",
+            "message": "Missing or invalid CSRF token. Refresh the UI and try again."
+        }), 403
+
+    return None
 
 
 # --- pywebview API Class ---
 class Api:
     # No __init__ needed as we get the window dynamically
+    def set_window_title(self, title):
+        """Updates the native pywebview window title."""
+        if not webview.windows:
+            print("Error: No pywebview window found.")
+            return False
+
+        try:
+            webview.windows[0].set_title(title)
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
     def save_file(self, filename):
         """Opens a save file dialog and returns the selected file path."""
         # Get the window dynamically from the global list
@@ -61,9 +211,9 @@ class Api:
             print("Error: No pywebview window found.")
             return None
         current_window = webview.windows[0]
-        result = current_window.create_file_dialog(webview.SAVE_DIALOG, save_filename=filename)
+        result = current_window.create_file_dialog(SAVE_DIALOG, save_filename=filename)
         print(f"File dialog result: {result}")  # Debugging
-        return result
+        return parse_file_dialog_result(result)
 
     def browse_file(self, file_types=None):
         """Opens a file dialog and returns the selected file path."""
@@ -80,13 +230,44 @@ class Api:
                 file_types = tuple(file_types)
 
             result = current_window.create_file_dialog(
-                webview.OPEN_DIALOG,
+                OPEN_DIALOG,
                 file_types=file_types
             )
         except Exception:
-            result = current_window.create_file_dialog(webview.OPEN_DIALOG)
+            result = current_window.create_file_dialog(OPEN_DIALOG)
 
-        return result[0] if result else None
+        return parse_file_dialog_result(result)
+
+    def browse_image(self):
+        """Opens a file dialog specifically for image files and returns the selected file path."""
+        # Get the window dynamically from the global list
+        if not webview.windows:
+            print("Error: No pywebview window found.")
+            return None
+
+        current_window = webview.windows[0]
+
+        # Image file type filter
+        image_file_types = (
+            'Image Files (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp)',
+            '*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.webp',
+            'JPEG Files (*.jpg;*.jpeg)',
+            '*.jpg;*.jpeg',
+            'PNG Files (*.png)',
+            '*.png',
+            'All Files (*.*)',
+            '*.*'
+        )
+
+        try:
+            result = current_window.create_file_dialog(
+                webview.OPEN_DIALOG,
+                file_types=image_file_types
+            )
+        except Exception:
+            result = current_window.create_file_dialog(OPEN_DIALOG)
+
+        return parse_file_dialog_result(result)
 
     def browse_folder(self):
         """Opens a folder dialog and returns the selected folder path."""
@@ -95,49 +276,220 @@ class Api:
             print("Error: No pywebview window found.")
             return None
         current_window = webview.windows[0]
-        result = current_window.create_file_dialog(webview.FOLDER_DIALOG)
+        result = current_window.create_file_dialog(FOLDER_DIALOG)
         print(f"Folder dialog result: {result}")  # Debugging
         # FOLDER_DIALOG also returns a tuple containing the path
-        return result[0] if result else None
+        return parse_file_dialog_result(result)
 
 
-# --- Shared State for Inference Process ---
-current_process: subprocess.Popen | None = None
-process_lock = threading.Lock()  # Lock for accessing current_process safely
+# --- Shared State for Inference Processes ---
+# Track inference workers (multiprocessing) instead of Popen
+# job_id -> {"process": mp.Process, "queue": mp.Queue, "cancelled": bool}
+processes = {}
+cancelled_jobs = set()
+process_lock = threading.Lock()
+owned_server_clients = {}
+owned_server_clients_lock = threading.Lock()
+shutdown_lock = threading.Lock()
+shutdown_started = False
 
 
-# --- Helper Function (same as original Flask) ---
-def dq_quote(s):
-    """Wrap the string in double quotes and escape inner double quotes."""
-    # Basic check if it looks quoted
-    if isinstance(s, str) and s.startswith('"') and s.endswith('"'):
-        return s
-    return '"' + str(s).replace('"', '\\"') + '"'
+def _ensure_model_server(args, *, auto_select_gamemode_model: bool, lora_path: str | None):
+    socket_path = get_server_address(
+        args.model_path,
+        lora_path=lora_path,
+        gamemode=args.gamemode,
+        auto_select_gamemode_model=auto_select_gamemode_model,
+    )
+
+    with owned_server_clients_lock:
+        existing_client = owned_server_clients.get(socket_path)
+
+    if existing_client is not None:
+        existing_client.ensure_server()
+        return
+
+    model_loader, tokenizer_loader = load_model_loaders(
+        ckpt_path=args.model_path,
+        t5_args=args.train,
+        device=args.device,
+        precision=args.precision,
+        attn_implementation=args.attn_implementation,
+        eval_mode=True,
+        pickle_module=routed_pickle,
+        lora_path=lora_path,
+        gamemode=args.gamemode,
+        auto_select_gamemode_model=auto_select_gamemode_model,
+    )
+    _server_owner_client = InferenceClient(
+        model_loader,
+        tokenizer_loader,
+        max_batch_size=args.max_batch_size,
+        idle_timeout=3600,
+        server_thread_daemon=True,
+        socket_path=socket_path,
+        fast_decoder_loop=args.fast_decoder_loop,
+    )
+
+    # Start the server in a dedicated thread that outlives per-job workers.
+    _server_owner_client.ensure_server()
+
+    with owned_server_clients_lock:
+        owned_server_clients.setdefault(socket_path, _server_owner_client)
 
 
-# Helper function for double-single quotes
-def dsq_quote(s):
-    """
-    Prepares a path string for Hydra command-line override.
-    Wraps the path in single quotes, escaping internal single quotes (' -> \\').
-    Then wraps the result in double quotes for shell safety.
-    Example: "C:/My's Folder" becomes "\"'C:/My\\'s Folder'\""
-    """
-    path_str = str(s)
+def _ensure_inference_server(args):
+    _ensure_model_server(
+        args,
+        auto_select_gamemode_model=args.auto_select_gamemode_model,
+        lora_path=args.lora_path
+    )
 
-    # 1. Escape internal single quotes within the path string itself
-    escaped_path = path_str.replace("'", "\\'")  # Replace ' with \'
-
-    # 2. Wrap the escaped path string in single quotes
-    inner_quoted = "'" + escaped_path + "'"
-
-    # 3. Wrap the single-quoted string in double quotes for the shell command line
-    return '"' + inner_quoted + '"'
+    if should_load_separate_timing_model(args):
+        _ensure_model_server(args, auto_select_gamemode_model=False, lora_path=None)
 
 
-def format_list_arg(items):
-    """Formats a list of strings for the command line argument."""
-    return "[" + ",".join("'" + str(d) + "'" for d in items) + "]"
+def _shutdown_inference_processes():
+    with process_lock:
+        active_processes = list(processes.items())
+        processes.clear()
+        cancelled_jobs.update(job_id for job_id, _ in active_processes)
+
+    for _, rec in active_processes:
+        proc = rec.get("process")
+        q = rec.get("queue")
+
+        if proc is not None:
+            try:
+                if proc.is_alive():
+                    if sys.platform == 'win32':
+                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], capture_output=True, timeout=5)
+                    else:
+                        proc.terminate()
+            except Exception:
+                pass
+
+            try:
+                proc.join(timeout=5)
+            except Exception:
+                pass
+
+        if q is not None:
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
+            try:
+                q.close()
+            except Exception:
+                pass
+
+
+def _shutdown_owned_model_servers():
+    with owned_server_clients_lock:
+        server_clients = list(owned_server_clients.values())
+        owned_server_clients.clear()
+
+    for client in server_clients:
+        try:
+            client.shutdown_server()
+        except Exception:
+            traceback.print_exc()
+
+
+def _shutdown_application_resources():
+    global shutdown_started
+
+    with shutdown_lock:
+        if shutdown_started:
+            return
+        shutdown_started = True
+
+    _shutdown_inference_processes()
+    _shutdown_owned_model_servers()
+
+
+def _coerce_optional_int(v):
+    if v is None or v == '':
+        return None
+    return int(v)
+
+
+def _coerce_optional_float(v):
+    if v is None or v == '':
+        return None
+    return float(v)
+
+
+def _coerce_bool_checkbox(form, key: str) -> bool:
+    return key in form
+
+
+def _validate_year_for_model(model_name: str | None, year: int | None) -> None:
+    if year is None:
+        return
+
+    min_year = 2007
+    max_year = 2024 if model_name == 'v32' else 2023
+
+    if year < min_year or year > max_year:
+        raise ValueError(
+            f"Year must be between {min_year} and {max_year} for model '{model_name or 'unknown'}'."
+        )
+
+
+class _QueueWriter(io.TextIOBase):
+    def __init__(self, q: mp.Queue):
+        self._q = q
+        self._buf = ""
+
+    def write(self, s):
+        if not s:
+            return 0
+        self._buf += s
+
+        # tqdm progress bars often update the same line using carriage returns.
+        # Forward those updates as individual messages so the UI can parse percentage.
+        while "\r" in self._buf:
+            seg, self._buf = self._buf.split("\r", 1)
+            if seg:
+                self._q.put(seg)
+            else:
+                # Even an empty segment can represent a progress refresh; keep UI alive.
+                self._q.put("")
+
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self._q.put(line)
+        return len(s)
+
+    def flush(self):
+        if self._buf:
+            self._q.put(self._buf)
+            self._buf = ""
+
+
+def _inference_worker(cfg: InferenceConfig, out_q: mp.Queue):
+    """Worker entrypoint executed in a separate process (spawn-safe)."""
+    import sys as _sys
+    import traceback as _traceback
+
+    try:
+        # Redirect stdout/stderr to queue.
+        qw = _QueueWriter(out_q)
+        _sys.stdout = qw
+        _sys.stderr = qw
+
+        main(cfg)
+        qw.flush()
+        out_q.put({"_event": "exit", "code": 0})
+    except Exception as e:
+        try:
+            out_q.put(str(e))
+            out_q.put(_traceback.format_exc())
+        except Exception:
+            pass
+        out_q.put({"_event": "exit", "code": 1})
 
 
 # --- Flask Routes ---
@@ -146,218 +498,257 @@ def format_list_arg(items):
 def index():
     """Renders the main HTML page."""
     # Jinja rendering is now handled by Flask's render_template
-    return render_template('index.html')
+    return render_template(
+        'index.html',
+        csrf_token=LOCAL_UI_CSRF_TOKEN,
+        csrf_header_name=CSRF_HEADER_NAME,
+        descriptor_sets=DESCRIPTOR_SETS,
+    )
+
+
+@app.route('/check_bf16_support', methods=['GET'])
+def check_bf16_support():
+    """Check if the GPU supports bf16 precision for faster inference."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return jsonify({"supported": False, "reason": "CUDA not available"})
+
+        # Get GPU compute capability
+        device_props = torch.cuda.get_device_properties(0)
+        compute_capability = (device_props.major, device_props.minor)
+        gpu_name = device_props.name
+
+        # bf16 requires compute capability 8.0+ (Ampere and newer: RTX 30xx, 40xx, A100, etc.)
+        supported = compute_capability[0] >= 8
+
+        return jsonify({
+            "supported": supported,
+            "gpu_name": gpu_name,
+            "compute_capability": f"{compute_capability[0]}.{compute_capability[1]}",
+            "reason": "GPU supports bf16" if supported else f"GPU compute capability {compute_capability[0]}.{compute_capability[1]} < 8.0 required"
+        })
+    except Exception as e:
+        return jsonify({"supported": False, "reason": str(e)})
 
 
 @app.route('/start_inference', methods=['POST'])
 def start_inference():
     """Starts the inference process based on form data."""
-    global current_process
-    with process_lock:
-        if current_process and current_process.poll() is None:
-            return jsonify({"status": "error", "message": "Process already running"}), 409  # Conflict
+    job_id = uuid.uuid4().hex
 
-        # --- Construct Command List (shell=False) ---
-        python_executable = sys.executable  # Get path to current Python interpreter
-        cmd = [python_executable, "inference.py", "-cn"]
+    # Create config
+    config_name = request.form.get('model')
+    with initialize_config_dir(version_base="1.1", config_dir=str(Path(__file__).parent / "configs/inference")):
+        cfg = compose(config_name=config_name)
+    cfg = OmegaConf.to_object(cfg)
+    cfg.use_server = True
 
-        # Get the model name from the form
-        model_name = request.form.get('model')
-        config_name = model_name
-        cmd.append(config_name)  # Add the config name to the command
+    # Required/paths
+    cfg.audio_path = request.form.get('audio_path') or None
+    cfg.output_path = request.form.get('output_path') or None
+    cfg.beatmap_path = request.form.get('beatmap_path') or None
+    cfg.lora_path = request.form.get('lora_path') or None
 
-        # Helper to quote values for Hydra's command-line parser
-        def hydra_quote(value):
-            """Quotes a value for Hydra (single quotes, escapes internal)."""
-            value_str = str(value)
-            # Escape internal single quotes: ' -> '\''
-            escaped_value = value_str.replace("'", r"\'")
-            return f"'{escaped_value}'"
+    # Basic settings
+    cfg.gamemode = _coerce_optional_int(request.form.get('gamemode')) or 0
+    cfg.difficulty = _coerce_optional_float(request.form.get('difficulty'))
+    cfg.year = _coerce_optional_int(request.form.get('year'))
+    try:
+        _validate_year_for_model(config_name, cfg.year)
+    except ValueError as ve:
+        return jsonify({"status": "error", "message": str(ve)}), 400
 
-        # Set of keys known to be paths needing quoting for Hydra
-        path_keys = {"audio_path", "output_path", "beatmap_path"}
+    # Numeric settings
+    cfg.hp_drain_rate = _coerce_optional_float(request.form.get('hp_drain_rate'))
+    cfg.circle_size = _coerce_optional_float(request.form.get('circle_size'))
+    cfg.overall_difficulty = _coerce_optional_float(request.form.get('overall_difficulty'))
+    cfg.approach_rate = _coerce_optional_float(request.form.get('approach_rate'))
+    cfg.slider_multiplier = _coerce_optional_float(request.form.get('slider_multiplier'))
+    cfg.slider_tick_rate = _coerce_optional_float(request.form.get('slider_tick_rate'))
+    cfg.keycount = _coerce_optional_int(request.form.get('keycount'))
+    cfg.hold_note_ratio = _coerce_optional_float(request.form.get('hold_note_ratio'))
+    cfg.scroll_speed_ratio = _coerce_optional_float(request.form.get('scroll_speed_ratio'))
+    cfg.cfg_scale = _coerce_optional_float(request.form.get('cfg_scale')) or cfg.cfg_scale
+    cfg.temperature = _coerce_optional_float(request.form.get('temperature')) or cfg.temperature
+    cfg.top_p = _coerce_optional_float(request.form.get('top_p')) or cfg.top_p
+    cfg.seed = _coerce_optional_int(request.form.get('seed'))
+    cfg.mapper_id = _coerce_optional_int(request.form.get('mapper_id'))
 
-        # Helper to add argument if value exists
-        def add_arg(key, value):
-            if value is not None and value != '':  # Ensure value is not empty
-                if key in path_keys:
-                    # Quote path values for Hydra
-                    cmd.append(f"{key}={hydra_quote(value)}")
-                else:
-                    # Other values usually don't need explicit Hydra quoting when passed via list
-                    cmd.append(f"{key}={value}")
+    # Metadata
+    cfg.title = request.form.get('title') or None
+    cfg.title_unicode = request.form.get('title_unicode') or None
+    cfg.artist = request.form.get('artist') or None
+    cfg.artist_unicode = request.form.get('artist_unicode') or None
+    cfg.creator = request.form.get('creator') or None
+    cfg.version = request.form.get('version') or None
+    cfg.source = request.form.get('source') or None
+    cfg.tags = request.form.get('tags') or None
+    cfg.preview_time = _coerce_optional_int(request.form.get('preview_time'))
 
-        # Helper for list arguments (Hydra format: key=['item1','item2',...])
-        def add_list_arg(key, items):
-            if items:
-                # Wrap each item in single quotes and join with comma
-                quoted_items = [f"'{str(item)}'" for item in items]
-                items_str = ",".join(quoted_items)
-                cmd.append(f"{key}=[{items_str}]")
+    # Background image
+    background_image = request.form.get('background_image')
+    if background_image:
+        cfg.background = background_image
 
-        # Required Paths
-        add_arg("audio_path", request.form.get('audio_path'))
-        add_arg("output_path", request.form.get('output_path'))
-        # Beatmap path
-        beatmap_path = request.form.get('beatmap_path')
-        add_arg("beatmap_path", beatmap_path)
+    # Timing and segmentation
+    cfg.start_time = _coerce_optional_int(request.form.get('start_time'))
+    cfg.end_time = _coerce_optional_int(request.form.get('end_time'))
 
-        # Basic settings
-        if 'gamemode' in request.form:
-            add_arg("gamemode", request.form.get('gamemode'))
-        else:
-            # Default to 0 if not provided
-            add_arg("gamemode", 0)
-        add_arg("difficulty", request.form.get('difficulty'))
-        add_arg("year", request.form.get('year'))
+    # Checkboxes
+    cfg.export_osz = _coerce_bool_checkbox(request.form, 'export_osz')
+    cfg.add_to_beatmap = _coerce_bool_checkbox(request.form, 'add_to_beatmap')
+    cfg.overwrite_reference_beatmap = _coerce_bool_checkbox(request.form, 'overwrite_reference_beatmap')
+    cfg.hitsounded = _coerce_bool_checkbox(request.form, 'hitsounded')
+    cfg.super_timing = _coerce_bool_checkbox(request.form, 'super_timing')
 
-        # Numeric settings
-        for param in ['hp_drain_rate', 'circle_size', 'overall_difficulty', 'approach_rate', 'slider_multiplier',
-                      'slider_tick_rate', 'keycount', 'hold_note_ratio', 'scroll_speed_ratio',
-                      'cfg_scale', 'temperature', 'top_p', 'seed']:
-            add_arg(param, request.form.get(param))
-        # mapper_id
-        add_arg("mapper_id", request.form.get('mapper_id'))
+    # Precision
+    if _coerce_bool_checkbox(request.form, 'enable_bf16'):
+        cfg.precision = 'bf16'
+    else:
+        cfg.precision = 'fp32'
 
-        # Timing and segmentation
-        for param in ['start_time', 'end_time']:
-            add_arg(param, request.form.get(param))
+    # Descriptor lists
+    descriptors = request.form.getlist('descriptors')
+    cfg.descriptors = descriptors if descriptors else None
+    negative_descriptors = request.form.getlist('negative_descriptors')
+    cfg.negative_descriptors = negative_descriptors if negative_descriptors else None
 
-        # Checkboxes
-        if 'export_osz' in request.form:
-            cmd.append("export_osz=true")
-        else :
-            cmd.append("export_osz=false")
-        if 'add_to_beatmap' in request.form:
-            cmd.append("add_to_beatmap=true")
-        else:
-            cmd.append("add_to_beatmap=false")
-        if 'hitsounded' in request.form:
-            cmd.append("hitsounded=true")
-        else:
-            cmd.append("hitsounded=false")
-        if 'super_timing' in request.form:
-            cmd.append("super_timing=true")
-        else:
-            cmd.append("super_timing=false")
-
-        # Descriptors
-        descriptors = request.form.getlist('descriptors')
-        add_list_arg("descriptors", descriptors)
-
-        # Negative Descriptors
-        negative_descriptors = request.form.getlist('negative_descriptors')
-        add_list_arg("negative_descriptors", negative_descriptors)
-
-        # In-Context Options
-        in_context_options = request.form.getlist('in_context_options')
-        if in_context_options and beatmap_path:  # Only add if not empty
-            add_list_arg("in_context", in_context_options)
-        # --- End Command List Construction ---
-
-        print("Executing Command List (shell=False):", cmd)
-
+    # In-context options
+    in_context_options = request.form.getlist('in_context_options')
+    if in_context_options and cfg.beatmap_path:
         try:
-            # Start the inference process without shell=True
-            current_process = subprocess.Popen(
-                cmd,  # Pass the list directly
-                shell=False,  # Explicitly False (default)
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Combine stdout and stderr
-                bufsize=1,
-                universal_newlines=True,
-                encoding='utf-8',
-                errors='replace'
-            )
-            print(f"Started process with PID: {current_process.pid}")
-            # Return success to the AJAX call
-            return jsonify({"status": "success", "message": "Inference started"}), 202  # Accepted
-
+            cfg.in_context = [ContextType[opt] for opt in in_context_options]
         except Exception as e:
-            print(f"Error starting subprocess: {e}")
-            current_process = None
-            return jsonify({"status": "error", "message": f"Failed to start process: {e}"}), 500
+            traceback.print_exc()
+            return jsonify({"status": "error", "message": f"Invalid in-context options: {e}"}), 400
+
+    # Validate and compile args
+    try:
+        compile_args(cfg, verbose=False)
+    except ValueError as ve:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": str(ve)}), 400
+
+    # Ensure a shared server is running, owned by web UI.
+    try:
+        _ensure_inference_server(cfg)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": f"Failed to ensure inference server: {e}"}), 500
+
+    # Spawn the worker process.
+    try:
+        q = mp.Queue()
+        p = mp.Process(target=_inference_worker, args=(cfg, q), daemon=True)
+        p.start()
+
+        with process_lock:
+            processes[job_id] = {"process": p, "queue": q}
+
+        return jsonify({"status": "success", "message": "Inference started", "job_id": job_id}), 202
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": f"Failed to start process: {e}"}), 500
 
 
 @app.route('/stream_output')
 def stream_output():
     """Streams the output of the running inference process using SSE."""
 
-    def generate():
-        global current_process
-        process_to_stream = None
+    job_id = request.args.get('job_id', '').strip()
+    if not job_id:
+        return Response("event: end\ndata: Missing job_id\n\n", mimetype='text/event-stream')
 
-        # Short lock to safely get the process object
+    def generate():
         with process_lock:
-            if current_process and current_process.poll() is None:
-                process_to_stream = current_process
-                print(f"Attempting to stream output for PID: {process_to_stream.pid}")
-            else:
-                # Handle case where process is already finished or never started
-                print("Stream requested but no active process found or process already finished.")
+            rec = processes.get(job_id)
+            if not rec:
                 yield "event: end\ndata: No active process or process already finished\n\n"
                 return
+            proc = rec["process"]
+            q = rec["queue"]
 
-        # If we got a process, proceed with streaming
-        if process_to_stream:
-            print(f"Streaming output for PID: {process_to_stream.pid}")
-            full_output_lines = []
-            error_occurred = False
-            log_filepath = None
+        full_output_lines = []
+        error_occurred = False
+        exit_code = None
+
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=0.2)
+                except queue_mod.Empty:
+                    if not proc.is_alive():
+                        # Process died without sending sentinel.
+                        exit_code = proc.exitcode
+                        break
+                    continue
+
+                if isinstance(item, dict) and item.get("_event") == "exit":
+                    exit_code = item.get("code", 0)
+                    break
+
+                line = str(item)
+                full_output_lines.append(line + "\n")
+                yield f"data: {line.rstrip()}\n\n"
+                sys.stdout.flush()
+
+            # Determine error state.
+            if exit_code and exit_code != 0:
+                with process_lock:
+                    was_cancelled = job_id in cancelled_jobs
+                    cancelled_jobs.discard(job_id)
+                if was_cancelled:
+                    error_occurred = False
+                else:
+                    error_occurred = True
+        except Exception as e:
+            error_occurred = True
+            full_output_lines.append(f"\n--- STREAMING ERROR ---\n{e}\n")
+        finally:
+            # Save logs on error (same behavior as before).
+            if error_occurred:
+                try:
+                    log_dir = os.path.join(script_dir, 'logs')
+                    os.makedirs(log_dir, exist_ok=True)
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    pid = proc.pid if proc is not None else 0
+                    log_filename = f"error_{pid}_{timestamp}.log"
+                    log_filepath = os.path.join(log_dir, log_filename)
+                    error_content = "".join(full_output_lines)
+
+                    with open(log_filepath, 'w', encoding='utf-8') as f:
+                        f.write(error_content)
+                    yield f"event: error_log\ndata: {log_filepath.replace(os.sep, '/')}\n\n"
+                except Exception:
+                    pass
+
+            completion_message = "Process completed"
+            if error_occurred:
+                completion_message += " with errors"
+            yield f"event: end\ndata: {completion_message}\n\n"
+
+            # Cleanup.
+            with process_lock:
+                processes.pop(job_id, None)
+                cancelled_jobs.discard(job_id)
 
             try:
-                # Stream lines from stdout
-                for line in iter(process_to_stream.stdout.readline, ""):
-                    full_output_lines.append(line)
-                    yield f"data: {line.rstrip()}\n\n"
-                    sys.stdout.flush()  # Ensure data is sent
+                if proc is not None:
+                    proc.join(timeout=1)
+            except Exception:
+                pass
 
-                # --- Process finished, check status ---
-                process_to_stream.stdout.close()  # Close the pipe
-                return_code = process_to_stream.wait()  # Wait for process to terminate fully
-                print(f"Process {process_to_stream.pid} finished streaming with exit code: {return_code}")
+            try:
+                q.cancel_join_thread()
+            except Exception:
+                pass
 
-                if return_code != 0:
-                    error_occurred = True
-                    print(f"Non-zero exit code ({return_code}) detected for PID {process_to_stream.pid}. Marking as error.")
-
-            except Exception as e:
-                print(f"Error during streaming for PID {process_to_stream.pid}: {e}")
-                error_occurred = True
-                full_output_lines.append(f"\n--- STREAMING ERROR ---\n{e}\n")
-            finally:
-                # --- Log Saving Logic (if error occurred) ---
-                if error_occurred:
-                    try:
-                        log_dir = os.path.join(script_dir, 'logs')
-                        os.makedirs(log_dir, exist_ok=True)
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        log_filename = f"error_{process_to_stream.pid}_{timestamp}.log"
-                        log_filepath = os.path.join(log_dir, log_filename)
-                        error_content = "".join(full_output_lines)
-
-                        with open(log_filepath, 'w', encoding='utf-8') as f:
-                            f.write(error_content)
-                        print(f"Error log saved for PID {process_to_stream.pid} to: {log_filepath}")
-                        yield f"event: error_log\ndata: {log_filepath.replace(os.sep, '/')}\n\n"
-
-                    except Exception as log_e:
-                        print(f"FATAL: Could not write error log for PID {process_to_stream.pid}: {log_e}")
-
-                # --- Standard End Event ---
-                completion_message = "Process completed"
-                if error_occurred:
-                    completion_message += " with errors"
-                yield f"event: end\ndata: {completion_message}\n\n"
-                print(f"Finished streaming for PID: {process_to_stream.pid}. Sent 'end' event.")
-
-                # --- Cleanup global process reference ---
-                with process_lock:
-                    if current_process == process_to_stream:
-                        current_process = None
-                        print("Cleared global current_process reference.")
-                    else:
-                        print(f"Stale process {process_to_stream.pid} finished streaming, global reference was already updated/cleared.")
+            try:
+                q.close()
+            except Exception:
+                pass
 
     return Response(generate(), mimetype='text/event-stream')
 
@@ -365,54 +756,34 @@ def stream_output():
 @app.route('/cancel_inference', methods=['POST'])
 def cancel_inference():
     """Attempts to terminate the currently running inference process."""
-    global current_process
-    message = ""
-    success = False
-    status_code = 500
+    job_id = request.form.get('job_id', '').strip()
+    if not job_id:
+        return jsonify({"status": "error", "message": "Missing job_id"}), 400
 
     with process_lock:
-        if current_process and current_process.poll() is None:
+        rec = processes.get(job_id)
+        if not rec:
+            return jsonify({"status": "error", "message": "No active process found"}), 404
+        proc = rec["process"]
+
+        if proc.is_alive():
+            cancelled_jobs.add(job_id)
             try:
-                pid = current_process.pid
-                print(f"Attempting to terminate process PID: {pid}...")
-                current_process.terminate()  # Send SIGTERM
-                # Optional: Add a short wait to see if it terminates quickly
-                try:
-                    current_process.wait(timeout=1)
-                    print(f"Process PID: {pid} terminated successfully after request.")
-                    message = "Cancel request sent, process terminated."
-                except subprocess.TimeoutExpired:
-                    print(f"Process PID: {pid} did not terminate immediately after SIGTERM.")
-                    message = "Cancel request sent. Process termination might take a moment."
-                    # You could consider current_process.kill() here if terminate isn't enough
-
-                success = True
-                status_code = 200
-                # DO NOT set current_process = None here. Let the stream generator handle it.
+                if sys.platform == 'win32':
+                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], capture_output=True, timeout=5)
+                else:
+                    proc.terminate()
+                return jsonify({"status": "success", "message": "Cancel request sent"}), 200
             except Exception as e:
-                print(f"Error terminating process: {e}")
-                message = f"Error occurred during cancellation: {e}"
-                success = False
-                status_code = 500
-        elif current_process:
-            message = "Process already finished."
-            success = False  # Or True if you consider it 'cancelled' as it's done
-            status_code = 409
-        else:
-            message = "No process is currently running."
-            success = False
-            status_code = 404
+                return jsonify({"status": "error", "message": f"Failed to terminate process: {e}"}), 500
 
-    if success:
-        return jsonify({"status": "success", "message": message}), status_code
-    else:
-        return jsonify({"status": "error", "message": message}), status_code
+    return jsonify({"status": "success", "message": "Process already finished"}), 200
 
 
-@app.route('/open_folder', methods=['GET'])
+@app.route('/open_folder', methods=['POST'])
 def open_folder():
     """Opens a folder in the file explorer."""
-    folder_path = request.args.get('folder')
+    folder_path = request.form.get('folder')
     print(f"Request received to open folder: {folder_path}")
     if not folder_path:
         return jsonify({"status": "error", "message": "No folder path specified"}), 400
@@ -447,10 +818,10 @@ def open_folder():
         return jsonify({"status": "error", "message": f"Could not open folder: {e}"}), 500
 
 
-@app.route('/open_log_file', methods=['GET'])
+@app.route('/open_log_file', methods=['POST'])
 def open_log_file():
     """Opens a specific log file."""
-    log_path = request.args.get('path')
+    log_path = request.form.get('path')
     print(f"Request received to open log file: {log_path}")
     if not log_path:
         return jsonify({"status": "error", "message": "No log file path specified"}), 400
@@ -524,26 +895,36 @@ def validate_paths():
         inference_args.beatmap_path = beatmap_path
         inference_args.output_path = output_path
 
-        result = autofill_paths(inference_args)
+        try:
+            compile_args(inference_args, verbose=False)
+        except ValueError as v:
+            return jsonify({
+                'success': False,
+                'autofilled_args': None,
+                'errors': [str(v)]
+            }), 200
+
+        autofilled_args = asdict(inference_args)
+        del autofilled_args['in_context']
+        del autofilled_args['output_type']
+        del autofilled_args['train']
 
         # Return the results
         response_data = {
-            'success': result['success'],
-            'autofilled_audio_path': inference_args.audio_path,
-            'autofilled_output_path': inference_args.output_path,
-            'errors': result['errors']
+            'success': True,
+            'autofilled_args': autofilled_args,
+            'errors': []
         }
 
         return jsonify(response_data), 200
 
     except Exception as e:
         error_msg = f"Error during path validation: {str(e)}"
-        print(f"Path validation error: {error_msg}")
+        print(error_msg)
         return jsonify({
             'success': False,
-            'errors': [error_msg],
-            'autofilled_audio_path': None,
-            'autofilled_output_path': None
+            'autofilled_args': None,
+            'errors': [error_msg]
         }), 500
 
 
@@ -576,8 +957,49 @@ def find_available_port(start_port=5000, max_tries=100):
     raise IOError("Could not find an available port.")
 
 
+def launch_browser_fallback(flask_url, flask_thread):
+    """Keep the server alive when an embedded window cannot be created."""
+    print(f"Running without an embedded window. Open {flask_url} in your browser.")
+    print("Press Ctrl+C to stop the server.")
+
+    try:
+        while flask_thread.is_alive():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping server...")
+    finally:
+        _shutdown_application_resources()
+
+
+def launch_webview_window(window_title, flask_url, window_width, window_height, api):
+    """Create the embedded pywebview window when a GUI backend is available."""
+    print(f"Creating pywebview window loading URL: {flask_url}")
+    try:
+        webview.create_window(
+            window_title,
+            url=flask_url,
+            width=window_width,
+            height=window_height,
+            resizable=True,
+            js_api=api,
+        )
+        webview.start()
+        print("Pywebview window closed. Shutting down application resources...")
+        _shutdown_application_resources()
+        print("Application shutdown complete. Exiting.")
+        return True
+    except Exception as e:
+        print(f"pywebview could not start an embedded window: {e}")
+        print(traceback.format_exc())
+        return False
+
+
 # --- Main Execution ---
 if __name__ == '__main__':
+    # Use spawn instead of fork to avoid issues with CUDA on Linux
+    multiprocessing.set_start_method('spawn', force=True)
+    atexit.register(_shutdown_application_resources)
+
     # Find an available port for Flask
     flask_port = find_available_port()
 
@@ -595,7 +1017,7 @@ if __name__ == '__main__':
         screen_height = primary_screen.height
         # Calculate window size (e.g., 45% width, 95% height of primary screen)
         window_width = int(screen_width * 0.45)
-        window_height = int(screen_height * 0.95)
+        window_height = int(screen_height * 0.9)
         print(f"Screen: {screen_width}x{screen_height}, Window: {window_width}x{window_height}")
     except Exception as e:
         print(f"Could not get screen dimensions, using default: {e}")
@@ -608,23 +1030,8 @@ if __name__ == '__main__':
     window_title = 'Mapperatorinator'
     flask_url = f'http://127.0.0.1:{flask_port}/'
 
-    print(f"Creating pywebview window loading URL: {flask_url}")
-
     # Instantiate the API class (doesn't need window object anymore)
     api = Api()
 
-    # Pass api instance directly to create_window via js_api
-    window = webview.create_window(
-        window_title,
-        url=flask_url,
-        width=window_width,  # Use calculated width
-        height=window_height,  # Use calculated height
-        resizable=True,
-        js_api=api  # Expose Python API class here
-    )
-
-    # Start the pywebview event loop (no args needed here now)
-    webview.start()
-
-    print("Pywebview window closed. Exiting application.")
-    # Flask thread will exit automatically as it's a daemon
+    if not launch_webview_window(window_title, flask_url, window_width, window_height, api):
+        launch_browser_fallback(flask_url, flask_thread)

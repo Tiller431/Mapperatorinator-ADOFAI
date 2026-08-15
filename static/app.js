@@ -1,23 +1,89 @@
 $(document).ready(function() {
+    const I18nUtils = {
+        t(key, fallback = key, params) {
+            if (typeof I18n !== 'undefined' && typeof I18n.t === 'function') {
+                const translated = I18n.t(key, params);
+                if (translated !== key) {
+                    return translated;
+                }
+            }
+
+            return fallback;
+        },
+
+        button(key, fallback, params) {
+            return this.t(`buttons.${key}`, fallback, params);
+        },
+
+        progress(key, fallback, params) {
+            return this.t(`progress.${key}`, fallback, params);
+        },
+
+        message(type, key, fallback, params) {
+            return this.t(`messages.${type}.${key}`, fallback, params);
+        },
+
+        link(key, fallback, params) {
+            return this.t(`links.${key}`, fallback, params);
+        }
+    };
+
     // Application state and configuration
     const AppState = {
-        evtSource: null,
-        isCancelled: false,
-        inferenceErrorOccurred: false,
-        accumulatedErrorMessages: [],
-        errorLogFilePath: null,
+        jobs: new Map(),
+        jobCounter: 0,
+        lastStartedJobId: null,
         animationSpeed: 300,
+        yearRange: {
+            min: 2007,
+            defaultMax: 2023,
+        },
 
         modelCapabilities: {
-            "v28": {},
-            "v29": {},
+            "v28": {
+                descriptorSet: 'omdb',
+            },
+            "v29": {
+                descriptorSet: 'omdb',
+            },
             "v30": {
                 supportedGamemodes: ['0'],
                 supportsYear: false,
                 supportedInContextOptions: ['TIMING'],
                 hideHitsoundsOption: true,
+                descriptorSet: null,
                 supportsDescriptors: false,
             },
+            "v31": {
+                descriptorSet: 'omdb',
+            },
+            "v32-mini": {
+                supportedInContextOptions: ['TIMING'],
+                descriptorSet: 'user_tags',
+                maxYear: 2024,
+            },
+            "v32": {
+                supportedInContextOptions: ['TIMING'],
+                descriptorSet: 'user_tags',
+                maxYear: 2024,
+            },
+        }
+    };
+
+    const Security = {
+        csrfToken: window.APP_BOOTSTRAP?.csrfToken || $('meta[name="mapperatorinator-csrf-token"]').attr('content') || '',
+        csrfHeaderName: window.APP_BOOTSTRAP?.csrfHeaderName || 'X-Mapperatorinator-CSRF-Token',
+
+        init() {
+            $.ajaxSetup({
+                headers: this.csrfToken ? {
+                    [this.csrfHeaderName]: this.csrfToken
+                } : {}
+            });
+
+            if (!this.csrfToken) {
+                console.error('CSRF token bootstrap data is missing; protected UI actions will fail.');
+            }
         }
     };
 
@@ -33,6 +99,28 @@ $(document).ready(function() {
             setTimeout(() => messageDiv.remove(), 5000);
         },
 
+        showTranslatedFlashMessage(keyPath, fallback, type = 'success', params) {
+            this.showFlashMessage(I18nUtils.t(keyPath, fallback, params), type);
+        },
+
+        translateValidationMessage(message) {
+            if (!message) {
+                return message;
+            }
+
+            if (message.includes('Audio file not found')) {
+                return I18nUtils.message('error', 'audio_not_found', 'Audio file not found');
+            }
+            if (message.includes('Beatmap file not found')) {
+                return I18nUtils.message('error', 'beatmap_not_found', 'Beatmap file not found');
+            }
+            if (message.includes('Beatmap file must have .osu extension')) {
+                return I18nUtils.message('error', 'beatmap_invalid_ext', 'Beatmap file must have .osu extension');
+            }
+
+            return message;
+        },
+
         smoothScroll(target, offset = 0) {
             $('html, body').animate({
                 scrollTop: $(target).offset().top + offset
@@ -42,35 +130,58 @@ $(document).ready(function() {
         resetFormToDefaults() {
             $('#inferenceForm')[0].reset();
 
-            // Set specific defaults
-            const defaults = {
-                model: 'v30', gamemode: '0', difficulty: '5', hp_drain_rate: '5',
-                circle_size: '4', keycount: '4', overall_difficulty: '8',
-                approach_rate: '9', slider_multiplier: '1.4', slider_tick_rate: '1',
-                year: '2023', cfg_scale: '1.0', temperature: '0.9', top_p: '0.9'
-            };
+            // Clear descriptors
+            DescriptorManager.clearSelections();
+            $('input[name="in_context_options"]').prop('checked', false);
 
-            Object.entries(defaults).forEach(([id, value]) => {
-                $(`#${id}`).val(value);
-            });
-
-            // Reset checkboxes
-            $('#hitsounded').prop('checked', true);
-            $('#export_osz, #add_to_beatmap, #super_timing').prop('checked', false);
-
-            // Clear descriptors and context options
-            $('input[name="descriptors"], input[name="in_context_options"]')
-                .removeClass('positive-check negative-check').prop('checked', false);
-
-            // Clear paths and optional fields
-            $('#audio_path, #output_path, #beatmap_path, #mapper_id, #seed, #start_time, #end_time, #hold_note_ratio, #scroll_speed_ratio').val('');
-            PathManager.clearPlaceholders();
-            PathManager.validateAndAutofillPaths(false);
+            ValidationManager.clearPlaceholders();
+            return ValidationManager.validateAndAutofill(false);
         }
     };
 
     // UI Manager for conditional visibility
     const UIManager = {
+        clearable_inputs: '#audio_path, #beatmap_path, #output_path, #lora_path, #background_image',
+
+        init() {
+            this.attachClearButtonHandlers();
+            $(this.clearable_inputs).trigger('blur');
+        },
+
+        attachClearButtonHandlers() {
+            // Listen for input events (typing)
+            $(this.clearable_inputs).on('input', (e) => {
+                this.updateClearButtonVisibility(e.target);
+            });
+
+            // Listen for blur events (leaving field) - immediate validation
+            $(this.clearable_inputs).on('blur', (e) => {
+                this.updateClearButtonVisibility(e.target);
+            });
+
+            // Handle clear button clicks
+            $('.clear-input-btn').on('click', (e) => {
+                const targetId = $(e.target).data('target');
+                const $targetInput = $(`#${targetId}`);
+
+                $targetInput.val('');
+                this.updateClearButtonVisibility($targetInput[0]);
+                return ValidationManager.validateAndAutofill(false);
+            });
+        },
+
+        updateClearButtonVisibility(inputElement) {
+            const $input = $(inputElement);
+            const $clearBtn = $input.siblings('.clear-input-btn');
+            const hasValue = $input.val().trim() !== '';
+
+            if (hasValue) {
+                $clearBtn.show();
+            } else {
+                $clearBtn.hide();
+            }
+        },
+
         updateConditionalFields() {
             const selectedGamemode = $("#gamemode").val();
             const selectedModel = $("#model").val();
@@ -104,7 +215,7 @@ $(document).ready(function() {
 
             // Handle beatmap path dependent fields
             const shouldShowBeatmapFields = beatmapPath !== '';
-            ['#in-context-options-box', '#add-to-beatmap-option'].forEach(selector => {
+            ['#in-context-options-box', '#add-to-beatmap-option', '#overwrite-reference-beatmap-option'].forEach(selector => {
                 const $element = $(selector);
                 if (shouldShowBeatmapFields && !$element.is(':visible')) {
                     $element.fadeIn(AppState.animationSpeed);
@@ -113,8 +224,49 @@ $(document).ready(function() {
                     if (selector === '#add-to-beatmap-option') {
                         $('#add_to_beatmap').prop('checked', false);
                     }
+                    if (selector === '#overwrite-reference-beatmap-option') {
+                        $('#overwrite_reference_beatmap').prop('checked', false);
+                    }
                 }
             });
+        },
+
+        getYearMaxForModel(model) {
+            const capabilities = AppState.modelCapabilities[model] || {};
+            return capabilities.maxYear || AppState.yearRange.defaultMax;
+        },
+
+        updateYearSettings() {
+            const selectedModel = $("#model").val();
+            const yearMin = AppState.yearRange.min;
+            const yearMax = this.getYearMaxForModel(selectedModel);
+            const $yearInput = $('#year');
+            const $yearLabel = $('label[for="year"]');
+            const translationParams = JSON.stringify({ min: yearMin, max: yearMax });
+
+            $yearInput.attr({
+                min: yearMin,
+                max: yearMax,
+            });
+            $yearLabel.attr('data-i18n-params', translationParams);
+            $yearLabel.attr('data-i18n-title-params', translationParams);
+
+            const currentValue = $yearInput.val().trim();
+            if (currentValue !== '') {
+                const numericValue = Number(currentValue);
+                if (!Number.isNaN(numericValue)) {
+                    if (numericValue > yearMax) {
+                        $yearInput.val(String(yearMax));
+                    } else if (numericValue < yearMin) {
+                        $yearInput.val(String(yearMin));
+                    }
+                }
+            }
+
+            const labelText = I18nUtils.t('labels.year', 'Year ({min}-{max})', { min: yearMin, max: yearMax });
+            const tooltipText = I18nUtils.t('tooltips.year', 'Year of the song ({min}-{max})', { min: yearMin, max: yearMax });
+            $yearLabel.text(`${labelText}:`);
+            $yearLabel.attr('title', tooltipText);
         },
 
         updateModelSettings() {
@@ -158,17 +310,16 @@ $(document).ready(function() {
                 $('#hitsounded').prop('checked', true);
             }
 
+            this.updateYearSettings();
             this.updateConditionalFields();
+            DescriptorManager.renderCurrentDescriptors();
         }
     };
 
     // File Browser Manager
     const FileBrowser = {
         init() {
-            window.addEventListener('pywebviewready', () => {
-                console.log("pywebview API is ready.");
-                this.attachBrowseHandlers();
-            });
+            this.attachBrowseHandlers();
         },
 
         attachBrowseHandlers() {
@@ -181,6 +332,8 @@ $(document).ready(function() {
 
                     if (browseType === 'folder') {
                         path = await window.pywebview.api.browse_folder();
+                    } else if (browseType === 'image') {
+                        path = await window.pywebview.api.browse_image();
                     } else {
                         let fileTypes = null;
 
@@ -202,7 +355,7 @@ $(document).ready(function() {
 
                     if (path) {
                         if (targetId === 'beatmap_path' && !path.toLowerCase().endsWith('.osu')) {
-                            Utils.showFlashMessage('Please select a valid .osu file.', 'error');
+                            Utils.showTranslatedFlashMessage('messages.error.invalid_osu_file', 'Please select a valid .osu file.', 'error');
                             // Set the path and let validation handle inline error
                         }
 
@@ -216,74 +369,32 @@ $(document).ready(function() {
                     }
                 } catch (error) {
                     console.error(`Error browsing for ${browseType}:`, error);
-                    alert(`Could not browse for ${browseType}. Ensure the backend API is running.`);
+                    alert(I18nUtils.message('error', 'browse_failed', 'Could not browse. Ensure the backend API is running.'));
                 }
             });
         }
     };
 
+    const validation_trigger_inputs = '#audio_path, #beatmap_path, #output_path';
+
     // Path Manager for autofill, validation and clear button support
-    const PathManager = {
+    const ValidationManager = {
         init() {
-            this.attachPathChangeHandlers();
-            this.attachClearButtonHandlers();
-            $('#audio_path, #beatmap_path, #output_path').trigger('blur');
+            this.attachValidationChangeHandlers();
+            $(validation_trigger_inputs).trigger('blur');
         },
 
-        attachPathChangeHandlers() {
-            // Listen for input events (typing)
-            $('#audio_path, #beatmap_path, #output_path').on('input', (e) => {
-                this.updateClearButtonVisibility(e.target);
-            });
-
+        attachValidationChangeHandlers() {
             // Listen for blur events (leaving field) - immediate validation
-            $('#audio_path, #beatmap_path, #output_path').on('blur', (e) => {
-                this.updateClearButtonVisibility(e.target);
-                this.validateAndAutofillPaths(false);
+            $(validation_trigger_inputs).on('blur', (_) => {
+                return this.validateAndAutofill(false);
             });
         },
 
-        attachClearButtonHandlers() {
-            // Handle clear button clicks
-            $('.clear-input-btn').on('click', (e) => {
-                const targetId = $(e.target).data('target');
-                const $targetInput = $(`#${targetId}`);
-
-                $targetInput.val('');
-                this.updateClearButtonVisibility($targetInput[0]);
-
-                this.validateAndAutofillPaths(false);
-            });
-
-            // Initial visibility check for all fields
-            $('#audio_path, #beatmap_path, #output_path').each((index, element) => {
-                this.updateClearButtonVisibility(element);
-            });
-        },
-
-        updateClearButtonVisibility(inputElement) {
-            const $input = $(inputElement);
-            const $clearBtn = $input.siblings('.clear-input-btn');
-            const hasValue = $input.val().trim() !== '';
-
-            if (hasValue) {
-                $clearBtn.show();
-            } else {
-                $clearBtn.hide();
-            }
-        },
-
-        validateAndAutofillPaths(showFlashMessages = false) { // isFileDialog replaced by showFlashMessages
+        validateAndAutofill(showFlashMessages = false) { // isFileDialog replaced by showFlashMessages
             const audioPath = $('#audio_path').val().trim();
             const beatmapPath = $('#beatmap_path').val().trim();
             const outputPath = $('#output_path').val().trim();
-
-            // Only validate if at least one path is provided
-            if (!audioPath && !beatmapPath && !outputPath) {
-                this.clearPlaceholders();
-                UIManager.updateConditionalFields();
-                return Promise.resolve(true);
-            }
 
             // Call backend validation
             return new Promise((resolve) => {
@@ -302,36 +413,60 @@ $(document).ready(function() {
                     error: (xhr, status, error) => {
                         console.error('Path validation failed:', error);
                         if (showFlashMessages) {
-                            Utils.showFlashMessage('Error validating paths. Check console for details.', 'error');
+                            Utils.showTranslatedFlashMessage('messages.error.validation_failed', 'Error validating paths. Check console for details.', 'error');
                         }
+                        this.clearPlaceholders();
                         resolve(false);
                     }
                 });
             });
         },
 
+        placeholder_elements: {
+            '#audio_path': 'audio_path',
+            '#output_path': 'output_path',
+            '#beatmap_path': 'beatmap_path',
+            '#gamemode': 'gamemode',
+            '#difficulty': 'difficulty',
+            '#title': 'title',
+            '#title_unicode': 'title_unicode',
+            '#artist': 'artist',
+            '#artist_unicode': 'artist_unicode',
+            '#creator': 'creator',
+            '#version': 'version',
+            '#preview_time': 'preview_time',
+            '#background_image': 'background',
+            '#source': 'source',
+            '#tags': 'tags',
+            '#hp_drain_rate': 'hp_drain_rate',
+            '#circle_size': 'circle_size',
+            '#approach_rate': 'approach_rate',
+            '#overall_difficulty': 'overall_difficulty',
+            '#slider_multiplier': 'slider_multiplier',
+            '#slider_tick_rate': 'slider_tick_rate',
+            '#hold_note_ratio': 'hold_note_ratio',
+            '#scroll_speed_ratio': 'scroll_speed_ratio',
+            '#mapper_id': 'mapper_id',
+        },
+
         handleValidationResponse(response, showFlashMessages = false) {
             this.clearValidationErrors();
-            const $audioPathInput = $('#audio_path');
-            const $outputPathInput = $('#output_path');
+            const autofilledArgs = response.autofilled_args;
 
-            // Show autofilled paths as placeholders
-            if (response.autofilled_audio_path && !$audioPathInput.val().trim()) {
-                $audioPathInput.attr('placeholder', response.autofilled_audio_path);
-            } else if (!$audioPathInput.val().trim()) {
-                $audioPathInput.attr('placeholder', '');
-            }
-
-            if (response.autofilled_output_path && !$outputPathInput.val().trim()) {
-                $outputPathInput.attr('placeholder', response.autofilled_output_path);
-            } else if (!$outputPathInput.val().trim()) {
-                $outputPathInput.attr('placeholder', '');
-            }
+            // Show autofilled values as placeholders
+            Object.entries(this.placeholder_elements).forEach(([selector, argName]) => {
+                const $input = $(selector);
+                if (autofilledArgs && autofilledArgs[argName] !== undefined && autofilledArgs[argName] !== null) {
+                    $input.attr('placeholder', autofilledArgs[argName]);
+                } else {
+                    $input.attr('placeholder', '');
+                }
+            });
 
             if (showFlashMessages) {
                 // Show errors as flash messages and inline indicators
                 response.errors.forEach(error => {
-                    Utils.showFlashMessage(error, 'error');
+                    Utils.showFlashMessage(Utils.translateValidationMessage(error), 'error');
                 });
             }
 
@@ -349,11 +484,11 @@ $(document).ready(function() {
             const beatmapPathVal = $('#beatmap_path').val().trim();
 
             if (error.includes('Audio file not found') && (audioPathVal || beatmapPathVal)) {
-                this.showInlineError('#audio_path', 'Audio file not found');
+                this.showInlineError('#audio_path', I18nUtils.message('error', 'audio_not_found', 'Audio file not found'));
             } else if (error.includes('Beatmap file not found') && beatmapPathVal) {
-                this.showInlineError('#beatmap_path', 'Beatmap file not found');
+                this.showInlineError('#beatmap_path', I18nUtils.message('error', 'beatmap_not_found', 'Beatmap file not found'));
             } else if (error.includes('Beatmap file must have .osu extension') && beatmapPathVal) {
-                this.showInlineError('#beatmap_path', 'Must be .osu file');
+                this.showInlineError('#beatmap_path', I18nUtils.message('error', 'beatmap_invalid_ext', 'Beatmap file must have .osu extension'));
             }
         },
 
@@ -374,40 +509,226 @@ $(document).ready(function() {
         },
 
         clearPlaceholders() {
-            $('#audio_path, #output_path').attr('placeholder', '');
+            Object.keys(this.placeholder_elements).forEach(selector => {
+                $(selector).attr('placeholder', '');
+            });
             this.clearValidationErrors();
         },
-
-        // Apply placeholder values to form fields before submission
-        applyPlaceholderValues() {
-            const $audioPath = $('#audio_path');
-            const $outputPath = $('#output_path');
-
-            if (!$audioPath.val().trim() && $audioPath.attr('placeholder')) {
-                $audioPath.val($audioPath.attr('placeholder'));
-            }
-
-            if (!$outputPath.val().trim() && $outputPath.attr('placeholder')) {
-                $outputPath.val($outputPath.attr('placeholder'));
-            }
-        }
     };
 
     // Descriptor Manager
     const DescriptorManager = {
+        descriptorSets: {},
+        selectionStates: new Map(),
+
         init() {
+            this.descriptorSets = window.APP_BOOTSTRAP?.descriptorSets || {};
+
             this.attachDropdownHandler();
             this.attachDescriptorClickHandlers();
+
+            window.addEventListener('languageChanged', () => this.renderCurrentDescriptors());
+        },
+
+        buildDescriptorInputId(setName, value) {
+            const slug = value
+                .toString()
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '-');
+            return `desc-${setName}-${slug}`;
+        },
+
+        formatGroupTitle(title = '') {
+            return title
+                .toString()
+                .split(/[_\s]+/)
+                .filter(Boolean)
+                .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+                .join(' ');
+        },
+
+        getActiveDescriptorSetName() {
+            const selectedModel = $('#model').val();
+            const capabilities = AppState.modelCapabilities[selectedModel] || {};
+            return Object.prototype.hasOwnProperty.call(capabilities, 'descriptorSet')
+                ? capabilities.descriptorSet
+                : 'omdb';
+        },
+
+        getActiveDescriptorGroups() {
+            const descriptorSetName = this.getActiveDescriptorSetName();
+            if (!descriptorSetName) {
+                return [];
+            }
+
+            const selectedGamemode = $('#gamemode').val();
+            const descriptorSet = this.descriptorSets[descriptorSetName];
+            const groups = descriptorSet?.groups || [];
+
+            return groups
+                .map((group) => ({
+                    ...group,
+                    items: (group.items || []).filter((item) => item.rulesetId === null || item.rulesetId === undefined || String(item.rulesetId) === String(selectedGamemode))
+                }))
+                .filter((group) => group.items.length > 0);
+        },
+
+        renderCurrentDescriptors() {
+            const $dropdown = $('.custom-dropdown-descriptors');
+            const $container = $dropdown.find('.descriptors-container');
+            const descriptorSetName = this.getActiveDescriptorSetName();
+
+            if (!descriptorSetName) {
+                $container.empty();
+                $dropdown.removeClass('open');
+                $dropdown.find('.dropdown-content').attr('inert', '');
+                if ($dropdown.is(':visible')) {
+                    $dropdown.stop(true, true).slideUp(AppState.animationSpeed);
+                }
+                return;
+            }
+
+            const groups = this.getActiveDescriptorGroups();
+            $container.empty();
+
+            groups.forEach((group) => {
+                const $group = $('<div>').addClass('descriptor-group');
+                const $heading = $('<h3>').text(group.title || this.formatGroupTitle(group.key || ''));
+                const groupTitleKey = group.titleKey || `descriptors.${descriptorSetName}.groups.${group.key}`;
+
+                if (groupTitleKey) {
+                    $heading.attr('data-i18n', groupTitleKey);
+                }
+
+                $group.append($heading);
+
+                (group.items || []).forEach((item) => {
+                    const inputId = this.buildDescriptorInputId(descriptorSetName, item.value);
+                    const translationBase = item.translationKey
+                        ? `descriptors.${descriptorSetName}.items.${item.translationKey}`
+                        : null;
+                    const $item = $('<div>').addClass('descriptor-item');
+                    const $checkbox = $('<input>')
+                        .attr({
+                            type: 'checkbox',
+                            id: inputId,
+                            name: 'descriptors',
+                            value: item.value,
+                        });
+                    const $label = $('<label>')
+                        .attr('for', inputId)
+                        .text(item.label || item.value);
+
+                    if (item.labelKey || translationBase) {
+                        $label.attr('data-i18n', item.labelKey || `${translationBase}.label`);
+                    }
+                    if (item.titleKey || translationBase) {
+                        $label.attr('data-i18n-title', item.titleKey || `${translationBase}.tooltip`);
+                    }
+                    if (item.title) {
+                        $label.attr('title', item.title);
+                    }
+
+                    $item.append($checkbox, $label);
+                    $group.append($item);
+                });
+
+                $container.append($group);
+            });
+
+            if (!$dropdown.is(':visible')) {
+                $dropdown.stop(true, true).slideDown(AppState.animationSpeed);
+            }
+
+            if (typeof I18n !== 'undefined' && typeof I18n.applyTranslations === 'function') {
+                I18n.applyTranslations();
+            }
+
+            this.syncRenderedSelections();
+        },
+
+        syncRenderedSelections() {
+            $('.descriptors-container input[name="descriptors"]').each((_, element) => {
+                const $checkbox = $(element);
+                const state = this.selectionStates.get($checkbox.val()) || 'neutral';
+                this.applyCheckboxState($checkbox, state);
+            });
+        },
+
+        applyCheckboxState($checkbox, state) {
+            $checkbox.removeClass('positive-check negative-check');
+
+            if (state === 'positive') {
+                $checkbox.addClass('positive-check').prop('checked', true);
+            } else if (state === 'negative') {
+                $checkbox.addClass('negative-check').prop('checked', true);
+            } else {
+                $checkbox.prop('checked', false);
+            }
         },
 
         attachDropdownHandler() {
-            $('.custom-dropdown-descriptors .dropdown-header').click(function() {
+            $('.custom-dropdown-descriptors .dropdown-header').on('click', function() {
                 const $dropdown = $(this).parent();
+                const dropdownContent = $dropdown.find('.dropdown-content').get(0);
                 $dropdown.toggleClass('open');
+                if (!dropdownContent) {
+                    return;
+                }
+
                 if ($dropdown.hasClass('open')) {
-                    Utils.smoothScroll(this);
+                    Utils.smoothScroll('.custom-dropdown-descriptors');
+                    dropdownContent.removeAttribute('inert');
+                } else {
+                    dropdownContent.setAttribute('inert', '');
                 }
             });
+        },
+
+        setDescriptorState($checkbox, state) {
+            const value = $checkbox.val();
+
+            if (state === 'positive' || state === 'negative') {
+                this.selectionStates.set(value, state);
+            } else {
+                this.selectionStates.delete(value);
+            }
+
+            this.applyCheckboxState($checkbox, state);
+        },
+
+        clearSelections() {
+            this.selectionStates.clear();
+            this.syncRenderedSelections();
+        },
+
+        getSelections() {
+            const selections = { positive: [], negative: [] };
+
+            $('input[name="descriptors"]').each(function() {
+                const $checkbox = $(this);
+                if ($checkbox.hasClass('positive-check')) {
+                    selections.positive.push($checkbox.val());
+                } else if ($checkbox.hasClass('negative-check')) {
+                    selections.negative.push($checkbox.val());
+                }
+            });
+
+            return selections;
+        },
+
+        applySelections(descriptors = {}) {
+            this.selectionStates.clear();
+            (descriptors.positive || []).forEach((value) => {
+                this.selectionStates.set(value, 'positive');
+            });
+
+            (descriptors.negative || []).forEach((value) => {
+                this.selectionStates.set(value, 'negative');
+            });
+
+            this.syncRenderedSelections();
         },
 
         attachDescriptorClickHandlers() {
@@ -417,15 +738,13 @@ $(document).ready(function() {
 
                 if (!$checkbox.prop('disabled')) {
                     if ($checkbox.hasClass('positive-check')) {
-                        $checkbox.removeClass('positive-check').addClass('negative-check');
+                        DescriptorManager.setDescriptorState($checkbox, 'negative');
                     } else if ($checkbox.hasClass('negative-check')) {
-                        $checkbox.removeClass('negative-check');
-                        $checkbox.prop('checked', false);
+                        DescriptorManager.setDescriptorState($checkbox, 'neutral');
                         return;
                     } else {
-                        $checkbox.addClass('positive-check');
+                        DescriptorManager.setDescriptorState($checkbox, 'positive');
                     }
-                    $checkbox.prop('checked', true);
                 }
             });
         }
@@ -471,15 +790,7 @@ $(document).ready(function() {
             });
 
             // Export descriptors
-            $('input[name="descriptors"]').each(function() {
-                const $checkbox = $(this);
-                const value = $checkbox.val();
-                if ($checkbox.hasClass('positive-check')) {
-                    config.descriptors.positive.push(value);
-                } else if ($checkbox.hasClass('negative-check')) {
-                    config.descriptors.negative.push(value);
-                }
-            });
+            config.descriptors = DescriptorManager.getSelections();
 
             // Export in-context options
             $('input[name="in_context_options"]:checked').each(function() {
@@ -495,7 +806,7 @@ $(document).ready(function() {
 
                 const filePath = await window.pywebview.api.save_file(filename);
                 if (!filePath) {
-                    this.showConfigStatus("Export cancelled by user", "error");
+                    this.showConfigStatus(I18nUtils.message('error', 'export_cancelled', 'Export cancelled by user'), "error");
                     return;
                 }
 
@@ -508,13 +819,13 @@ $(document).ready(function() {
                     },
                     success: (response) => {
                         if (response.success) {
-                            this.showConfigStatus(`Configuration exported successfully to: ${response.file_path}`, "success");
+                            this.showConfigStatus(`${I18nUtils.message('success', 'config_exported', 'Configuration exported successfully')}: ${response.file_path}`, "success");
                         } else {
-                            this.showConfigStatus(`Error saving config: ${response.error}`, "error");
+                            this.showConfigStatus(`${I18nUtils.message('error', 'save_failed', 'Failed to save configuration')}: ${response.error}`, "error");
                         }
                     },
                     error: () => {
-                        this.showConfigStatus("Failed to save config to server. Using browser download instead.", "error");
+                        this.showConfigStatus(I18nUtils.message('error', 'save_failed', 'Failed to save configuration'), "error");
                         this.fallbackDownload(config);
                     }
                 });
@@ -534,15 +845,15 @@ $(document).ready(function() {
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            this.showConfigStatus("Configuration exported successfully (browser download)", "success");
+            this.showConfigStatus(I18nUtils.message('success', 'config_exported', 'Configuration exported successfully'), "success");
         },
 
         resetToDefaults() {
-            if (confirm("Are you sure you want to reset all settings to default values? This cannot be undone.")) {
+            if (confirm(I18nUtils.message('confirm', 'reset_settings', 'Are you sure you want to reset all settings to default values? This cannot be undone.'))) {
                 Utils.resetFormToDefaults();
                 $("#model, #gamemode, #beatmap_path").trigger('change');
-                $('#audio_path, #output_path, #beatmap_path').trigger('blur');
-                this.showConfigStatus("All settings reset to default values", "success");
+                $(UIManager.clearable_inputs).trigger('blur');
+                this.showConfigStatus(I18nUtils.message('success', 'settings_reset', 'All settings reset to default values'), "success");
             }
         },
 
@@ -551,7 +862,7 @@ $(document).ready(function() {
             if (!file) return;
 
             if (file.type !== 'application/json' && !file.name.endsWith('.json')) {
-                this.showConfigStatus("Please select a valid JSON configuration file.", "error");
+                this.showConfigStatus(I18nUtils.message('error', 'config_invalid', 'Please select a valid JSON configuration file.'), "error");
                 return;
             }
 
@@ -565,7 +876,7 @@ $(document).ready(function() {
             try {
                 const config = JSON.parse(content);
                 if (!config.version) {
-                    throw new Error("Invalid configuration file format");
+                    throw new Error(I18nUtils.message('error', 'config_invalid', 'Please select a valid JSON configuration file.'));
                 }
 
                 // Import settings
@@ -583,17 +894,7 @@ $(document).ready(function() {
                 }
 
                 // Import descriptors
-                $('input[name="descriptors"]').removeClass('positive-check negative-check').prop('checked', false);
-                if (config.descriptors) {
-                    config.descriptors.positive?.forEach(value => {
-                        $(`input[name="descriptors"][value="${value}"]`)
-                            .addClass('positive-check').prop('checked', true);
-                    });
-                    config.descriptors.negative?.forEach(value => {
-                        $(`input[name="descriptors"][value="${value}"]`)
-                            .addClass('negative-check').prop('checked', true);
-                    });
-                }
+                DescriptorManager.applySelections(config.descriptors);
 
                 // Import in-context options
                 $('input[name="in_context_options"]').prop('checked', false);
@@ -603,14 +904,15 @@ $(document).ready(function() {
 
                 // Trigger updates
                 $("#model, #gamemode").trigger('change');
-                $('#audio_path, #output_path, #beatmap_path').trigger('blur');
-                $('#audio_path, #output_path, #beatmap_path').trigger('input');
+                $(UIManager.clearable_inputs).trigger('blur');
+                $(UIManager.clearable_inputs).trigger('input');
 
-                this.showConfigStatus(`Configuration imported successfully! (${config.timestamp || 'Unknown date'})`, "success");
+                const timestampSuffix = config.timestamp ? ` (${config.timestamp})` : '';
+                this.showConfigStatus(`${I18nUtils.message('success', 'config_imported', 'Configuration imported successfully!')}${timestampSuffix}`, "success");
 
             } catch (error) {
                 console.error("Error importing configuration:", error);
-                this.showConfigStatus(`Error importing configuration: ${error.message}`, "error");
+                this.showConfigStatus(`${I18nUtils.message('error', 'config_import_failed', 'Error importing configuration')}: ${error.message}`, "error");
             }
         },
 
@@ -627,7 +929,75 @@ $(document).ready(function() {
     const InferenceManager = {
         init() {
             $('#inferenceForm').submit((e) => this.handleSubmit(e));
-            $('#cancel-button').click(() => this.cancelInference());
+            window.addEventListener('languageChanged', () => this.refreshAllJobTranslations());
+        },
+
+        setJobStatus(job, key, fallback, params) {
+            job.statusTranslationKey = key;
+            job.statusFallback = fallback;
+            job.statusParams = params;
+            job.elements.$status.text(I18nUtils.t(key, fallback, params));
+        },
+
+        refreshJobTranslations(job) {
+            if (!job?.elements) {
+                return;
+            }
+
+            job.elements.$card.find('.progress-card-close')
+                .attr('title', I18nUtils.button('remove', 'Remove'));
+            job.elements.$warningText.text(I18nUtils.progress('warning_detected', 'Warning on this job (Will continue to generate)'));
+            job.elements.$initMessage.text(I18nUtils.progress('initializing', 'Initializing process... This may take a moment.'));
+            job.elements.$warningLogLinkAnchor.text(I18nUtils.link('view_warning_log', 'View warning log'));
+            job.elements.$beatmapLinkAnchor.text(I18nUtils.link('open_folder', 'Click here to open the folder containing your map.'));
+            job.elements.$errorLogLinkAnchor.text(I18nUtils.link('open_log', 'See why... (opens error log)'));
+            job.elements.$throughputLabel.text(I18nUtils.progress('throughput', 'Throughput'));
+
+            if (job.latestTokensPerSecond !== null) {
+                job.elements.$throughputValue.text(`${job.latestTokensPerSecond} tok/s`);
+            }
+
+            if (job.cancelState === 'cancelling') {
+                job.elements.$cancelButton.text(I18nUtils.button('cancelling', 'Cancelling...'));
+            } else {
+                job.elements.$cancelButton.text(I18nUtils.button('cancel', 'Cancel'));
+            }
+
+            if (job.statusTranslationKey) {
+                this.setJobStatus(job, job.statusTranslationKey, job.statusFallback, job.statusParams);
+            }
+        },
+
+        refreshAllJobTranslations() {
+            AppState.jobs.forEach((job) => this.refreshJobTranslations(job));
+        },
+
+        setJobThroughput(job, tokensPerSecondText) {
+            const normalizedText = (tokensPerSecondText || '').toString().trim();
+            if (!normalizedText) {
+                job.latestTokensPerSecond = null;
+                job.elements.$throughputValue.text('');
+                job.elements.$throughputContainer.hide();
+                return;
+            }
+
+            job.latestTokensPerSecond = normalizedText;
+            job.elements.$throughputValue.text(`${normalizedText} tok/s`);
+            job.elements.$throughputContainer.show();
+        },
+
+        extractTokensPerSecond(messageData) {
+            if (!messageData) {
+                return null;
+            }
+
+            const directMatch = messageData.match(/(\d+(?:\.\d+)?)\s+tok\/s\b/i);
+            if (directMatch) {
+                return directMatch[1];
+            }
+
+            const keyedMatch = messageData.match(/tok\/s\s*[=:]\s*(\d+(?:\.\d+)?)/i);
+            return keyedMatch ? keyedMatch[1] : null;
         },
 
         async handleSubmit(e) {
@@ -636,38 +1006,45 @@ $(document).ready(function() {
             // Apply placeholder values before validation
             if (!await this.validateForm()) return;
 
-            this.resetProgress();
-            this.startInference();
+            this.removeFinishedCards();
+            const formData = this.buildFormData();
+
+            // Determine job label suffix based on title/title_unicode/audio filename
+            const jobLabelSuffix = this.getJobLabelSuffix(formData);
+            const job = this.createJobCard(jobLabelSuffix);
+            this.startInference(job, formData);
         },
 
         async validateForm() {
-            PathManager.applyPlaceholderValues();
+            const $audioPath = $('#audio_path');
+            const $beatmapPath = $('#beatmap_path');
+            const $outputPath = $('#output_path');
 
-            const audioPath = $('#audio_path').val().trim();
-            const beatmapPath = $('#beatmap_path').val().trim();
-            const outputPath = $('#output_path').val().trim();
+            const audioPath = $audioPath.val().trim() || $audioPath.attr('placeholder');
+            const beatmapPath = $beatmapPath.val().trim() || $beatmapPath.attr('placeholder');
+            const outputPath = $outputPath.val().trim() || $outputPath.attr('placeholder');
 
             if (!audioPath && !beatmapPath) {
                 Utils.smoothScroll(0);
-                Utils.showFlashMessage("Either 'Beatmap Path' or 'Audio Path' are required for running inference", 'error');
+                Utils.showTranslatedFlashMessage('messages.error.audio_or_beatmap_required', "Either 'Beatmap Path' or 'Audio Path' are required for running inference", 'error');
                 return false;
             }
 
             if (!outputPath && !beatmapPath) {
                 Utils.smoothScroll(0);
-                Utils.showFlashMessage("Either 'Output Path' or 'Beatmap Path' are required for running inference", 'error');
+                Utils.showTranslatedFlashMessage('messages.error.output_or_beatmap_required', "Either 'Output Path' or 'Beatmap Path' are required for running inference", 'error');
                 return false;
             }
 
             // Validate beatmap file type if beatmap path is provided
             if (beatmapPath && !beatmapPath.toLowerCase().endsWith('.osu')) {
                 Utils.smoothScroll('#beatmap_path');
-                Utils.showFlashMessage("Beatmap file must have .osu extension", 'error');
-                PathManager.showInlineError('#beatmap_path', 'Must be .osu file');
+                Utils.showTranslatedFlashMessage('messages.error.beatmap_invalid_ext', 'Beatmap file must have .osu extension', 'error');
+                ValidationManager.showInlineError('#beatmap_path', I18nUtils.message('error', 'beatmap_invalid_ext', 'Beatmap file must have .osu extension'));
                 return false;
             }
 
-            const pathsAreValid = await PathManager.validateAndAutofillPaths(true);
+            const pathsAreValid = await ValidationManager.validateAndAutofill(true);
             if (!pathsAreValid) {
                 Utils.smoothScroll(0);
                 return false;
@@ -676,26 +1053,144 @@ $(document).ready(function() {
             return true;
         },
 
-        resetProgress() {
-            $('#flash-container').empty();
-            $("#progress_output").show();
+        createJobCard(labelSuffix = "") {
+            AppState.jobCounter += 1;
+            // Build job display name with suffix when available
+            const baseName = `Job ${AppState.jobCounter}`;
+            const jobDisplayName = labelSuffix ? `${baseName} - ${labelSuffix}` : baseName;
+            const tempKey = `temp-${Date.now()}-${AppState.jobCounter}`;
+
+            const $card = $(
+                `<div class="progress-card" data-status="running" data-job-key="${tempKey}">
+                    <div class="progress-card-header">
+                        <div class="progress-card-title">${jobDisplayName}</div>
+                        <button type="button" class="progress-card-close" title="Remove">×</button>
+                    </div>
+                    <div class="progress-card-status">Starting...</div>
+                    <div class="progress-card-throughput" style="display:none;">
+                        <span class="progress-card-throughput-label">Throughput</span>
+                        <span class="progress-card-throughput-value"></span>
+                    </div>
+                    <div class="warning-text" style="display:none; font-size: 12px; color: var(--accent-color); margin-top: 4px;">
+                        Warning on this job (Will continue to generate)
+                    </div>
+                    <div class="init-message" style="font-style: italic; color: #ccc; margin-bottom: 10px;">
+                        Initializing process... This may take a moment.
+                    </div>
+                    <div class="progressBarContainer">
+                        <div class="progressBar"></div>
+                    </div>
+                    <div class="progress-card-actions">
+                        <button type="button" class="cancel-button" style="display:none;">Cancel</button>
+                    </div>
+                    <div class="progress-card-links warning-log-link" style="display:none;">
+                        <a href="#">View warning log</a>
+                    </div>
+                    <pre class="warning-log" style="display:none; white-space: pre-wrap; background: #141414; border: 1px solid var(--border-color); padding: 8px; border-radius: 6px; margin-top: 8px;"></pre>
+                    <div class="progress-card-links beatmap-link" style="display:none;">
+                        <a href="#" target="_blank">Click here to open the folder containing your map.</a>
+                    </div>
+                    <div class="progress-card-links error-log-link" style="display:none;">
+                        <a href="#">See why... (opens error log)</a>
+                    </div>
+                </div>`
+            );
+
+            $('#progressCards').prepend($card);
+            $('#progress_output').show();
             Utils.smoothScroll('#progress_output');
 
-            $("#progressBarContainer, #progressTitle").show();
-            $("#progressBar").css("width", "0%").removeClass('cancelled error');
-            $("#beatmapLink, #errorLogLink").hide();
-            $("#init_message").text("Initializing process... This may take a moment.").show();
-            $("#progressTitle").text("").css('color', '');
-            $("#cancel-button").hide().prop('disabled', false).text('Cancel');
-            $("button[type='submit']").prop("disabled", true);
+            const job = {
+                id: null,
+                tempKey,
+                displayName: jobDisplayName,
+                stage: 'starting',
+                errorIndicatorSeen: false,
+                warningMessages: [],
+                warningCaptureActive: false,
+                warningCaptureRemaining: 0,
+                warningSuppressed: false,
+                cancelState: 'idle',
+                latestTokensPerSecond: null,
+                evtSource: null,
+                isCancelled: false,
+                inferenceErrorOccurred: false,
+                accumulatedErrorMessages: [],
+                errorLogFilePath: null,
+                elements: {
+                    $card,
+                    $status: $card.find('.progress-card-status'),
+                    $throughputContainer: $card.find('.progress-card-throughput'),
+                    $throughputLabel: $card.find('.progress-card-throughput-label'),
+                    $throughputValue: $card.find('.progress-card-throughput-value'),
+                    $warningText: $card.find('.warning-text'),
+                    $initMessage: $card.find('.init-message'),
+                    $progressBar: $card.find('.progressBar'),
+                    $progressBarContainer: $card.find('.progressBarContainer'),
+                    $cancelButton: $card.find('.cancel-button'),
+                    $warningLogLink: $card.find('.warning-log-link'),
+                    $warningLogLinkAnchor: $card.find('.warning-log-link a'),
+                    $warningLog: $card.find('.warning-log'),
+                    $beatmapLink: $card.find('.beatmap-link'),
+                    $beatmapLinkAnchor: $card.find('.beatmap-link a'),
+                    $errorLogLink: $card.find('.error-log-link'),
+                    $errorLogLinkAnchor: $card.find('.error-log-link a')
+                }
+            };
 
-            AppState.inferenceErrorOccurred = false;
-            AppState.accumulatedErrorMessages = [];
-            AppState.isCancelled = false;
+            $card.find('.progress-card-close').on('click', () => this.requestClose(job, $card));
+            job.elements.$cancelButton.on('click', () => this.requestCancel(job));
 
-            if (AppState.evtSource) {
-                AppState.evtSource.close();
-                AppState.evtSource = null;
+            this.setJobStatus(job, 'progress.starting', 'Starting...');
+            this.refreshJobTranslations(job);
+
+            AppState.jobs.set(tempKey, job);
+            return job;
+        },
+
+        removeJob(jobId, $cardOverride = null) {
+            const job = this.getJob(jobId);
+            const $card = $cardOverride || job?.elements?.$card;
+            if (job?.evtSource) {
+                job.evtSource.close();
+            }
+            if ($card) {
+                const tempKey = $card.data('job-key');
+                $card.remove();
+                if (!jobId && tempKey) {
+                    AppState.jobs.delete(tempKey);
+                }
+            }
+            if (job) {
+                AppState.jobs.delete(job.id || job.tempKey);
+            }
+            if (AppState.lastStartedJobId && job && AppState.lastStartedJobId === job.id) {
+                AppState.lastStartedJobId = null;
+            }
+            this.updateProgressOutputVisibility();
+        },
+
+        removeFinishedCards() {
+            $('.progress-card').each((_, card) => {
+                const $card = $(card);
+                const status = $card.data('status');
+                if (status === 'completed' || status === 'error' || status === 'cancelled') {
+                    const jobId = $card.data('job-id');
+                    const tempKey = $card.data('job-key');
+                    $card.remove();
+                    if (jobId) {
+                        AppState.jobs.delete(jobId);
+                    } else if (tempKey) {
+                        AppState.jobs.delete(tempKey);
+                    }
+                }
+            });
+            this.updateProgressOutputVisibility();
+        },
+
+        updateProgressOutputVisibility() {
+            if ($('#progressCards').children().length === 0) {
+                $('#progress_output').hide();
             }
         },
 
@@ -704,20 +1199,11 @@ $(document).ready(function() {
 
             // Handle descriptors
             formData.delete('descriptors');
-            const positiveDescriptors = [];
-            const negativeDescriptors = [];
+            formData.delete('negative_descriptors');
+            const descriptorSelections = DescriptorManager.getSelections();
 
-            $('input[name="descriptors"]').each(function() {
-                const $cb = $(this);
-                if ($cb.hasClass('positive-check')) {
-                    positiveDescriptors.push($cb.val());
-                } else if ($cb.hasClass('negative-check')) {
-                    negativeDescriptors.push($cb.val());
-                }
-            });
-
-            positiveDescriptors.forEach(val => formData.append('descriptors', val));
-            negativeDescriptors.forEach(val => formData.append('negative_descriptors', val));
+            descriptorSelections.positive.forEach(val => formData.append('descriptors', val));
+            descriptorSelections.negative.forEach(val => formData.append('negative_descriptors', val));
 
             // Ensure hitsounded is true for V30
             if ($("#model").val() === "v30" && !$("#option-item-hitsounded").is(':visible')) {
@@ -727,16 +1213,56 @@ $(document).ready(function() {
             return formData;
         },
 
-        startInference() {
+        // Compute job label suffix from Title (Unicode), Title, or audio filename
+        getJobLabelSuffix(formData) {
+            const maxLength = 60;
+
+            const sanitizeLabel = (value) => {
+                const text = (value || '').toString().replace(/\s+/g, ' ').trim();
+                if (!text) return '';
+                return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+            };
+
+            const titleUnicode = sanitizeLabel(formData.get('title_unicode'));
+            if (titleUnicode) return titleUnicode;
+
+            const title = sanitizeLabel(formData.get('title'));
+            if (title) return title;
+
+            const audioPathRaw = (formData.get('audio_path') || '').toString().trim();
+            if (audioPathRaw) {
+                // Normalize path separators and strip any trailing separators
+                const normalized = audioPathRaw.replace(/\\/g, '/').replace(/\/+$/, '');
+                const filename = normalized.split('/').pop();
+                const safeFilename = sanitizeLabel(filename);
+                if (safeFilename) return safeFilename;
+            }
+
+            return '';
+        },
+
+        startInference(job, formData) {
             $.ajax({
                 url: "/start_inference",
                 method: "POST",
-                data: this.buildFormData(),
+                data: formData,
                 processData: false,
                 contentType: false,
-                success: () => {
-                    $("#cancel-button").show();
-                    this.connectToSSE();
+                success: (response) => {
+                    const jobId = response.job_id;
+                    if (!jobId) {
+                        Utils.showTranslatedFlashMessage('messages.error.start_failed', 'Failed to start inference process. Check backend console.', 'error');
+                        this.removeJob(job.id || job.tempKey, job.elements.$card);
+                        return;
+                    }
+                    job.id = jobId;
+                    job.cancelState = 'idle';
+                    job.elements.$cancelButton.show().prop('disabled', false).text(I18nUtils.button('cancel', 'Cancel'));
+                    job.elements.$card.attr('data-job-id', jobId);
+                    AppState.jobs.delete(job.tempKey);
+                    AppState.jobs.set(jobId, job);
+                    AppState.lastStartedJobId = jobId;
+                    this.connectToSSE(job);
                 },
                 error: (jqXHR, textStatus, errorThrown) => {
                     console.error("Failed to start inference:", textStatus, errorThrown);
@@ -750,29 +1276,27 @@ $(document).ready(function() {
                         } catch(e) { /* ignore parsing error */ }
                     }
                     Utils.showFlashMessage(errorMsg, 'error');
-                    $("button[type='submit']").prop("disabled", false);
-                    $("#cancel-button").hide();
-                    $("#progress_output").hide();
+                    this.removeJob(job.id, job.elements.$card);
                 }
             });
         },
 
-        connectToSSE() {
-            console.log("Connecting to SSE stream...");
-            AppState.evtSource = new EventSource("/stream_output");
-            AppState.errorLogFilePath = null;
+        connectToSSE(job) {
+            console.log("Connecting to SSE stream...", job.id);
+            job.evtSource = new EventSource(`/stream_output?job_id=${encodeURIComponent(job.id)}`);
+            job.errorLogFilePath = null;
 
-            AppState.evtSource.onmessage = (e) => this.handleSSEMessage(e);
-            AppState.evtSource.onerror = (err) => this.handleSSEError(err);
-            AppState.evtSource.addEventListener("error_log", (e) => {
-                AppState.errorLogFilePath = e.data;
+            job.evtSource.onmessage = (e) => this.handleSSEMessage(job, e);
+            job.evtSource.onerror = (err) => this.handleSSEError(job, err);
+            job.evtSource.addEventListener("error_log", (e) => {
+                job.errorLogFilePath = e.data;
             });
-            AppState.evtSource.addEventListener("end", (e) => this.handleSSEEnd(e));
+            job.evtSource.addEventListener("end", (e) => this.handleSSEEnd(job, e));
         },
 
-        handleSSEMessage(e) {
-            if ($("#init_message").is(":visible")) $("#init_message").hide();
-            if (AppState.isCancelled) return;
+        handleSSEMessage(job, e) {
+            if (job.elements.$initMessage.is(":visible")) job.elements.$initMessage.hide();
+            if (job.isCancelled) return;
 
             const messageData = e.data;
             const errorIndicators = [
@@ -781,41 +1305,87 @@ $(document).ready(function() {
             ];
 
             const isErrorMessage = errorIndicators.some(indicator => messageData.includes(indicator));
+            const isClientDisconnectTrace = messageData.includes("_client_handler") ||
+                messageData.includes("Exception in thread Thread-") ||
+                messageData.includes("GeneratorExit") ||
+                messageData.includes("connection_dropped") ||
+                messageData.includes("generator ignored GeneratorExit") ||
+                messageData.includes("BrokenPipeError") ||
+                messageData.includes("The pipe is being closed") ||
+                messageData.includes("[WinError 232]");
 
-            if (isErrorMessage && !AppState.inferenceErrorOccurred) {
-                AppState.inferenceErrorOccurred = true;
-                AppState.accumulatedErrorMessages.push(messageData);
-                $("#progressTitle").text("Error Detected").css('color', 'var(--accent-color)');
-                $("#progressBar").addClass('error');
-            } else if (AppState.inferenceErrorOccurred) {
-                AppState.accumulatedErrorMessages.push(messageData);
+            if (job.warningCaptureActive) {
+                job.warningMessages.push(messageData);
+                job.warningCaptureRemaining -= 1;
+                if (job.warningCaptureRemaining <= 0) {
+                    job.warningCaptureActive = false;
+                }
+                if (isClientDisconnectTrace) {
+                    job.warningSuppressed = true;
+                }
+                if (job.warningSuppressed) {
+                    job.warningMessages = [];
+                    job.warningCaptureActive = false;
+                    job.elements.$warningLog.hide().text('');
+                    job.elements.$warningLogLink.hide();
+                    job.elements.$warningText.hide();
+                    return;
+                }
+                job.elements.$warningLog.text(job.warningMessages.join("\n"));
+            }
+
+            if (isErrorMessage && !isClientDisconnectTrace) {
+                job.errorIndicatorSeen = true;
+                job.accumulatedErrorMessages.push(messageData);
+                job.warningMessages.push(messageData);
+                job.warningCaptureActive = true;
+                job.warningCaptureRemaining = 80;
+                job.elements.$warningText.show();
+                job.elements.$warningLog.text(job.warningMessages.join("\n"));
+                if (job.elements.$warningLogLink.is(':hidden')) {
+                    job.elements.$warningLogLinkAnchor.off("click").on("click", (event) => {
+                        event.preventDefault();
+                        job.elements.$warningLog.toggle();
+                    });
+                    job.elements.$warningLogLink.show();
+                }
+            } else if (job.inferenceErrorOccurred) {
+                job.accumulatedErrorMessages.push(messageData);
             } else {
-                this.updateProgress(messageData);
+                this.updateProgress(job, messageData);
             }
         },
 
-        updateProgress(messageData) {
+        updateProgress(job, messageData) {
             // Update progress title based on message content
             const lowerCaseMessage = messageData.toLowerCase();
             const progressTitles = {
-                "generating timing": "Generating Timing",
-                "generating kiai": "Generating Kiai",
-                "generating map": "Generating Map",
-                "seq len": "Refining Positions"
+                "generating timing": ['progress.generating_timing', 'Generating Timing'],
+                "generating kiai": ['progress.generating_kiai', 'Generating Kiai'],
+                "generating map": ['progress.generating_map', 'Generating Map'],
+                "seq len": ['progress.refining_positions', 'Refining Positions']
             };
 
-            Object.entries(progressTitles).forEach(([keyword, title]) => {
+            Object.entries(progressTitles).forEach(([keyword, [key, fallback]]) => {
                 if (lowerCaseMessage.includes(keyword)) {
-                    $("#progressTitle").text(title);
+                    this.setJobStatus(job, key, fallback);
+                    if (job.stage !== 'generating') {
+                        job.stage = 'generating';
+                    }
                 }
             });
+
+            const tokensPerSecond = this.extractTokensPerSecond(messageData);
+            if (tokensPerSecond !== null) {
+                this.setJobThroughput(job, tokensPerSecond);
+            }
 
             // Update progress bar
             const progressMatch = messageData.match(/^\s*(\d+)%\|/);
             if (progressMatch) {
                 const currentPercent = parseInt(progressMatch[1].trim(), 10);
                 if (!isNaN(currentPercent)) {
-                    $("#progressBar").css("width", currentPercent + "%");
+                    job.elements.$progressBar.css("width", currentPercent + "%");
                 }
             }
 
@@ -826,121 +1396,197 @@ $(document).ready(function() {
                     const fullPath = parts[1].trim().replace(/\\/g, "/");
                     const folderPath = fullPath.substring(0, fullPath.lastIndexOf("/"));
 
-                    $("#beatmapLinkAnchor")
+                    job.elements.$beatmapLinkAnchor
                         .attr("href", "#")
-                        .text("Click here to open the folder containing your map.")
+                        .text(I18nUtils.link('open_folder', 'Click here to open the folder containing your map.'))
                         .off("click")
                         .on("click", (e) => {
                             e.preventDefault();
-                            $.get("/open_folder", { folder: folderPath })
+                            $.ajax({
+                                url: "/open_folder",
+                                method: "POST",
+                                data: { folder: folderPath }
+                            })
                                 .done(response => console.log("Open folder response:", response))
-                                .fail(() => alert("Failed to open folder via backend."));
+                                .fail(() => alert(I18nUtils.message('error', 'open_folder_failed', 'Failed to open folder via backend.')));
                         });
-                    $("#beatmapLink").show();
+                    job.elements.$beatmapLink.show();
                 }
             }
         },
 
-        handleSSEError(err) {
+        handleSSEError(job, err) {
             console.error("EventSource failed:", err);
-            if (AppState.evtSource) {
-                AppState.evtSource.close();
-                AppState.evtSource = null;
+            if (job.evtSource) {
+                job.evtSource.close();
+                job.evtSource = null;
             }
 
-            if (!AppState.isCancelled && !AppState.inferenceErrorOccurred) {
-                AppState.inferenceErrorOccurred = true;
-                AppState.accumulatedErrorMessages.push("Error: Connection to process stream lost.");
-                $("#progressTitle").text("Connection Error").css('color', 'var(--accent-color)');
-                $("#progressBar").addClass('error');
-                Utils.showFlashMessage("Error: Connection to process stream lost.", "error");
+            job.stage = 'finished';
+
+            if (!job.isCancelled && !job.inferenceErrorOccurred) {
+                job.inferenceErrorOccurred = true;
+                job.accumulatedErrorMessages.push(I18nUtils.message('error', 'connection_lost', 'Error: Connection to process stream lost.'));
+                this.setJobStatus(job, 'progress.connection_error', 'Connection Error');
+                job.elements.$status.css('color', 'var(--accent-color)');
+                job.elements.$progressBar.addClass('error');
+                job.elements.$card.data('status', 'error');
+                Utils.showTranslatedFlashMessage('messages.error.connection_lost', 'Error: Connection to process stream lost.', 'error');
             }
 
-            if (!AppState.isCancelled) {
-                $("button[type='submit']").prop("disabled", false);
-            }
-            $("#cancel-button").hide();
+            job.elements.$cancelButton.hide();
         },
 
-        handleSSEEnd(e) {
+        handleSSEEnd(job, e) {
             console.log("Received end event from server.", e.data);
-            if (AppState.evtSource) {
-                AppState.evtSource.close();
-                AppState.evtSource = null;
+            if (job.evtSource) {
+                job.evtSource.close();
+                job.evtSource = null;
             }
 
-            if (AppState.isCancelled) {
-                $("#progressTitle, #progressBarContainer, #beatmapLink, #errorLogLink").hide();
-                $("#progress_output").hide();
-            } else if (AppState.inferenceErrorOccurred) {
-                this.handleInferenceError();
+            const endMessage = (e.data || '').toLowerCase();
+            const endWithErrors = endMessage.includes('with errors');
+            if (endWithErrors) {
+                job.inferenceErrorOccurred = true;
+            }
+
+            if (job.isCancelled) {
+                this.setJobStatus(job, 'progress.cancelled', 'Cancelled');
+                job.elements.$status.css('color', 'var(--accent-color)');
+                job.elements.$progressBar.addClass('error');
+                job.elements.$card.data('status', 'cancelled');
+            } else if (job.inferenceErrorOccurred) {
+                job.warningMessages = [];
+                job.warningCaptureActive = false;
+                job.warningSuppressed = false;
+                job.elements.$warningLog.hide().text('');
+                job.elements.$warningLogLink.hide();
+                job.elements.$warningText.hide();
+                this.handleInferenceError(job);
+                job.elements.$card.data('status', 'error');
             } else {
-                $("#progressTitle").show().text("Processing Complete").css('color', '');
-                $("#progressBarContainer").show();
-                $("#progressBar").css("width", "100%").removeClass('error');
+                this.setJobStatus(job, 'progress.processing_complete', 'Processing Complete');
+                job.elements.$status.css('color', '');
+                job.elements.$progressBar.css("width", "100%").removeClass('error');
+                job.elements.$card.data('status', 'completed');
             }
 
-            $("button[type='submit']").prop("disabled", false);
-            $("#cancel-button").hide();
-            AppState.isCancelled = false;
+            job.elements.$cancelButton.hide();
+            job.isCancelled = false;
+            job.cancelState = 'idle';
         },
 
-        handleInferenceError() {
-            const fullErrorText = AppState.accumulatedErrorMessages.join("\\n");
-            let specificError = "An error occurred during processing. Check console/logs.";
+        handleInferenceError(job) {
+            const fullErrorText = job.accumulatedErrorMessages.join("\\n");
+            let specificError = I18nUtils.message('error', 'generation_error', 'There was an error while creating the beatmap. Check console/logs for details.');
 
             if (fullErrorText.includes("FileNotFoundError:")) {
                 const fileNotFoundMatch = fullErrorText.match(/FileNotFoundError:.*? file (.*?) not found/);
                 specificError = fileNotFoundMatch?.[1] ?
-                    `Error: File not found - ${fileNotFoundMatch[1].replace(/\\\\/g, '\\\\')}` :
-                    "Error: A required file was not found.";
+                    `${I18nUtils.message('error', 'file_not_found', 'Error: A required file was not found.')}: ${fileNotFoundMatch[1].replace(/\\\\/g, '\\\\')}` :
+                    I18nUtils.message('error', 'file_not_found', 'Error: A required file was not found.');
             } else if (fullErrorText.includes("HYDRA_FULL_ERROR=1")) {
-                specificError = "There was an error while creating the beatmap. Check console/logs for details.";
+                specificError = I18nUtils.message('error', 'generation_error', 'There was an error while creating the beatmap. Check console/logs for details.');
             } else if (fullErrorText.includes("Error executing job")) {
-                specificError = "There was an error starting or executing the generation task.";
+                specificError = I18nUtils.message('error', 'task_error', 'There was an error starting or executing the generation task.');
             } else if (fullErrorText.includes("Connection to process stream lost")) {
-                specificError = "Error: Connection to the generation process was lost.";
+                specificError = I18nUtils.message('error', 'connection_lost', 'Error: Connection to process stream lost.');
             }
 
             Utils.showFlashMessage(specificError, "error");
-            $("#progressTitle").text("Processing Failed").css('color', 'var(--accent-color)').show();
-            $("#progressBar").css("width", "100%").addClass('error');
-            $("#progressBarContainer").show();
-            $("#beatmapLink").hide();
+            this.setJobStatus(job, 'progress.processing_failed', 'Processing Failed');
+            job.elements.$status.css('color', 'var(--accent-color)').show();
+            job.elements.$progressBar.css("width", "100%").addClass('error');
+            job.elements.$beatmapLink.hide();
 
-            if (AppState.errorLogFilePath) {
-                $("#errorLogLinkAnchor").off("click").on("click", (e) => {
+            if (job.errorLogFilePath) {
+                job.elements.$errorLogLinkAnchor.off("click").on("click", (e) => {
                     e.preventDefault();
-                    $.get("/open_log_file", { path: AppState.errorLogFilePath })
+                    $.ajax({
+                        url: "/open_log_file",
+                        method: "POST",
+                        data: { path: job.errorLogFilePath }
+                    })
                         .done(response => console.log("Open log response:", response))
-                        .fail(() => alert("Failed to open log file via backend."));
+                        .fail(() => alert(I18nUtils.message('error', 'open_log_failed', 'Failed to open log file via backend.')));
                 });
-                $("#errorLogLink").show();
+                job.elements.$errorLogLink.show();
             }
         },
 
-        cancelInference() {
-            const $cancelBtn = $("#cancel-button");
-            $cancelBtn.prop('disabled', true).text('Cancelling...');
+        requestCancel(job) {
+            this.cancelInference(job);
+        },
+
+        cancelInference(job) {
+            const $cancelBtn = job.elements.$cancelButton;
+            job.cancelState = 'cancelling';
+            $cancelBtn.prop('disabled', true).text(I18nUtils.button('cancelling', 'Cancelling...'));
 
             $.ajax({
                 url: "/cancel_inference",
                 method: "POST",
+                data: { job_id: job.id },
                 success: (response) => { // Expecting JSON response
-                    AppState.isCancelled = true;
-                    Utils.showFlashMessage(response.message || "Inference cancelled successfully.", "cancel-success");
+                    job.isCancelled = true;
+                    Utils.showFlashMessage(I18nUtils.message('success', 'cancel_request_sent', 'Cancel request sent'), "cancel-success");
                 },
                 error: (jqXHR) => {
-                    const errorMsg = jqXHR.responseJSON?.message || "Failed to send cancel request. Unknown error.";
+                    const errorMsg = jqXHR.responseJSON?.message || I18nUtils.message('error', 'cancel_failed', 'Failed to send cancel request. Unknown error.');
                     Utils.showFlashMessage(errorMsg, "error");
-                    $cancelBtn.prop('disabled', false).text('Cancel');
+                    job.cancelState = 'idle';
+                    $cancelBtn.prop('disabled', false).text(I18nUtils.button('cancel', 'Cancel'));
                 }
             });
+        },
+
+        requestClose(job, $card) {
+            const status = $card?.data('status');
+            if (job.stage === 'finished' || status === 'completed' || status === 'error' || status === 'cancelled') {
+                this.removeJob(job.id || job.tempKey, $card);
+                return;
+            }
+            this.cancelInference(job);
+            this.removeJob(job.id || job.tempKey, $card);
+        },
+
+        getJob(jobId) {
+            return AppState.jobs.get(jobId) || null;
         }
     };
 
     // Initialize all components
     function initializeApp() {
+        // Initialize language selector
+        const $langSelector = $('#language-selector');
+        if ($langSelector.length && typeof I18n !== 'undefined') {
+            // Set initial value from I18n
+            const currentLang = I18n.getCurrentLanguage();
+            $langSelector.val(currentLang);
+            
+            // Handle language change
+            $langSelector.on('change', async function() {
+                const newLang = $(this).val();
+                const success = await I18n.setLanguage(newLang);
+                if (!success) {
+                    // Revert to current language if failed
+                    $(this).val(I18n.getCurrentLanguage());
+                }
+            });
+        }
+
+        window.addEventListener('languageChanged', () => UIManager.updateYearSettings());
+
+        // Check BF16 support on page load
+        $.get("/check_bf16_support", function(data) {
+            if (data.supported) {
+                $("#bf16-option").show();
+                if (data.gpu_name) {
+                    $("#bf16-gpu-info").text("(" + data.gpu_name + ")");
+                }
+            }
+        });
+
         // Initialize Select2
         $('.select2').select2({
             placeholder: "Select options",
@@ -949,21 +1595,21 @@ $(document).ready(function() {
             containerCssClass: "select2-container-dark"
         });
 
-        // Ensure progress title div exists
-        if (!$("#progressTitle").length) {
-            $("#progress_output h3").after("<div id='progressTitle' style='font-weight:bold; padding-bottom:5px;'></div>");
-        }
-
         // Initialize all managers
+        Security.init();
         FileBrowser.init();
-        PathManager.init();
+        UIManager.init();
+        ValidationManager.init();
         DescriptorManager.init();
         ConfigManager.init();
         InferenceManager.init();
 
         // Attach event handlers
         $("#model").on('change', () => UIManager.updateModelSettings());
-        $("#gamemode").on('change', () => UIManager.updateConditionalFields());
+        $("#gamemode").on('change', () => {
+            UIManager.updateConditionalFields();
+            DescriptorManager.renderCurrentDescriptors();
+        });
 
         // Initial UI updates
         UIManager.updateModelSettings();

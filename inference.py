@@ -1,4 +1,10 @@
+import logging
+import multiprocessing
+import sys
+
+import utils.excepthook  # noqa
 import os.path
+import uuid
 from functools import reduce
 from pathlib import Path
 import random
@@ -8,11 +14,13 @@ import torch
 from accelerate.utils import set_seed
 from omegaconf import OmegaConf, DictConfig
 from slider import Beatmap
-from transformers.utils import cached_file
+from transformers.utils import cached_file, is_flash_attn_2_available
+from importlib import metadata
+from packaging.version import Version
 
 import osu_diffusion
-import routed_pickle
-from config import InferenceConfig, FidConfig
+from utils import routed_pickle
+from config import InferenceConfig
 from diffusion_pipeline import DiffisionPipeline
 from osuT5.osuT5.config import TrainConfig
 from osuT5.osuT5.dataset.data_utils import events_of_type, TIMING_TYPES, merge_events
@@ -21,68 +29,158 @@ from osuT5.osuT5.inference import Preprocessor, Processor, Postprocessor, Beatma
 from osuT5.osuT5.inference.server import InferenceClient
 from osuT5.osuT5.inference.super_timing_generator import SuperTimingGenerator
 from osuT5.osuT5.model import Mapperatorinator
-from osuT5.osuT5.tokenizer import Tokenizer, ContextType
-from osuT5.osuT5.utils import get_model
+from osuT5.osuT5.tokenizer import ContextType
+from osuT5.osuT5.utils import load_model_loaders, resolve_compatible_lora_path, resolve_model_checkpoint_path, get_model_checkpoint_subfolder
 from osu_diffusion import DiT_models
 from osu_diffusion.config import DiffusionTrainConfig
 
 
-def prepare_args(args: FidConfig | InferenceConfig):
+def get_default_logger():
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+def assert_package_version(package_name: str, required_version: str):
+    required_version = Version(required_version)
+    try:
+        installed_version = Version(metadata.version(package_name))
+    except metadata.PackageNotFoundError as e:
+        raise RuntimeError(
+            f"Missing dependency: '{package_name}' is not installed. "
+            "Please install requirements.txt."
+        ) from e
+
+    assert installed_version >= required_version, (
+        f"{package_name}>={required_version} is required, but {installed_version} is installed. "
+        f"Please install requirements.txt."
+    )
+
+
+def assert_package_versions():
+    assert_package_version("transformers", "4.57.3")
+
+
+def setup_inference_environment(seed: int):
+    assert_package_versions()
+    multiprocessing.set_start_method('spawn', force=True)
+    torch.set_grad_enabled(False)
+    torch.set_float32_matmul_precision('high')
+    set_seed(seed)
+
+
+def _cuda_native_bf16() -> bool:
+    """Whether the current CUDA device supports bf16 natively (not emulated).
+
+    Works on both NVIDIA (compute capability >= 8.0) and ROCm builds, unlike a
+    raw compute-capability check whose numbering is NVIDIA-specific.
+    """
+    try:
+        return torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:  # torch < 2.3 has no emulation flag (and no emulation)
+        return torch.cuda.is_bf16_supported()
+
+
+def compile_device_and_seed(args: InferenceConfig, verbose=True):
+    message = None
     if args.device == "auto":
         if torch.cuda.is_available():
-            print("Using CUDA for inference (auto-selected).")
+            message = "Using CUDA for inference (auto-selected)."
             args.device = "cuda"
         elif torch.mps.is_available():
-            print("Using MPS for inference (auto-selected).")
+            message = "Using MPS for inference (auto-selected)."
             args.device = "mps"
         else:
-            print("Using CPU for inference (auto-selected fallback).")
+            message = "Using CPU for inference (auto-selected fallback)."
             args.device = "cpu"
     elif args.device != "cpu":
         if args.device == "cuda":
             if not torch.cuda.is_available():
-                print("CUDA is not available. Falling back to CPU.")
+                message = "CUDA is not available. Falling back to CPU."
                 args.device = "cpu"
         elif args.device == "mps":
             if not torch.mps.is_available():
-                print("MPS is not available. Falling back to CPU.")
+                message = "MPS is not available. Falling back to CPU."
                 args.device = "cpu"
         else:
-            print(
-                f"Requested device '{args.device}' not available. Falling back to CPU."
-            )
+            message = f"Requested device '{args.device}' not available. Falling back to CPU."
             args.device = "cpu"
-    torch.set_grad_enabled(False)
-    torch.set_float32_matmul_precision('high')
+
+    if verbose and message is not None:
+        print(message)
+
+    # Resolve precision against the device. bf16 is the default, but low
+    # precision only helps on CUDA, and native bf16 needs hardware support
+    # (Ampere or newer on NVIDIA); emulated bf16 on older GPUs is slower than
+    # fp32. Fall back to fp32 there rather than risk fp16 numerics.
+    message = None
+    if args.precision in ("bf16", "fp16") and args.device != "cuda":
+        message = f"{args.precision} precision requires CUDA; using fp32 on '{args.device}'."
+        args.precision = "fp32"
+    elif args.precision == "bf16" and args.device == "cuda" and not _cuda_native_bf16():
+        message = ("GPU does not natively support bf16; falling back to fp32. "
+                   "Set precision=fp16 manually if your GPU has fast fp16.")
+        args.precision = "fp32"
+
+    if verbose and message is not None:
+        print(message)
+
+    # The fast decoder loop uses CUDA graphs, which need a CUDA device. On CUDA
+    # devices where graph capture fails at runtime (e.g. some ROCm setups) it
+    # falls back to the stock generate loop on its own.
+    if args.fast_decoder_loop and args.device != "cuda":
+        if verbose:
+            print(f"fast_decoder_loop requires CUDA; disabling on '{args.device}'.")
+        args.fast_decoder_loop = False
+
+    message = None
+    if args.attn_implementation == "auto":
+        if args.precision in ("bf16", "fp16") and args.device == "cuda" and is_flash_attn_2_available():
+            message = "Using Flash Attention for attention (auto-selected)."
+            args.attn_implementation = "flash_attention_2"
+        else:
+            message = "Using SDPA for attention (auto-selected)."
+            args.attn_implementation = "sdpa"
+    elif args.attn_implementation == "flash_attention_2":
+        if not is_flash_attn_2_available():
+            message = "Flash Attention is not available. Falling back to SDPA."
+            args.attn_implementation = "sdpa"
+        elif args.precision not in ("bf16", "fp16") or args.device != "cuda":
+            message = "Flash Attention requires bf16/fp16 precision and CUDA device. Falling back to SDPA."
+            args.attn_implementation = "sdpa"
+
+    if verbose and message is not None:
+        print(message)
+
     if args.seed is None:
         args.seed = random.randint(0, 2 ** 16)
-        print(f"Random seed: {args.seed}")
-    set_seed(args.seed)
+        if verbose:
+            print(f"Random seed: {args.seed}")
 
 
-def autofill_paths(args: InferenceConfig):
-    """Autofills audio_path and output_path. Can be used either in Web GUI or CLI."""
-    errors = []
-
+def compile_paths(args: InferenceConfig):
     # Convert paths to Path objects for easier manipulation
     beatmap_path = Path(args.beatmap_path) if args.beatmap_path else None
     output_path = Path(args.output_path) if args.output_path else None
     audio_path = Path(args.audio_path) if args.audio_path else None
 
-    # Helper function to validate beatmap file type
-    def is_valid_beatmap_file(path):
-        """Check if the file exists and has a valid beatmap extension (.osu)."""
-        if not path:
-            return True  # Empty path is valid (optional)
-        return path.exists() and path.suffix.lower() == '.osu'
-
     # Case 1: Beatmap path is provided - autofill audio and output
-    if beatmap_path and is_valid_beatmap_file(beatmap_path):
+    if beatmap_path:
+        if not beatmap_path.exists():
+            raise ValueError(f"Beatmap file not found: {beatmap_path}")
+        elif not beatmap_path.suffix.lower() == '.osu':
+            raise ValueError(f"Beatmap file must have .osu extension: {beatmap_path}")
+
         try:
             beatmap = Beatmap.from_path(beatmap_path)
 
             # Autofill audio path if empty
-            if not audio_path:
+            if not audio_path and beatmap.audio_filename:
                 audio_path = beatmap_path.parent / beatmap.audio_filename
 
             # Autofill output path if empty
@@ -90,8 +188,7 @@ def autofill_paths(args: InferenceConfig):
                 output_path = beatmap_path.parent
 
         except Exception as e:
-            error_msg = f"Error reading beatmap file: {e}"
-            errors.append(error_msg)
+            raise ValueError(f"Error reading beatmap file: {e}")
 
     # Case 2: Audio path is provided but no output path - autofill output
     elif audio_path and audio_path.exists() and not output_path:
@@ -100,135 +197,102 @@ def autofill_paths(args: InferenceConfig):
     # Validate all paths
     valid_audio_extensions = {'.mp3', '.wav', '.ogg', '.m4a', '.flac'}
     if not audio_path:
-        errors.append("Audio file path is required.")
+        raise ValueError("Audio file path is required.")
     elif not audio_path.exists():
-        errors.append(f"Audio file not found: {audio_path}")
+        raise ValueError(f"Audio file not found: {audio_path}")
     elif audio_path.suffix.lower() not in valid_audio_extensions:
-        errors.append(f"Audio file must have one of the following extensions: {', '.join(valid_audio_extensions)}: {audio_path}")
-
-    if beatmap_path:
-        if not beatmap_path.exists():
-            errors.append(f"Beatmap file not found: {beatmap_path}")
-        elif not is_valid_beatmap_file(beatmap_path):
-            errors.append(f"Beatmap file must have .osu extension: {beatmap_path}")
+        raise ValueError(
+            f"Audio file must have one of the following extensions: {', '.join(valid_audio_extensions)}: {audio_path}")
 
     # Update args
     args.audio_path = str(audio_path) if audio_path else ""
     args.output_path = str(output_path) if output_path else ""
     args.beatmap_path = str(beatmap_path) if beatmap_path else ""
 
-    return {
-        'success': len(errors) == 0,
-        'errors': errors
-    }
 
-
-def get_args_from_beatmap(args: InferenceConfig, tokenizer: Tokenizer):
-    result = autofill_paths(args)
-
-    if not result['success']:
-        for error in result['errors']:
-            print(f"Error: {error}")
-        raise ValueError("Invalid paths provided. Please check the errors above.")
-
-    if not args.beatmap_path:
-        # populate fair defaults for any inherited args that need to be filled
-        if args.gamemode is None:
-            args.gamemode = 0
-            print(f"Using game mode {args.gamemode}")
-        if args.hp_drain_rate is None:
-            args.hp_drain_rate = 5
-            print(f"Using HP drain rate {args.hp_drain_rate}")
-        if args.circle_size is None:
-            args.circle_size = 4
-            print(f"Using circle size {args.circle_size}")
-        if args.overall_difficulty is None:
-            args.overall_difficulty = 8
-            print(f"Using overall difficulty {args.overall_difficulty}")
-        if args.approach_rate is None:
-            args.approach_rate = 9
-            print(f"Using approach rate {args.approach_rate}")
-        if args.slider_multiplier is None:
-            args.slider_multiplier = 1.4
-            print(f"Using slider multiplier {args.slider_multiplier}")
-        if args.slider_tick_rate is None:
-            args.slider_tick_rate = 1
-            print(f"Using slider tick rate {args.slider_tick_rate}")
-        if args.hitsounded is None:
-            args.hitsounded = True
-            print(f"Using hitsounded {args.hitsounded}")
-        if args.keycount is None and args.gamemode == 3:
-            args.keycount = 4
-            print(f"Using keycount {args.keycount}")
-        return
-
+def compile_args_from_beatmap(args: InferenceConfig, verbose=True):
     beatmap_path = Path(args.beatmap_path)
     beatmap = Beatmap.from_path(beatmap_path)
 
-    if beatmap.mode not in args.train.data.gamemodes and (any(c in [ContextType.MAP, ContextType.GD, ContextType.NO_HS] for c in args.in_context) or args.add_to_beatmap):
-        raise ValueError(f"Beatmap mode {beatmap.mode} is not supported by the model. Supported modes: {args.train.data.gamemodes}")
+    if beatmap.mode not in args.train.data.gamemodes and (any(
+            c in [ContextType.MAP, ContextType.GD, ContextType.NO_HS] for c in args.in_context) or args.add_to_beatmap):
+        raise ValueError(
+            f"Reference beatmap mode {beatmap.mode} is not supported by the model. Supported modes: {args.train.data.gamemodes}")
 
-    print(f"Using metadata from beatmap: {beatmap.display_name}")
-    generation_config = generation_config_from_beatmap(beatmap, tokenizer)
-
-    if args.gamemode is None:
-        args.gamemode = generation_config.gamemode
-        print(f"Using game mode {args.gamemode}")
-    if args.beatmap_id is None and generation_config.beatmap_id:
-        args.beatmap_id = generation_config.beatmap_id
-        print(f"Using beatmap ID {args.beatmap_id}")
-    if args.difficulty is None and generation_config.difficulty != -1 and len(beatmap.hit_objects(stacking=False)) > 0:
-        args.difficulty = generation_config.difficulty
-        print(f"Using difficulty {args.difficulty}")
-    if args.mapper_id is None and beatmap.beatmap_id in tokenizer.beatmap_mapper:
-        args.mapper_id = generation_config.mapper_id
-        print(f"Using mapper ID {args.mapper_id}")
-    if args.descriptors is None and beatmap.beatmap_id in tokenizer.beatmap_descriptors:
-        args.descriptors = generation_config.descriptors
-        print(f"Using descriptors {args.descriptors}")
-    if args.hp_drain_rate is None:
-        args.hp_drain_rate = generation_config.hp_drain_rate
-        print(f"Using HP drain rate {args.hp_drain_rate}")
-    if args.circle_size is None:
-        args.circle_size = generation_config.circle_size
-        print(f"Using circle size {args.circle_size}")
-    if args.overall_difficulty is None:
-        args.overall_difficulty = generation_config.overall_difficulty
-        print(f"Using overall difficulty {args.overall_difficulty}")
-    if args.approach_rate is None:
-        args.approach_rate = generation_config.approach_rate
-        print(f"Using approach rate {args.approach_rate}")
-    if args.slider_multiplier is None:
-        args.slider_multiplier = generation_config.slider_multiplier
-        print(f"Using slider multiplier {args.slider_multiplier}")
-    if args.slider_tick_rate is None:
-        args.slider_tick_rate = generation_config.slider_tick_rate
-        print(f"Using slider tick rate {args.slider_tick_rate}")
-    if args.hitsounded is None:
-        args.hitsounded = generation_config.hitsounded
-        print(f"Using hitsounded {args.hitsounded}")
-    if args.keycount is None and args.gamemode == 3:
-        args.keycount = int(generation_config.keycount)
-        print(f"Using keycount {args.keycount}")
-    if args.hold_note_ratio is None and args.gamemode == 3:
-        args.hold_note_ratio = generation_config.hold_note_ratio
-        print(f"Using hold note ratio {args.hold_note_ratio}")
-    if args.scroll_speed_ratio is None and args.gamemode == 3:
-        args.scroll_speed_ratio = generation_config.scroll_speed_ratio
-        print(f"Using scroll speed ratio {args.scroll_speed_ratio}")
-
+    if verbose:
+        print(f"Using metadata from beatmap: {beatmap.display_name}")
+    generation_config = generation_config_from_beatmap(beatmap, beatmap_path)
     beatmap_config = beatmap_config_from_beatmap(beatmap)
 
-    args.title = beatmap_config.title
-    args.artist = beatmap_config.artist
-    args.bpm = beatmap_config.bpm
-    args.offset = beatmap_config.offset
-    args.background = beatmap.background
-    args.preview_time = beatmap_config.preview_time
+    beatmap_args = {
+        "gamemode": generation_config.gamemode,
+        "beatmap_id": generation_config.beatmap_id,
+        "difficulty": generation_config.difficulty,
+        "mapper_id": generation_config.mapper_id,
+        "descriptors": generation_config.descriptors,
+        "hp_drain_rate": generation_config.hp_drain_rate,
+        "circle_size": generation_config.circle_size,
+        "overall_difficulty": generation_config.overall_difficulty,
+        "approach_rate": generation_config.approach_rate,
+        "slider_multiplier": generation_config.slider_multiplier,
+        "slider_tick_rate": generation_config.slider_tick_rate,
+        "hitsounded": generation_config.hitsounded,
+        "keycount": generation_config.keycount,
+        "hold_note_ratio": generation_config.hold_note_ratio,
+        "scroll_speed_ratio": generation_config.scroll_speed_ratio,
+        "bpm": beatmap_config.bpm,
+        "offset": beatmap_config.offset,
+        "title": beatmap_config.title,
+        "title_unicode": beatmap_config.title_unicode,
+        "artist": beatmap_config.artist,
+        "artist_unicode": beatmap_config.artist_unicode,
+        "creator": beatmap_config.creator,
+        "version": beatmap_config.version,
+        "source": beatmap_config.source,
+        "background": str(beatmap_path.parent / beatmap.background) if beatmap.background else None,
+        "preview_time": beatmap_config.preview_time,
+    }
+
+    for key, value in beatmap_args.items():
+        if getattr(args, key) is None and value is not None:
+            setattr(args, key, value)
+            if verbose:
+                print(f"Using beatmap {key} {value}")
+
+
+def compile_default_args(args: InferenceConfig, verbose=True):
+    # Populate fair defaults for any inherited args that need to be filled
+    default_args = {
+        "gamemode": 0,
+        "hitsounded": True,
+        "keycount": 4,
+        "hp_drain_rate": 5,
+        "circle_size": 4,
+        "overall_difficulty": 8,
+        "approach_rate": 9,
+        "slider_multiplier": 1.4,
+        "slider_tick_rate": 1,
+        "bpm": 120,
+        "offset": 0,
+        "title": "Unknown Title",
+        "artist": "Unknown Artist",
+        "creator": "Mapperatorinator",
+        "version": "Mapperatorinator",
+        "source": "",
+        "preview_time": -1,
+    }
+
+    for key, value in default_args.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+            if verbose:
+                print(f"Using default {key} {value}")
 
 
 def get_tags_dict(args: DictConfig | InferenceConfig):
     return dict(
+        model=args.model_path,
+        lora=args.lora_path,
         lookback=args.lookback,
         lookahead=args.lookahead,
         beatmap_id=args.beatmap_id,
@@ -268,55 +332,116 @@ def get_tags_dict(args: DictConfig | InferenceConfig):
     )
 
 
-def get_config(args: InferenceConfig):
-    # Create tags that describes args
-    tags = get_tags_dict(args)
-    # Filter to all non-default values
-    defaults = get_tags_dict(OmegaConf.load("configs/inference/default.yaml"))
-    tags = {k: v for k, v in tags.items() if v != defaults[k]}
-    # To string separated by spaces
-    tags = " ".join(f"{k}={v}" for k, v in tags.items())
+def compile_derived_args(args: InferenceConfig):
+    # Any args that can be derived from other args
+    derived_args = {
+        "title_unicode": args.title,
+        "artist_unicode": args.artist,
+    }
 
+    for key, value in derived_args.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+
+    if args.tags is None:
+        # Create tags that describes args
+        tags = get_tags_dict(args)
+        # Filter to all non-default values
+        defaults = get_tags_dict(OmegaConf.load("configs/inference/default.yaml"))
+        tags = {k: v for k, v in tags.items() if v != defaults[k]}
+        # To string separated by spaces
+        args.tags = " ".join(f"{k}={v}" for k, v in tags.items())
+
+
+def compile_args(args: InferenceConfig, verbose=True):
+    """Validates and populates missing args."""
+    compile_device_and_seed(args, verbose=verbose)
+    compile_paths(args)
+
+    if args.beatmap_path:
+        compile_args_from_beatmap(args, verbose=verbose)
+    else:
+        compile_default_args(args, verbose=verbose)
+
+    compile_derived_args(args)
+
+
+def get_config(args: InferenceConfig):
     # Set defaults for generation config that does not allow an unknown value
     return GenerationConfig(
-        gamemode=args.gamemode if args.gamemode is not None else 0,
+        gamemode=args.gamemode,
         beatmap_id=args.beatmap_id,
         difficulty=args.difficulty,
         mapper_id=args.mapper_id,
         year=args.year,
-        hitsounded=args.hitsounded if args.hitsounded is not None else True,
+        hitsounded=args.hitsounded,
         hp_drain_rate=args.hp_drain_rate,
         circle_size=args.circle_size,
         overall_difficulty=args.overall_difficulty,
         approach_rate=args.approach_rate,
-        slider_multiplier=args.slider_multiplier or 1.4,
-        slider_tick_rate=args.slider_tick_rate or 1,
-        keycount=args.keycount if args.keycount is not None else 4,
+        slider_multiplier=args.slider_multiplier,
+        slider_tick_rate=args.slider_tick_rate,
+        keycount=args.keycount,
         hold_note_ratio=args.hold_note_ratio,
         scroll_speed_ratio=args.scroll_speed_ratio,
         descriptors=args.descriptors,
         negative_descriptors=args.negative_descriptors,
     ), BeatmapConfig(
         title=args.title,
+        title_unicode=args.title_unicode,
         artist=args.artist,
-        title_unicode=args.title,
-        artist_unicode=args.artist,
+        artist_unicode=args.artist_unicode,
         audio_filename=Path(args.audio_path).name,
-        hp_drain_rate=args.hp_drain_rate or 5,
+        hp_drain_rate=args.hp_drain_rate,
         circle_size=(args.keycount if args.gamemode == 3 else args.circle_size) or 4,
-        overall_difficulty=args.overall_difficulty or 8,
-        approach_rate=args.approach_rate or 9,
-        slider_multiplier=args.slider_multiplier or 1.4,
-        slider_tick_rate=args.slider_tick_rate or 1,
+        overall_difficulty=args.overall_difficulty,
+        approach_rate=args.approach_rate,
+        slider_multiplier=args.slider_multiplier,
+        slider_tick_rate=args.slider_tick_rate,
         creator=args.creator,
         version=args.version,
-        tags=tags,
+        source=args.source,
+        tags=args.tags,
         background_line=background_line(args.background),
         preview_time=args.preview_time,
         bpm=args.bpm,
         offset=args.offset,
         mode=args.gamemode,
     )
+
+
+def supports_explicit_timing_output(args: InferenceConfig) -> bool:
+    return any(ContextType.TIMING in context_type["out"] for context_type in args.train.data.context_types)
+
+
+def should_generate_timing_context(args: InferenceConfig, output_type: list[ContextType]) -> bool:
+    has_empty_or_none_context = len(args.in_context) == 0 or ContextType.NONE in args.in_context
+    return has_empty_or_none_context and supports_explicit_timing_output(args) and any(
+        context_type in output_type for context_type in [ContextType.TIMING, ContextType.MAP]
+    )
+
+
+def should_load_separate_timing_model(args: InferenceConfig, output_type: list[ContextType] | None = None) -> bool:
+    output_type = args.output_type if output_type is None else output_type
+    needs_generated_timing = (
+        args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context)
+    ) or should_generate_timing_context(args, output_type)
+
+    if not needs_generated_timing:
+        return False
+
+    current_ckpt_path, current_subfolder = resolve_model_checkpoint_path(
+        args.model_path,
+        gamemode=args.gamemode,
+        auto_select_gamemode_model=args.auto_select_gamemode_model,
+    )
+    base_ckpt_path, base_subfolder = resolve_model_checkpoint_path(
+        args.model_path,
+        gamemode=args.gamemode,
+        auto_select_gamemode_model=False,
+    )
+
+    return current_ckpt_path != base_ckpt_path or current_subfolder != base_subfolder
 
 
 def generate(
@@ -329,14 +454,18 @@ def generate(
         beatmap_config: BeatmapConfig,
         model: Mapperatorinator | InferenceClient,
         tokenizer,
+        timing_model: Mapperatorinator | InferenceClient | None = None,
+        timing_tokenizer=None,
         diff_model=None,
         diff_tokenizer=None,
         refine_model=None,
         verbose=True,
+        logger=None,
 ):
     audio_path = args.audio_path if audio_path is None else audio_path
     beatmap_path = args.beatmap_path if beatmap_path is None else beatmap_path
     output_path = args.output_path if output_path is None else output_path
+    logger = get_default_logger() if logger is None else logger.getChild(__name__)
 
     # Do some validation
     if not Path(audio_path).exists() or not Path(audio_path).is_file():
@@ -348,33 +477,38 @@ def generate(
         # Validate beatmap file type
         if beatmap_path_obj.suffix.lower() != '.osu':
             raise ValueError(f"Beatmap file must have .osu extension: {beatmap_path}")
+    if (output_path is None or output_path == "") and (not args.add_to_beatmap or not args.overwrite_reference_beatmap or args.export_osz):
+        raise ValueError("Output path is required.")
 
     preprocessor = Preprocessor(args, parallel=args.parallel)
     processor = Processor(args, model, tokenizer)
-    postprocessor = Postprocessor(args)
+    postprocessor = Postprocessor(args, logger=logger)
 
     audio = preprocessor.load(audio_path)
     sequences = preprocessor.segment(audio)
     extra_in_context = {}
     output_type = args.output_type.copy()
+    timing_model = model if timing_model is None else timing_model
+    timing_tokenizer = tokenizer if timing_tokenizer is None else timing_tokenizer
 
     # Auto generate timing if not provided in in_context and required for the model and this output_type
     timing_events, timing_times, timing = None, None, None
-    if args.super_timing and ContextType.NONE in args.in_context:
-        super_timing_generator = SuperTimingGenerator(args, model, tokenizer)
+    if args.super_timing and (len(args.in_context) == 0 or ContextType.NONE in args.in_context):
+        super_timing_generator = SuperTimingGenerator(args, timing_model, timing_tokenizer)
         timing_events, timing_times = super_timing_generator.generate(audio, generation_config, verbose=verbose)
         timing = postprocessor.generate_timing(timing_events)
         extra_in_context[ContextType.TIMING] = timing
         if ContextType.TIMING in output_type:
             output_type.remove(ContextType.TIMING)
-    elif (ContextType.NONE in args.in_context and ContextType.MAP in output_type and
-          not any((ContextType.NONE in ctx["in"] or len(ctx["in"]) == 0) and ContextType.MAP in ctx["out"] for ctx in args.train.data.context_types)):
-        # Generate timing and convert in_context to timing context
-        timing_events, timing_times = processor.generate(
+    elif should_generate_timing_context(args, output_type):
+        # Generate timing context with the base model and reuse it for the main generation pass.
+        timing_processor = Processor(args, timing_model, timing_tokenizer)
+        timing_events, timing_times = timing_processor.generate(
             sequences=sequences,
             generation_config=generation_config,
             in_context=[ContextType.NONE],
             out_context=[ContextType.TIMING],
+            beatmap_path=beatmap_path,
             verbose=verbose,
         )[0]
         timing_events, timing_times = events_of_type(timing_events, timing_times, TIMING_TYPES)
@@ -399,7 +533,7 @@ def generate(
             verbose=verbose,
         )
 
-        events, event_times = reduce(merge_events, result)
+        events, _ = reduce(merge_events, result)
 
         if timing is None and (ContextType.TIMING in args.output_type or args.train.data.add_timing):
             timing = postprocessor.generate_timing(events)
@@ -409,7 +543,6 @@ def generate(
             events = postprocessor.resnap_events(events, timing)
     else:
         events = timing_events
-        event_times = timing_times if timing_times is not None else []
 
     # Generate positions with diffusion
     if args.generate_positions and args.gamemode in [0, 2] and ContextType.MAP in output_type:
@@ -427,123 +560,90 @@ def generate(
         timing=timing,
     )
 
-    result_path = None
-    osz_path = None
-    
-    # Handle ADOFAI format export
-    if args.format == "adofai":
-        if output_path is not None and output_path != "":
-            # Extract metadata
-            audio_filename = Path(audio_path).name
-            title = args.title or beatmap_config.title or "Generated Song"
-            artist = args.artist or beatmap_config.artist or "Unknown Artist"
-            creator = args.creator or beatmap_config.creator or "Mapperatorinator ADOFAI"
-            
-            if args.stub:
-                # Explicit stub generation
-                from adofai.inference import create_stub_adofai
-                
-                bpm = args.bpm if hasattr(args, 'bpm') else beatmap_config.bpm
-                offset = args.offset if hasattr(args, 'offset') else beatmap_config.offset
-                
-                result_path = create_stub_adofai(
-                    output_path=output_path,
-                    audio_filename=audio_filename,
-                    bpm=bpm,
-                    offset=offset,
-                    title=title,
-                    artist=artist,
-                    creator=creator,
-                )
-                
-                if verbose:
-                    print(f"Generated ADOFAI stub chart saved to {result_path}")
-            else:
-                # Real event-to-ADOFAI conversion (primary path)
-                from adofai.osu_to_adofai import export_osu_to_adofai
-                
-                result_path = export_osu_to_adofai(
-                    events=events,
-                    times=event_times if 'event_times' in locals() else [],
-                    output_path=output_path,
-                    audio_filename=audio_filename,
-                    title=title,
-                    artist=artist,
-                    creator=creator,
-                )
-                
-                if verbose:
-                    print(f"Generated ADOFAI chart saved to {result_path}")
-                    print(f"  Converted from {len(events)} osuT5 events")
-                    print("  Note: Uses osuT5 pretrained model + event-to-ADOFAI conversion")
+    if args.add_to_beatmap:
+        result = postprocessor.add_to_beatmap(result, beatmap_path)
+        if verbose:
+            logger.info(f"Merged generated content with reference beatmap")
+
+    if args.add_to_beatmap and args.overwrite_reference_beatmap:
+        output_osu_path = Path(beatmap_path)
     else:
-        # Original osu! export path
-        if args.add_to_beatmap:
-            result_path = postprocessor.add_to_beatmap(result, beatmap_path)
-            if verbose:
-                print(f"Added generated content to {result_path}")
-        elif output_path is not None and output_path != "":
-            result_path = postprocessor.write_result(result, output_path)
-            if verbose:
-                print(f"Generated beatmap saved to {result_path}")
+        # noinspection PyTypeChecker
+        output_osu_path = Path(output_path) / f"beatmap{str(uuid.uuid4().hex)}.osu"
 
-        if args.export_osz:
-            osz_path = postprocessor.export_osz(result_path, audio_path, output_path)
-            if verbose:
-                print(f"Generated .osz saved to {osz_path}")
-
-    return result, result_path, osz_path
+    if args.export_osz:
+        # noinspection PyTypeChecker
+        result_path = Path(output_path) / f"beatmap{str(uuid.uuid4().hex)}.osz"
+        postprocessor.export_osz(result_path, result, output_osu_path.name, audio_path, args.background)
+        if verbose:
+            logger.info(f"Generated .osz saved to {result_path}")
+    else:
+        result_path = output_osu_path
+        postprocessor.write_result(result_path, result)
+        if verbose:
+            logger.info(f"Generated beatmap saved to {result_path}")
 
 
-def load_model(
-        ckpt_path_str: str,
-        t5_args: TrainConfig,
-        device,
-        max_batch_size: int = 8,
-        use_server: bool = False,
-):
-    if ckpt_path_str == "":
-        raise ValueError("Model path is empty.")
+    return result, result_path
 
-    ckpt_path = Path(ckpt_path_str)
 
-    def tokenizer_loader():
-        if not (ckpt_path / "pytorch_model.bin").exists() or not (ckpt_path / "custom_checkpoint_0.pkl").exists():
-            tokenizer = Tokenizer.from_pretrained(ckpt_path_str)
-        else:
-            tokenizer_state = torch.load(ckpt_path / "custom_checkpoint_0.pkl", pickle_module=routed_pickle, weights_only=False)
-            tokenizer = Tokenizer()
-            tokenizer.load_state_dict(tokenizer_state)
-        return tokenizer
-
-    tokenizer = tokenizer_loader()
-
-    def model_loader():
-        if not (ckpt_path / "pytorch_model.bin").exists() or not (ckpt_path / "custom_checkpoint_0.pkl").exists():
-            model = Mapperatorinator.from_pretrained(ckpt_path_str)
-            model.generation_config.disable_compile = True
-        else:
-            model_state = torch.load(ckpt_path / "pytorch_model.bin", map_location=device, weights_only=True)
-            model = get_model(t5_args, tokenizer)
-            model.load_state_dict(model_state)
-
-        model.eval()
-        model.to(device)
-        print(f"Model loaded: {ckpt_path_str} on device {device}")
-        return model
+def load_model_with_server(ckpt_path: str | Path | None, t5_args: TrainConfig, device, max_batch_size: int = 8,
+                           use_server: bool = False, precision: str = "fp32", attn_implementation: str = "sdpa",
+                           eval_mode: bool = True, lora_path=None, gamemode: int | None = None,
+                           auto_select_gamemode_model: bool = True, fast_decoder_loop: bool = False):
+    model_loader, tokenizer_loader = load_model_loaders(
+        ckpt_path=ckpt_path,
+        t5_args=t5_args,
+        device=device,
+        precision=precision,
+        attn_implementation=attn_implementation,
+        eval_mode=eval_mode,
+        pickle_module=routed_pickle,
+        lora_path=lora_path,
+        gamemode=gamemode,
+        auto_select_gamemode_model=auto_select_gamemode_model,
+    )
 
     return InferenceClient(
         model_loader,
         tokenizer_loader,
         max_batch_size=max_batch_size,
-        socket_path=get_server_address(ckpt_path_str),
-    ) if use_server else model_loader(), tokenizer
+        fast_decoder_loop=fast_decoder_loop,
+        socket_path=get_server_address(
+            ckpt_path,
+            lora_path=lora_path,
+            gamemode=gamemode,
+            auto_select_gamemode_model=auto_select_gamemode_model,
+        ),
+    ) if use_server else model_loader(), tokenizer_loader()
 
 
-def get_server_address(ckpt_path_str: str):
+def get_server_address(
+        ckpt_path_str: str | Path | None,
+        lora_path: str | Path | None = None,
+        gamemode: int | None = None,
+        auto_select_gamemode_model: bool = True,
+):
     """
     Get a valid socket address for the OS and model version.
     """
+    resolved_ckpt_path, subfolder = resolve_model_checkpoint_path(
+        ckpt_path_str,
+        gamemode=gamemode,
+        auto_select_gamemode_model=auto_select_gamemode_model,
+    )
+    ckpt_path_str = "" if not resolved_ckpt_path else (resolved_ckpt_path.as_posix() if isinstance(resolved_ckpt_path, Path) else str(resolved_ckpt_path))
+    if subfolder:
+        ckpt_path_str = f"{ckpt_path_str}/{subfolder}"
+    ckpt_subfolder = get_model_checkpoint_subfolder(resolved_ckpt_path, subfolder)
+    effective_lora_path, _ = resolve_compatible_lora_path(
+        lora_path,
+        ckpt_subfolder=ckpt_subfolder,
+        verbose=False,
+    )
+    if effective_lora_path:
+        effective_lora_str = effective_lora_path.as_posix() if isinstance(effective_lora_path, Path) else str(effective_lora_path)
+        ckpt_path_str = f"{ckpt_path_str}__lora__{effective_lora_str}"
     ckpt_path_str = ckpt_path_str.replace(" ", "_").replace("/", "_").replace("\\", "_").replace(".", "_")
     # Check if the OS supports Unix sockets
     if os.name == 'posix':
@@ -581,11 +681,34 @@ def load_diff_model(
     return model, tokenizer
 
 
-@hydra.main(config_path="configs/inference", config_name="v30", version_base="1.1")
+@hydra.main(config_path="configs/inference", config_name="v32", version_base="1.1")
 def main(args: InferenceConfig):
-    prepare_args(args)
+    args = OmegaConf.to_object(args) if isinstance(args, DictConfig) else args
+    compile_args(args)
+    setup_inference_environment(args.seed)
 
-    model, tokenizer = load_model(args.model_path, args.train, args.device, args.max_batch_size, args.use_server)
+    model, tokenizer = load_model_with_server(args.model_path, args.train, args.device,
+                                              max_batch_size=args.max_batch_size, use_server=args.use_server,
+                                              precision=args.precision, attn_implementation=args.attn_implementation,
+                                              lora_path=args.lora_path, gamemode=args.gamemode,
+                                              auto_select_gamemode_model=args.auto_select_gamemode_model,
+                                              fast_decoder_loop=args.fast_decoder_loop)
+
+    timing_model, timing_tokenizer = None, None
+    if should_load_separate_timing_model(args):
+        print("Using base model for timing generation.")
+        timing_model, timing_tokenizer = load_model_with_server(
+            args.model_path,
+            args.train,
+            args.device,
+            max_batch_size=args.max_batch_size,
+            use_server=args.use_server,
+            precision=args.precision,
+            attn_implementation=args.attn_implementation,
+            gamemode=args.gamemode,
+            auto_select_gamemode_model=False,
+            fast_decoder_loop=args.fast_decoder_loop,
+        )
 
     diff_model, diff_tokenizer, refine_model = None, None, None
     if args.generate_positions:
@@ -597,7 +720,6 @@ def main(args: InferenceConfig):
         if args.compile:
             diff_model.forward = torch.compile(diff_model.forward, mode="reduce-overhead", fullgraph=True)
 
-    get_args_from_beatmap(args, tokenizer)
     generation_config, beatmap_config = get_config(args)
 
     return generate(
@@ -607,6 +729,8 @@ def main(args: InferenceConfig):
         beatmap_config=beatmap_config,
         model=model,
         tokenizer=tokenizer,
+        timing_model=timing_model,
+        timing_tokenizer=timing_tokenizer,
         diff_model=diff_model,
         diff_tokenizer=diff_tokenizer,
         refine_model=refine_model,

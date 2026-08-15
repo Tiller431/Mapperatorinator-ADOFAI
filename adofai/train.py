@@ -23,19 +23,34 @@ class SimpleADOFAIModel(nn.Module):
     
     For production, use the full Whisper-based architecture from osuT5.
     This is just for testing the training pipeline.
+    
+    NOTE: This model expects log-mel spectrogram input [batch, time_frames, n_mels]
+    instead of raw audio waveforms to avoid OOM on long songs.
     """
     
-    def __init__(self, vocab_size: int, hidden_size: int = 256, num_layers: int = 2):
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int = 256,
+        num_layers: int = 2,
+        n_mels: int = 80,
+    ):
         super().__init__()
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
+        self.n_mels = n_mels
         
-        # Simple encoder: takes audio features
+        # Audio encoder: takes spectrogram features [time_frames, n_mels]
+        # Uses a small conv + linear to encode efficiently
         self.audio_encoder = nn.Sequential(
-            nn.Linear(1, 64),
+            nn.Conv1d(n_mels, 128, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Linear(64, hidden_size),
+            nn.Conv1d(128, hidden_size, kernel_size=3, padding=1),
+            nn.ReLU(),
         )
+        
+        # Pooling to reduce time dimension further
+        self.audio_pool = nn.AdaptiveAvgPool1d(32)  # Reduce to fixed 32 frames
         
         # Decoder: LSTM + output head
         self.decoder_embedding = nn.Embedding(vocab_size, hidden_size)
@@ -51,7 +66,7 @@ class SimpleADOFAIModel(nn.Module):
         Forward pass.
         
         Args:
-            audio: [batch, audio_len] audio samples
+            audio: [batch, time_frames, n_mels] log-mel spectrogram
             target_tokens: [batch, seq_len] target token IDs (for teacher forcing)
         
         Returns:
@@ -59,10 +74,18 @@ class SimpleADOFAIModel(nn.Module):
         """
         batch_size = audio.shape[0]
         
-        # Encode audio (simple mean pooling)
-        audio_features = audio.unsqueeze(-1)  # [batch, audio_len, 1]
-        audio_encoded = self.audio_encoder(audio_features)  # [batch, audio_len, hidden]
-        audio_context = audio_encoded.mean(dim=1, keepdim=True)  # [batch, 1, hidden]
+        # Encode audio spectrogram
+        # audio: [batch, time_frames, n_mels]
+        # Conv expects [batch, channels, time], so transpose
+        audio_t = audio.transpose(1, 2)  # [batch, n_mels, time_frames]
+        audio_encoded = self.audio_encoder(audio_t)  # [batch, hidden, time_frames]
+        
+        # Pool to fixed size to keep memory bounded
+        audio_pooled = self.audio_pool(audio_encoded)  # [batch, hidden, 32]
+        
+        # Transpose back and mean pool to single context vector
+        audio_features = audio_pooled.transpose(1, 2)  # [batch, 32, hidden]
+        audio_context = audio_features.mean(dim=1, keepdim=True)  # [batch, 1, hidden]
         
         if target_tokens is not None:
             # Teacher forcing during training
@@ -147,8 +170,8 @@ def main():
                         help='Optional JSON index of charts')
     parser.add_argument('--output_dir', type=str, default='adofai_checkpoints',
                         help='Directory to save checkpoints')
-    parser.add_argument('--batch_size', type=int, default=4,
-                        help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=2,
+                        help='Batch size (default 2 for T4 GPU safety)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate')
     parser.add_argument('--epochs', type=int, default=10,
@@ -178,6 +201,10 @@ def main():
     else:
         hidden_size = 256
         num_layers = 2
+        # Use batch_size=1 for full training on T4 GPU to avoid OOM
+        if args.device == 'cuda' and args.batch_size > 2:
+            print(f"⚠️  Batch size {args.batch_size} may cause OOM on T4 GPU")
+            print("    Recommended: --batch_size 1 or 2 for full training")
     
     # Create output directory
     output_dir = Path(args.output_dir)
@@ -257,8 +284,12 @@ def main():
     print(f"\nNote: This is a smoke test model. For production quality:")
     print("  1. Use full Whisper encoder from osuT5")
     print("  2. Train on full ADOFAI dataset (100+ charts)")
-    print("  3. Use spectrogram features instead of raw audio")
-    print("  4. Integrate with osuT5 training pipeline")
+    print("  3. Integrate with osuT5 training pipeline")
+    print("\nT4 GPU Settings (to avoid OOM):")
+    print("  - Audio capped at 60s (center crop)")
+    print("  - Log-mel spectrogram features (80 mels)")
+    print("  - Batch size 1-2 recommended")
+    print("  - Max sequence length 512 tokens")
 
 
 if __name__ == '__main__':

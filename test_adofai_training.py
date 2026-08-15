@@ -331,6 +331,103 @@ def test_audio_detection_case_insensitive():
         print("✓ Audio detection case-insensitive: PASSED")
 
 
+def test_oom_fix_long_audio():
+    """
+    Test that the OOM fix works: long audio should be processed efficiently
+    without allocating multi-GB tensors.
+    
+    This test verifies:
+    1. Audio is capped at max_duration_sec (60s)
+    2. Spectrogram conversion reduces memory from O(samples) to O(frames)
+    3. Forward+backward pass works on CPU without excessive memory
+    """
+    import tempfile
+    import torch
+    from adofai.dataset import load_audio_file, compute_log_mel_spectrogram
+    from adofai.train import SimpleADOFAIModel
+    from adofai.tokenizer import AdofaiTokenizer
+    
+    print("Testing OOM fix with long audio...")
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        
+        # Create a long audio file (90 seconds at 16kHz = 1.44M samples)
+        # This would cause OOM with per-sample Linear layer
+        audio_path = tmpdir / "long_audio.wav"
+        create_silent_wav(audio_path, duration_sec=90.0, sample_rate=16000)
+        
+        # Load with duration cap (should be cropped to 60s)
+        audio_waveform = load_audio_file(
+            audio_path,
+            sample_rate=16000,
+            max_duration_sec=60.0,
+        )
+        
+        # Verify duration cap worked
+        expected_max_samples = 60 * 16000  # 960k samples
+        assert len(audio_waveform) <= expected_max_samples, \
+            f"Audio not capped: {len(audio_waveform)} > {expected_max_samples}"
+        print(f"  ✓ Audio capped to {len(audio_waveform)} samples (60s at 16kHz)")
+        
+        # Convert to spectrogram (should be compact: [time_frames, n_mels])
+        spectrogram = compute_log_mel_spectrogram(
+            audio_waveform,
+            sample_rate=16000,
+            n_mels=80,
+        )
+        
+        # Verify spectrogram shape is O(frames) not O(samples)
+        # With hop_length=160, 60s @ 16kHz = 960k samples / 160 = 6000 frames
+        assert spectrogram.shape[0] < 10000, \
+            f"Spectrogram too large: {spectrogram.shape}"
+        assert spectrogram.shape[1] == 80, \
+            f"Wrong n_mels: {spectrogram.shape[1]}"
+        print(f"  ✓ Spectrogram shape: {spectrogram.shape} (much smaller than raw audio)")
+        
+        # Test forward+backward pass (should not allocate multi-GB tensors)
+        tokenizer = AdofaiTokenizer()
+        model = SimpleADOFAIModel(
+            vocab_size=tokenizer.vocab_size,
+            hidden_size=64,  # Small for test
+            num_layers=1,
+            n_mels=80,
+        )
+        model.eval()
+        
+        # Create dummy batch
+        batch_size = 1
+        audio_batch = torch.tensor(spectrogram, dtype=torch.float32).unsqueeze(0)  # [1, frames, 80]
+        
+        # Dummy target tokens
+        target_tokens = torch.randint(0, tokenizer.vocab_size, (batch_size, 32), dtype=torch.long)
+        
+        # Forward pass
+        with torch.no_grad():
+            logits = model(audio_batch, target_tokens[:, :-1])
+        
+        assert logits.shape[0] == batch_size
+        assert logits.shape[2] == tokenizer.vocab_size
+        print(f"  ✓ Forward pass succeeded with output shape: {logits.shape}")
+        
+        # Backward pass (test memory during gradient computation)
+        model.train()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        optimizer.zero_grad()
+        
+        logits = model(audio_batch, target_tokens[:, :-1])
+        loss_fn = torch.nn.CrossEntropyLoss()
+        loss = loss_fn(
+            logits.reshape(-1, logits.shape[-1]),
+            target_tokens[:, 1:].reshape(-1)
+        )
+        loss.backward()
+        optimizer.step()
+        
+        print(f"  ✓ Backward pass succeeded (loss: {loss.item():.4f})")
+        print("✓ OOM fix test: PASSED")
+
+
 if __name__ == "__main__":
     print("Running ADOFAI training pipeline tests...\n")
     
@@ -342,5 +439,6 @@ if __name__ == "__main__":
     test_smoke_training()
     test_audio_detection_mismatch()
     test_audio_detection_case_insensitive()
+    test_oom_fix_long_audio()
     
     print("\n✅ All training pipeline tests passed!")

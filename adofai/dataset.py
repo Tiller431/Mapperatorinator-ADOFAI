@@ -25,11 +25,25 @@ from .converter import AdofaiConverter
 from .event import AdofaiEvent
 
 
-def load_audio_file(file: str | Path, sample_rate: int = 16000, normalize: bool = True) -> npt.NDArray:
+def load_audio_file(
+    file: str | Path,
+    sample_rate: int = 16000,
+    normalize: bool = True,
+    max_duration_sec: Optional[float] = 60.0,
+) -> npt.NDArray:
     """
     Load an audio file as a numpy time-series array.
     
     Uses pydub to handle multiple formats and resamples to target sample rate.
+    
+    Args:
+        file: Path to audio file
+        sample_rate: Target sample rate
+        normalize: Whether to normalize amplitude
+        max_duration_sec: Maximum duration in seconds (crops from center if longer)
+    
+    Returns:
+        Audio samples as float32 numpy array
     """
     from pydub import AudioSegment
     
@@ -38,11 +52,90 @@ def load_audio_file(file: str | Path, sample_rate: int = 16000, normalize: bool 
     audio = audio.set_frame_rate(sample_rate)
     audio = audio.set_channels(1)  # Mono
     samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+    
+    # Crop to max duration (center crop for long songs)
+    if max_duration_sec is not None:
+        max_samples = int(max_duration_sec * sample_rate)
+        if len(samples) > max_samples:
+            # Center crop
+            start = (len(samples) - max_samples) // 2
+            samples = samples[start:start + max_samples]
+    
     if normalize:
         max_val = np.max(np.abs(samples))
         if max_val > 0:
             samples *= 1.0 / max_val
     return samples
+
+
+def compute_log_mel_spectrogram(
+    audio: npt.NDArray,
+    sample_rate: int = 16000,
+    n_fft: int = 512,
+    hop_length: int = 160,
+    n_mels: int = 80,
+) -> npt.NDArray:
+    """
+    Compute log-mel spectrogram from audio waveform.
+    
+    This is a compact audio representation suitable for neural network input,
+    reducing memory usage from O(audio_samples) to O(time_frames * n_mels).
+    
+    Args:
+        audio: Audio waveform [samples]
+        sample_rate: Audio sample rate
+        n_fft: FFT window size
+        hop_length: Number of samples between successive frames
+        n_mels: Number of mel filterbanks
+    
+    Returns:
+        Log-mel spectrogram [time_frames, n_mels]
+    """
+    try:
+        import torchaudio.transforms as T
+        import torch
+        
+        # Convert to torch tensor
+        if isinstance(audio, np.ndarray):
+            audio_tensor = torch.from_numpy(audio).float()
+        else:
+            audio_tensor = audio
+        
+        # Ensure 1D
+        if audio_tensor.ndim == 2:
+            audio_tensor = audio_tensor.squeeze(0)
+        
+        # Compute mel spectrogram
+        mel_transform = T.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
+        )
+        mel_spec = mel_transform(audio_tensor)  # [n_mels, time_frames]
+        
+        # Convert to log scale (add small epsilon for numerical stability)
+        log_mel_spec = torch.log(mel_spec + 1e-9)
+        
+        # Transpose to [time_frames, n_mels] for easier processing
+        log_mel_spec = log_mel_spec.transpose(0, 1)
+        
+        return log_mel_spec.numpy()
+        
+    except ImportError:
+        # Fallback: simple mean-pooling (less optimal but works without torchaudio)
+        # Chunk audio into fixed-size frames and compute mean
+        chunk_size = hop_length
+        n_frames = len(audio) // chunk_size
+        
+        # Reshape and average
+        audio_chunked = audio[:n_frames * chunk_size].reshape(n_frames, chunk_size)
+        features = audio_chunked.mean(axis=1, keepdims=True)  # [n_frames, 1]
+        
+        # Expand to n_mels channels by repeating (crude but functional)
+        features = np.tile(features, (1, n_mels))  # [n_frames, n_mels]
+        
+        return features
 
 
 class AdofaiDatasetEntry:
@@ -117,11 +210,19 @@ class AdofaiDatasetEntry:
         """Parse the ADOFAI level."""
         return parse_adofai(self.level_path)
     
-    def load_audio(self, sample_rate: int = 16000) -> Optional[npt.NDArray]:
+    def load_audio(
+        self,
+        sample_rate: int = 16000,
+        max_duration_sec: Optional[float] = 60.0,
+    ) -> Optional[npt.NDArray]:
         """Load audio file."""
         if not self.has_audio():
             return None
-        return load_audio_file(self.audio_file, sample_rate=sample_rate)
+        return load_audio_file(
+            self.audio_file,
+            sample_rate=sample_rate,
+            max_duration_sec=max_duration_sec,
+        )
 
 
 class AdofaiDataset(IterableDataset):
@@ -142,6 +243,8 @@ class AdofaiDataset(IterableDataset):
         sample_rate: int = 16000,
         max_samples: Optional[int] = None,
         skip_invalid: bool = True,
+        max_audio_duration_sec: float = 60.0,
+        use_spectrogram: bool = True,
     ):
         """
         Initialize ADOFAI dataset.
@@ -155,6 +258,8 @@ class AdofaiDataset(IterableDataset):
             sample_rate: Audio sample rate
             max_samples: Maximum number of samples to load (for smoke testing)
             skip_invalid: Skip charts with missing/broken audio
+            max_audio_duration_sec: Max audio duration in seconds (center-cropped if longer)
+            use_spectrogram: Whether to convert audio to log-mel spectrogram (recommended)
         """
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -164,6 +269,8 @@ class AdofaiDataset(IterableDataset):
         self.sample_rate = sample_rate
         self.max_samples = max_samples
         self.skip_invalid = skip_invalid
+        self.max_audio_duration_sec = max_audio_duration_sec
+        self.use_spectrogram = use_spectrogram
         self.converter = AdofaiConverter()
         
         # Load entries
@@ -271,13 +378,20 @@ class AdofaiDataset(IterableDataset):
                 level = entry.load_level()
                 events, event_times = self.converter.level_to_events(level)
                 
-                # Load audio
-                audio = entry.load_audio(self.sample_rate)
+                # Load audio (with duration cap)
+                audio = entry.load_audio(
+                    self.sample_rate,
+                    max_duration_sec=self.max_audio_duration_sec,
+                )
                 if audio is None and not self.skip_invalid:
                     raise ValueError(f"No audio for {entry.chart_name}")
                 
                 if audio is None:
                     continue
+                
+                # Convert to spectrogram if requested
+                if self.use_spectrogram:
+                    audio = compute_log_mel_spectrogram(audio, self.sample_rate)
                 
                 # Create sample
                 sample = {
@@ -288,6 +402,7 @@ class AdofaiDataset(IterableDataset):
                     'event_times': event_times,
                     'bpm': level.settings.get('bpm', 120),
                     'offset': level.settings.get('offset', 0),
+                    'is_spectrogram': self.use_spectrogram,
                 }
                 
                 yield sample
@@ -312,15 +427,29 @@ def collate_adofai_batch(batch):
     workshop_ids = [item['workshop_id'] for item in batch]
     bpms = torch.tensor([item['bpm'] for item in batch], dtype=torch.float32)
     offsets = torch.tensor([item['offset'] for item in batch], dtype=torch.float32)
+    is_spectrogram = batch[0].get('is_spectrogram', False)
     
     # Pad audio to max length in batch
-    max_audio_len = max(len(item['audio']) for item in batch)
-    audio_batch = []
-    for item in batch:
-        audio = item['audio']
-        padded = np.pad(audio, (0, max_audio_len - len(audio)), mode='constant')
-        audio_batch.append(padded)
-    audio_batch = torch.tensor(np.stack(audio_batch), dtype=torch.float32)
+    if is_spectrogram:
+        # Audio is [time_frames, n_mels]
+        max_audio_len = max(item['audio'].shape[0] for item in batch)
+        n_mels = batch[0]['audio'].shape[1]
+        audio_batch = []
+        for item in batch:
+            audio = item['audio']
+            pad_width = ((0, max_audio_len - audio.shape[0]), (0, 0))
+            padded = np.pad(audio, pad_width, mode='constant')
+            audio_batch.append(padded)
+        audio_batch = torch.tensor(np.stack(audio_batch), dtype=torch.float32)
+    else:
+        # Audio is [samples] (raw waveform)
+        max_audio_len = max(len(item['audio']) for item in batch)
+        audio_batch = []
+        for item in batch:
+            audio = item['audio']
+            padded = np.pad(audio, (0, max_audio_len - len(audio)), mode='constant')
+            audio_batch.append(padded)
+        audio_batch = torch.tensor(np.stack(audio_batch), dtype=torch.float32)
     
     # Collect events (keep as list for now, tokenization happens later)
     events_batch = [item['events'] for item in batch]
@@ -334,4 +463,5 @@ def collate_adofai_batch(batch):
         'event_times': event_times_batch,
         'bpm': bpms,
         'offset': offsets,
+        'is_spectrogram': is_spectrogram,
     }

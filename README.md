@@ -19,7 +19,7 @@ This is a fork of [Mapperatorinator](https://github.com/OliBomby/Mapperatorinato
 python osuT5/train.py -cn adofai_v31 data.train_dataset_path=/path/to/adofai-charts
 ```
 
-**Inference/export:** Generation pipeline is implemented but model checkpoints trained on ADOFAI data do not yet exist. The inference path uses the trained Whisper checkpoint to generate ADOFAI events, which are then exported via the `.adofai` converter.
+**Inference/export:** Generation and export are still being wired. The intended local path is `inference.py` with an mp3 (once ADOFAI format support is added), but that integration does not yet exist on PR #2. No trained ADOFAI checkpoint exists either.
 
 **What works today:**
 - `.adofai` file I/O (UTF-8 BOM handling, trailing commas, `pathData`/`angleData`)
@@ -94,7 +94,7 @@ The Web UI wraps `inference.py`.
 
 ### Command-Line Inference (osu!)
 
-Run `inference.py` with [Hydra override syntax](https://hydra.cc/docs/advanced/override_grammar/basic/). See `configs/inference_v29.yaml` for parameters.
+Run `inference.py` with [Hydra override syntax](https://hydra.cc/docs/advanced/override_grammar/basic/). See `configs/inference/default.yaml` for parameters.
 
 ```sh
 python inference.py \
@@ -123,7 +123,7 @@ Guided prompts for osu! beatmap parameters.
 
 ### Generation Tips (osu!)
 
-- Edit `configs/inference_v29.yaml` to set defaults.
+- Edit `configs/inference/default.yaml` to set defaults.
 - Descriptors: [osu! wiki beatmap tags](https://osu.ppy.sh/wiki/en/Beatmap/Beatmap_tags).
 - Always provide `year` (2007–2023) and `difficulty` to avoid inconsistent generation.
 - Increase `cfg_scale` to strengthen `mapper_id` and `descriptors` effects.

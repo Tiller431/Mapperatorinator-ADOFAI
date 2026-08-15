@@ -13,14 +13,15 @@ def adofai_event_ranges() -> list[EventRange]:
 
     Camera/VFX/gameplay bounds are widened from Tiller727/adofai-charts-v1
     (Workshop ``level.adofai``) plus known smoke overflows (zoom 1000,
-    RepeatEvents 48, filter intensity 500). Values are stored as-is; there
-    is no clip-to-old-max (1000 must not become 400).
+    RepeatEvents 48, filter intensity 500, speed mult 1280, bloom -1752,
+    shake 4333, angleOffset -1e8, VFX intensity ±1e6). Values are stored
+    as-is; there is no clip-to-old-max (1000 must not become 400).
     """
     return [
         EventRange(EventType.TILE_ANGLE, 0, 359),
         EventRange(EventType.MIDSPIN, 0, 0),
         EventRange(EventType.SET_SPEED_BPM, 1, 9999),
-        EventRange(EventType.SET_SPEED_MULT, 0, 80),
+        EventRange(EventType.SET_SPEED_MULT, 0, 2047),
         EventRange(EventType.PAUSE, 0, 1024),
         EventRange(EventType.HOLD, 0, 100),
         # Converter emits 1 for present-or-not flags (not 0).
@@ -28,7 +29,7 @@ def adofai_event_ranges() -> list[EventRange]:
         EventRange(EventType.MULTI_PLANET, 2, 10),
         EventRange(EventType.CHECKPOINT, 0, 1),
         EventRange(EventType.AUTO_PLAY_TILES, 0, 1),
-        EventRange(EventType.SET_PLANET_ROTATION, 0, 10),
+        EventRange(EventType.SET_PLANET_ROTATION, 0, 31),
         EventRange(EventType.FREE_ROAM, 0, 1),
         EventRange(EventType.FREE_ROAM_TWIRL, 0, 1),
         EventRange(EventType.FREE_ROAM_REMOVE, 0, 1),
@@ -56,8 +57,8 @@ def adofai_event_ranges() -> list[EventRange]:
         EventRange(EventType.SET_CONDITIONAL_EVENTS, 0, 1),
         EventRange(EventType.SET_INPUT_EVENT, 0, 1),
         EventRange(EventType.FLASH, 0, 4096),
-        EventRange(EventType.BLOOM, 0, 4095),
-        EventRange(EventType.SHAKE_SCREEN, 0, 512),
+        EventRange(EventType.BLOOM, -4096, 4095),
+        EventRange(EventType.SHAKE_SCREEN, 0, 8191),
         EventRange(EventType.SET_FILTER, 0, 50),
         EventRange(EventType.SET_FILTER_ADVANCED, 0, 50),
         EventRange(EventType.FILTER_PROPERTIES, 0, 1),
@@ -78,10 +79,10 @@ def adofai_event_ranges() -> list[EventRange]:
         EventRange(EventType.VFX_OPACITY, 0, 100),
         EventRange(EventType.VFX_ENABLED, 0, 1),
         EventRange(EventType.VFX_DISABLE_OTHERS, 0, 1),
-        EventRange(EventType.VFX_INTENSITY, -10000, 65535),
-        EventRange(EventType.VFX_STRENGTH, 0, 512),
+        EventRange(EventType.VFX_INTENSITY, -1_048_576, 1_048_575),
+        EventRange(EventType.VFX_STRENGTH, 0, 2047),
         EventRange(EventType.VFX_THRESHOLD, 0, 100),
-        EventRange(EventType.ANGLE_OFFSET, -16384, 16383),
+        EventRange(EventType.ANGLE_OFFSET, -134_217_728, 134_217_727),
     ]
 
 
@@ -132,7 +133,11 @@ def encode_event(
     return offset + event.value - er.min_value
 
 
-def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 4096):
+def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 1_048_575):
+    # Converter emits absolute ms. 4096 overflowed real Workshop charts
+    # (first fail 4437; 126-chart max 921354). 2^20-1 plus chunking means
+    # TIME_SHIFT is never dropped. Training Tokenizer still computes its
+    # own windowed range from sequence length.
     ranges = [
         EventRange(EventType.TIME_SHIFT, 0, max_time_shift),
         EventRange(EventType.SNAPPING, 0, 16),
@@ -149,7 +154,35 @@ def _adofai_encode_tables(num_diff_classes: int = 24, max_time_shift: int = 4096
     return event_range, event_start
 
 
+def _encode_time_shift_chunks(
+    value: int,
+    event_range: dict[EventType, EventRange],
+    event_start: dict[EventType, int],
+) -> list[int]:
+    """Encode one TIME_SHIFT, splitting values above the table max (no drop)."""
+    er = event_range[EventType.TIME_SHIFT]
+    value = int(value)
+    if value < er.min_value:
+        raise ValueError(
+            f"event value {value} is not within range "
+            f"[{er.min_value}, {er.max_value}] for event type {EventType.TIME_SHIFT}"
+        )
+    tokens = []
+    while value > er.max_value:
+        tokens.append(encode_event(Event(EventType.TIME_SHIFT, er.max_value), event_range, event_start))
+        value -= er.max_value
+    tokens.append(encode_event(Event(EventType.TIME_SHIFT, value), event_range, event_start))
+    return tokens
+
+
 def encode_adofai_events(events: list[Event], num_diff_classes: int = 24) -> list[int]:
     """Encode a converter event stream with the ADOFAI EventRange tables."""
     event_range, event_start = _adofai_encode_tables(num_diff_classes=num_diff_classes)
-    return [encode_event(event, event_range, event_start) for event in events]
+    tokens: list[int] = []
+    for event in events:
+        event_type = resolve_event_type(event.type, event_range)
+        if event_type == EventType.TIME_SHIFT:
+            tokens.extend(_encode_time_shift_chunks(event.value, event_range, event_start))
+        else:
+            tokens.append(encode_event(event, event_range, event_start))
+    return tokens

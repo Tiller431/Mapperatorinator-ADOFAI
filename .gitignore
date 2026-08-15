@@ -1,5 +1,6 @@
 .venv
 __pycache__
+adofai-dataset/
 logs
 logs_fid
 multirun

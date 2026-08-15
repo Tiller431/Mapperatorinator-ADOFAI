@@ -13,6 +13,16 @@ from pathlib import Path
 from typing import Any
 import dataclasses
 
+try:
+    import json5
+except ImportError:  # pragma: no cover - optional, cleanup is the fallback
+    json5 = None
+
+# Illegal in JSON strings; keep tab/LF/CR. Workshop files sometimes embed these.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+# Unquoted object keys (JSON5). Only after { [ or , so values stay intact.
+_UNQUOTED_KEY = re.compile(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*):')
+
 
 # Legacy pathData character mapping to angles
 PATH_DATA_MAP = {
@@ -50,17 +60,77 @@ class AdofaiLevel:
         }
 
 
+def _escape_raw_breaks_in_strings(content: str) -> str:
+    """Turn raw CR/LF inside quotes into JSON escapes (Workshop levelDesc/author)."""
+    out: list[str] = []
+    in_string = False
+    escape = False
+    quote = ""
+    for ch in content:
+        if in_string:
+            if escape:
+                out.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escape = True
+                continue
+            if ch == quote:
+                out.append(ch)
+                in_string = False
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            out.append(ch)
+            continue
+        if ch in "\"'":
+            in_string = True
+            quote = ch
+        out.append(ch)
+    return "".join(out)
+
+
 def _clean_json_string(content: str) -> str:
+    """Make Workshop .adofai text acceptable to json.loads / json5.loads.
+
+    Real files mix trailing commas, unquoted keys, raw control chars, raw
+    newlines in strings, double commas, and missing commas between values
+    (2346220412__main line 449/450; `]\\n\"decorations\"`).
+    JSON5 covers trailing commas / unquoted keys / comments; the rest needs
+    this cleanup.
     """
-    Clean up non-standard JSON formatting common in .adofai files.
-    
-    Handles:
-    - Trailing commas before closing brackets/braces
-    - Multiple trailing commas
-    """
-    # Remove trailing commas before closing brackets/braces
-    content = re.sub(r',(\s*[}\]])', r'\1', content)
+    content = _CONTROL_CHARS.sub("", content)
+    content = _escape_raw_breaks_in_strings(content)
+    content = _UNQUOTED_KEY.sub(r'\1"\2"\3:', content)
+    # Insert missing commas between adjacent values: `}\n{`, `]\n"key"`
+    content = re.sub(r'([}\]])(\s*)([{\["])', r"\1,\2\3", content)
+    # Double commas: `"difficulty": 1, ,` / `4,,`
+    content = re.sub(r",(\s*),+", r",\1", content)
+    # Trailing commas before } or ]
+    content = re.sub(r",(\s*[}\]])", r"\1", content)
     return content
+
+
+def _loads_adofai_json(content: str) -> Any:
+    """Parse ADOFAI JSON with json, then json5, then the same on cleaned text."""
+    cleaned = _clean_json_string(content)
+    last_error: Exception | None = None
+    for candidate in (content, cleaned):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+        if json5 is not None:
+            try:
+                return json5.loads(candidate)
+            except Exception as exc:  # json5 raises ValueError / JSON5DecodeError
+                last_error = exc
+    raise ValueError(f"Failed to parse ADOFAI file as JSON: {last_error}")
 
 
 def parse_adofai(file_path: str | Path) -> AdofaiLevel:
@@ -68,7 +138,8 @@ def parse_adofai(file_path: str | Path) -> AdofaiLevel:
     Parse an ADOFAI level file.
     
     Supports both angleData (modern) and pathData (legacy) formats.
-    Handles non-standard JSON formatting (trailing commas, UTF-8 BOM, etc.).
+    Handles Workshop JSON quirks: UTF-8 BOM, trailing commas, unquoted keys,
+    missing commas between objects, raw control chars (json5 + cleanup).
     
     Args:
         file_path: Path to .adofai file
@@ -90,14 +161,7 @@ def parse_adofai(file_path: str | Path) -> AdofaiLevel:
     with open(file_path, 'r', encoding='utf-8-sig') as f:
         content = f.read()
     
-    # Clean up non-standard JSON
-    content = _clean_json_string(content)
-    
-    # Parse JSON
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse ADOFAI file as JSON: {e}")
+    data = _loads_adofai_json(content)
     
     # Extract settings (required)
     if "settings" not in data:

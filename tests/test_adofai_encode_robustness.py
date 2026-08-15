@@ -9,14 +9,21 @@ Real Tiller727/adofai-charts-v1 failures on main:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from adofai.converter import AdofaiConverter
-from adofai.parser import AdofaiLevel, parse_adofai
+from adofai.parser import AdofaiLevel, parse_adofai, _clean_json_string
 from osuT5.osuT5.adofai_vocab import encode_adofai_events
 from osuT5.osuT5.event import Event, EventType
+
+
+def _parse_via_json_cleanup(path: Path):
+    """Official no-json5 path: cleanup must be valid for json.loads."""
+    content = path.read_text(encoding="utf-8-sig")
+    return json.loads(_clean_json_string(content))
 
 
 def _write_messy_fixture(tmp_path: Path) -> Path:
@@ -53,6 +60,85 @@ def test_messy_json_fixture_parses(tmp_path):
     assert len(level.actions) == 2
     assert level.actions[0]["eventType"] == "Twirl"
     assert level.actions[1]["floor"] == 1
+
+
+def _write_settings_fixture(tmp_path: Path, name: str, extra_settings: str) -> Path:
+    content = (
+        "{\n"
+        '\t"angleData": [0, 90],\n'
+        '\t"settings": {\n'
+        '\t\t"version": 15,\n'
+        '\t\t"bpm": 120,\n'
+        '\t\toffset: 0,\n'
+        '\t\t"pitch": 100,\n'
+        f"{extra_settings}"
+        "\t},\n"
+        '\t"actions": [],\n'
+        '\t"decorations": []\n'
+        "}\n"
+    )
+    path = tmp_path / name
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def test_artist_links_comma_separated_https_urls_parse(tmp_path):
+    """Workshop artistLinks is one string of comma-joined https URLs.
+
+    Cleanup must not treat `,https:` inside that string as an unquoted key
+    (2723436598 / 2756222522 / 2784257948 / 2985588667 / 3048734750).
+    """
+    path = _write_settings_fixture(
+        tmp_path,
+        "artist_links_https.adofai",
+        '\t\t"artistLinks": "https://youtu.be/cSYO23Yu1po , https://youtu.be/kr61UJ-NTSw",\n',
+    )
+    data = _parse_via_json_cleanup(path)
+    links = data["settings"]["artistLinks"]
+    assert "https://youtu.be/cSYO23Yu1po" in links
+    assert "https://youtu.be/kr61UJ-NTSw" in links
+    assert ':"' not in links
+    assert links.count("https://") == 2
+    level = parse_adofai(path)
+    assert level.settings["artistLinks"] == links
+
+
+def test_artist_links_missing_comma_between_strings_parse(tmp_path):
+    """Adjacent string values in artistLinks with no comma."""
+    path = _write_settings_fixture(
+        tmp_path,
+        "artist_links_adjacent.adofai",
+        '\t\t"artistLinks": ["https://evinak.bandcamp.com/" "https://soundcloud.com/sakura3zuki"],\n',
+    )
+    data = _parse_via_json_cleanup(path)
+    links = data["settings"]["artistLinks"]
+    assert links == [
+        "https://evinak.bandcamp.com/",
+        "https://soundcloud.com/sakura3zuki",
+    ]
+    level = parse_adofai(path)
+    assert level.settings["artistLinks"] == links
+
+
+def test_level_desc_raw_newline_and_tab_in_string_parse(tmp_path):
+    """Raw CR/LF/TAB inside levelDesc (3469661239__main). Python json strict."""
+    desc_body = (
+        "spring map!\r\n"
+        "A collab map with a spring feeling.\t\r\n"
+        "Special Thanks : Pharah"
+    )
+    path = _write_settings_fixture(
+        tmp_path,
+        "level_desc_raw_breaks.adofai",
+        f'\t\t"levelDesc": "{desc_body}",\n',
+    )
+    data = _parse_via_json_cleanup(path)
+    desc = data["settings"]["levelDesc"]
+    assert "spring map!" in desc
+    assert "A collab map with a spring feeling." in desc
+    assert "Special Thanks : Pharah" in desc
+    level = parse_adofai(path)
+    assert "spring map!" in level.settings["levelDesc"]
 
 
 def test_int_none_camera_fields_do_not_raise():
@@ -184,5 +270,26 @@ def test_hub_2118291532_encodes_time_shift_4437():
     time_shifts = [e.value for e in events if e.type == EventType.TIME_SHIFT]
     assert any(v >= 4437 for v in time_shifts)
     assert any(v >= 20082 for v in time_shifts)
+    tokens = encode_adofai_events(events)
+    assert tokens
+
+
+@pytest.mark.parametrize(
+    "chart_dir",
+    [
+        "2723436598__main",
+        "2756222522__main",
+        "2784257948__main",
+        "2985588667__main",
+        "3048734750__main",
+        "3469661239__main",
+    ],
+)
+def test_hub_leftover_parse_adofai_six(chart_dir):
+    """Six leftover official parse_adofai fails after PR #7 (artistLinks / levelDesc)."""
+    path = _hub_level(chart_dir)
+    level = parse_adofai(path)
+    assert level.angle_data
+    events, _ = AdofaiConverter().level_to_events(level)
     tokens = encode_adofai_events(events)
     assert tokens

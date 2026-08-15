@@ -123,6 +123,30 @@ def test_time_shift_20082_encodes():
     assert all(isinstance(t, int) for t in tokens)
 
 
+def test_encode_leftover_126_set_overflows():
+    """Values that failed encode after TIME_SHIFT was unblocked. Stored as-is."""
+    extras = [
+        Event(EventType.SET_SPEED_MULT, 160),
+        Event(EventType.SET_SPEED_MULT, 240),
+        Event(EventType.SET_SPEED_MULT, 1280),
+        Event(EventType.VFX_INTENSITY, 77_777),
+        Event(EventType.VFX_INTENSITY, 1_000_000),
+        Event(EventType.VFX_INTENSITY, -1_000_000),
+        Event(EventType.SHAKE_SCREEN, 800),
+        Event(EventType.SHAKE_SCREEN, 4333),
+        Event(EventType.BLOOM, -1752),
+        Event(EventType.BLOOM, -27),
+        Event(EventType.ANGLE_OFFSET, -114_514),
+        Event(EventType.ANGLE_OFFSET, 17_280),
+        Event(EventType.ANGLE_OFFSET, -100_000_000),
+        Event(EventType.VFX_STRENGTH, 1000),
+        Event(EventType.SET_PLANET_ROTATION, 14),
+    ]
+    tokens = encode_adofai_events(extras)
+    assert len(tokens) == len(extras)
+    assert all(isinstance(t, int) for t in tokens)
+
+
 HUB_CHARTS = Path("/workspace/adofai-dataset/hub-package/charts")
 
 

@@ -13,14 +13,15 @@ def adofai_event_ranges() -> list[EventRange]:
 
     Camera/VFX/gameplay bounds are widened from Tiller727/adofai-charts-v1
     (Workshop ``level.adofai``) plus known smoke overflows (zoom 1000,
-    RepeatEvents 48, filter intensity 500). Values are stored as-is; there
-    is no clip-to-old-max (1000 must not become 400).
+    RepeatEvents 48, filter intensity 500, speed mult 1280, bloom -1752,
+    shake 4333, angleOffset -1e8, VFX intensity ±1e6). Values are stored
+    as-is; there is no clip-to-old-max (1000 must not become 400).
     """
     return [
         EventRange(EventType.TILE_ANGLE, 0, 359),
         EventRange(EventType.MIDSPIN, 0, 0),
         EventRange(EventType.SET_SPEED_BPM, 1, 9999),
-        EventRange(EventType.SET_SPEED_MULT, 0, 80),
+        EventRange(EventType.SET_SPEED_MULT, 0, 2047),
         EventRange(EventType.PAUSE, 0, 1024),
         EventRange(EventType.HOLD, 0, 100),
         # Converter emits 1 for present-or-not flags (not 0).
@@ -28,7 +29,7 @@ def adofai_event_ranges() -> list[EventRange]:
         EventRange(EventType.MULTI_PLANET, 2, 10),
         EventRange(EventType.CHECKPOINT, 0, 1),
         EventRange(EventType.AUTO_PLAY_TILES, 0, 1),
-        EventRange(EventType.SET_PLANET_ROTATION, 0, 10),
+        EventRange(EventType.SET_PLANET_ROTATION, 0, 31),
         EventRange(EventType.FREE_ROAM, 0, 1),
         EventRange(EventType.FREE_ROAM_TWIRL, 0, 1),
         EventRange(EventType.FREE_ROAM_REMOVE, 0, 1),
@@ -56,8 +57,8 @@ def adofai_event_ranges() -> list[EventRange]:
         EventRange(EventType.SET_CONDITIONAL_EVENTS, 0, 1),
         EventRange(EventType.SET_INPUT_EVENT, 0, 1),
         EventRange(EventType.FLASH, 0, 4096),
-        EventRange(EventType.BLOOM, 0, 4095),
-        EventRange(EventType.SHAKE_SCREEN, 0, 512),
+        EventRange(EventType.BLOOM, -4096, 4095),
+        EventRange(EventType.SHAKE_SCREEN, 0, 8191),
         EventRange(EventType.SET_FILTER, 0, 50),
         EventRange(EventType.SET_FILTER_ADVANCED, 0, 50),
         EventRange(EventType.FILTER_PROPERTIES, 0, 1),
@@ -78,10 +79,10 @@ def adofai_event_ranges() -> list[EventRange]:
         EventRange(EventType.VFX_OPACITY, 0, 100),
         EventRange(EventType.VFX_ENABLED, 0, 1),
         EventRange(EventType.VFX_DISABLE_OTHERS, 0, 1),
-        EventRange(EventType.VFX_INTENSITY, -10000, 65535),
-        EventRange(EventType.VFX_STRENGTH, 0, 512),
+        EventRange(EventType.VFX_INTENSITY, -1_048_576, 1_048_575),
+        EventRange(EventType.VFX_STRENGTH, 0, 2047),
         EventRange(EventType.VFX_THRESHOLD, 0, 100),
-        EventRange(EventType.ANGLE_OFFSET, -16384, 16383),
+        EventRange(EventType.ANGLE_OFFSET, -134_217_728, 134_217_727),
     ]
 
 

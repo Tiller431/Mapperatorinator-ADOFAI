@@ -1,5 +1,7 @@
 # RunPod Deployment Guide for Mapperatorinator V30
 
+> **Note:** This is upstream osu! documentation from the original Mapperatorinator. Not applicable to ADOFAI.
+
 ## Quick Deployment Steps
 
 ### 1. Build and Push Docker Image

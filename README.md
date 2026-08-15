@@ -2,17 +2,25 @@
 
 **AI-powered chart generation for A Dance of Fire and Ice (ADOFAI)**
 
-This is a fork of [Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) adapted to generate ADOFAI charts instead of osu! beatmaps. The project uses spectrogram-based neural networks (Whisper-style encoder-decoder) to generate rhythm game charts from audio.
+This is a fork of [Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) adapted to generate ADOFAI charts instead of osu! beatmaps.
 
 ## Project Status
 
-**⚠️ Foundation Phase:** This repository currently provides:
-- ✅ ADOFAI file format I/O (`.adofai` parsing and writing)
-- ✅ Event representation for ADOFAI charts (tiles, speed changes, twirls, holds, etc.)
-- ✅ Export pipeline that can generate valid `.adofai` files
-- ❌ **Model NOT yet trained on ADOFAI data** — pretrained weights are for osu! and will not produce quality ADOFAI charts
+**⚠️ Foundation Phase — Training Pipeline Ready, Model Retraining Needed:**
 
-To generate quality ADOFAI charts, the model must be retrained on a dataset of ADOFAI levels. See [`docs/ADOFAI.md`](docs/ADOFAI.md) for details on dataset requirements and next steps.
+What's working:
+- ✅ ADOFAI file format I/O (`.adofai` parsing and writing with UTF-8 BOM handling)
+- ✅ Event representation for ADOFAI charts (tiles, speed changes, twirls, holds, etc.)
+- ✅ Complete training pipeline (dataset loader, tokenizer, LSTM proof-of-concept model)
+- ✅ Google Colab notebook for cloud training
+- ✅ Memory-optimized for T4 GPU (log-mel spectrograms, 60s audio cap, batch size 2)
+
+What's NOT ready:
+- ❌ **Model NOT trained on ADOFAI data** — current v1 uses simple LSTM for pipeline validation
+- ❌ **Export/inference is stub/placeholder** — will generate basic patterns until model is retrained
+- ❌ **Whisper encoder integration TODO** — upstream Mapperatorinator uses Whisper-style architecture; v1 ADOFAI uses LSTM
+
+To generate quality ADOFAI charts, collect a dataset (100+ Workshop charts recommended) and run training. See [`docs/ADOFAI.md`](docs/ADOFAI.md) for the complete training guide.
 
 ## Credits
 
@@ -101,31 +109,35 @@ This creates synthetic charts and tests dataset loading + tokenization.
 ## ADOFAI Format Support
 
 The `adofai/` module provides:
-- **Parser** (`adofai/parser.py`): Read and write `.adofai` files with trailing-comma tolerance
-- **Event representation** (`adofai/event.py`): Intermediate format for tiles, speed changes, twirls, holds
-- **Converter** (`adofai/converter.py`): Convert between `.adofai` structure and event sequences
-- **Export** (`adofai/inference.py`): Generate `.adofai` files from the pipeline
-- **Dataset** (`adofai/dataset.py`): Load ADOFAI charts from Workshop-style directories
+- **Parser** (`adofai/parser.py`): Read and write `.adofai` files with UTF-8 BOM handling and trailing-comma tolerance
+- **Event representation** (`adofai/event.py`): Intermediate format for tiles, speed changes, twirls, holds (~2021 tokens)
+- **Converter** (`adofai/converter.py`): Convert between `.adofai` structure and event sequences with timing calculations
+- **Export** (`adofai/inference.py`): Generate `.adofai` files (stub/placeholder until model retraining)
+- **Dataset** (`adofai/dataset.py`): Load charts from Workshop folders, convert audio to log-mel spectrograms, robust audio detection
 - **Tokenizer** (`adofai/tokenizer.py`): Convert events to/from tokens for training
-- **Training** (`adofai/train.py`): Train chart generation model on ADOFAI data
+- **Training** (`adofai/train.py`): LSTM proof-of-concept model with memory-safe defaults (batch_size=2, 60s audio cap)
 
 See [`docs/ADOFAI.md`](docs/ADOFAI.md) for detailed format documentation and training guide.
 
-## Web GUI and Command-Line (osu! mode still available)
+## Web GUI and Command-Line
 
-The original Web UI and CLI are preserved for osu! beatmap generation. To use them:
+### ADOFAI Generation (Primary)
+
+See **Training** section below for training your own ADOFAI model. Export/inference is currently stub/placeholder until the model is retrained on ADOFAI data.
+
+### osu! Mode (Original Mapperatorinator)
+
+The original Web UI and CLI are preserved for osu! beatmap generation:
 
 ```sh
 python web-ui.py
 ```
 
-For ADOFAI generation, use `format=adofai` parameter (see Command-Line Inference below).
-
 ## Command-Line Inference
 
 ### ADOFAI Generation
 
-To generate an ADOFAI chart (currently stub/placeholder until model is retrained):
+**Note:** ADOFAI inference currently generates stub/placeholder patterns until the model is retrained on ADOFAI data. See **Training** section below.
 
 ```sh
 python inference.py \
@@ -138,7 +150,7 @@ python inference.py \
   offset=0
 ```
 
-### osu! Generation (Original)
+### osu! Generation (Original Mapperatorinator)
 
 For users who prefer the command line or need access to advanced configurations for osu! beatmaps, follow the steps below.
 
@@ -177,7 +189,8 @@ Example:
 python inference.py beatmap_path="'C:\Users\USER\AppData\Local\osu!\Songs\1 Kenji Ninuma - DISCO PRINCE\Kenji Ninuma - DISCOPRINCE (peppy) [Normal].osu'" gamemode=0 difficulty=5.5 year=2023 descriptors="['jump aim','clean']" in_context=[TIMING,KIAI]
 ```
 
-## Interactive CLI
+## Interactive CLI (osu! — Original Mapperatorinator)
+
 For those who prefer a terminal-based workflow but want a guided setup, the interactive CLI script is an excellent alternative to the Web UI.
 
 ### Launch the CLI
@@ -201,7 +214,9 @@ It provides an advanced multi-select menu for choosing style descriptors using y
 After you've answered all the questions, it will display the final command for your review.
 You can then confirm to execute it directly or cancel and copy the command for manual use.
 
-## Generation Tips
+---
+
+## Generation Tips (osu! — Original Mapperatorinator)
 
 - You can edit `configs/inference_v29.yaml` and add your arguments there instead of typing them in the terminal every time.
 - All available descriptors can be found [here](https://osu.ppy.sh/wiki/en/Beatmap/Beatmap_tags).
@@ -216,7 +231,9 @@ You can then confirm to execute it directly or cancel and copy the command for m
 - To generate hitsounds for a beatmap, use the `beatmap_path` and `in_context=[NO_HS,TIMING,KIAI]` arguments.
 - To generate only timing for a song, use the `super_timing=true` and `output_type=[TIMING]` arguments.
 
-## MaiMod: The AI-driven Modding Tool
+---
+
+## MaiMod: The AI-driven Modding Tool (osu! — Original Mapperatorinator)
 
 MaiMod is a modding tool for osu! beatmaps that uses Mapperatorinator predictions to find potential faults and inconsistencies which can't be detected by other automatic modding tools like [Mapset Verifier](https://github.com/Naxesss/MapsetVerifier).
 It can detect issues like:
@@ -238,9 +255,13 @@ MaiMod also accepts the same arguments as `inference.py`, so you can customize t
 
 MaiMod Web UI coming soon.
 
-## Overview
+---
 
-### Tokenization
+## Overview (osu! — Original Mapperatorinator)
+
+The sections below describe the upstream Mapperatorinator architecture for osu! beatmap generation. ADOFAI v1 uses a simpler LSTM model for proof-of-concept; Whisper encoder integration is planned for future versions.
+
+### Tokenization (osu!)
 
 Mapperatorinator converts osu! beatmaps into an intermediate event representation that can be directly converted to and from tokens.
 It includes hit objects, hitsounds, slider velocities, new combos, timing points, kiai times, and taiko/mania scroll speeds.
@@ -251,8 +272,8 @@ Here is a small examle of the tokenization process:
 
 To save on vocabulary size, time events are quantized to 10ms intervals and position coordinates are quantized to 32 pixel grid points.
 
-### Model architecture
-The model is basically a wrapper around the [HF Transformers Whisper](https://huggingface.co/docs/transformers/en/model_doc/whisper#transformers.WhisperForConditionalGeneration) model, with custom input embeddings and loss function.
+### Model architecture (osu!)
+The upstream Mapperatorinator model is basically a wrapper around the [HF Transformers Whisper](https://huggingface.co/docs/transformers/en/model_doc/whisper#transformers.WhisperForConditionalGeneration) model, with custom input embeddings and loss function.
 Model size amounts to 219M parameters.
 This model was found to be faster and more accurate than T5 for this task.
 
@@ -356,18 +377,23 @@ This trains a tiny model on 5 samples for 2 epochs to verify everything works.
 
 **3. Full Training**
 
-Train on your full dataset:
+Train on your full dataset (T4 GPU-safe defaults):
 ```sh
 python3 -m adofai.train \
   --data_dir path/to/workshop_charts \
   --output_dir adofai_checkpoints \
-  --batch_size 8 \
+  --batch_size 2 \
   --lr 1e-4 \
   --epochs 50 \
   --device cuda  # or cpu/mps
 ```
 
-**Note:** Current training uses a simple LSTM for proof-of-concept. For production quality, integrate with the osuT5 Whisper architecture. See [`docs/ADOFAI.md`](docs/ADOFAI.md) for details.
+**Memory settings (T4 GPU):**
+- Audio: 60s max (center-cropped), converted to log-mel spectrogram (80 mels)
+- Batch size: 2 (default; reduce to 1 if OOM)
+- Architecture: LSTM proof-of-concept (Whisper encoder integration TODO)
+
+See [`docs/ADOFAI.md`](docs/ADOFAI.md) for complete training guide and architecture details.
 
 ---
 
@@ -412,12 +438,14 @@ python osuT5/train.py -cn train_v29 train_dataset_path="/workspace/datasets/cool
 
 ## Credits
 
-Special thanks to:
+This ADOFAI fork is built upon [Mapperatorinator](https://github.com/OliBomby/Mapperatorinator) by OliBomby (~2500 GPU hours across 142 training runs for the osu! model).
+
+Special thanks to the original Mapperatorinator contributors:
 1. The authors of [osuT5](https://github.com/gyataro/osuT5) for their training code.
 2. Hugging Face team for their [tools](https://huggingface.co/docs/transformers/index).
 3. [Jason Won](https://github.com/jaswon) and [Richard Nagyfi](https://github.com/sedthh) for bouncing ideas.
 4. [Marvin](https://github.com/minetoblend) for donating training credits.
-5. The osu! community for the beatmaps.
+5. The osu! community for the beatmaps used in upstream training.
 
 ## Related works
 

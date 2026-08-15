@@ -64,6 +64,7 @@ ADOFAI charts are stored as JSON-like files with the following structure:
 ### Format Quirks
 
 ADOFAI files are *almost* JSON but with quirks:
+- **UTF-8 BOM**: Steam Workshop files often start with a UTF-8 Byte Order Mark. Our parser uses `encoding='utf-8-sig'` to automatically strip it.
 - **Trailing commas** are common and must be tolerated
 - **Legacy pathData**: Older files use `pathData` (string like `"RRULDR!"`) instead of `angleData`
   - Conversion table: `R=0°, U=90°, L=180°, D=270°, !=999 (midspin)`, etc.
@@ -156,18 +157,20 @@ The training pipeline expects charts in Workshop-style folders:
 ### Dataset Needs
 
 1. **ADOFAI charts + audio pairs**:
-   - Collect `.adofai` files with corresponding audio (`.ogg`, `.mp3`, etc.)
+   - Collect `.adofai` files with corresponding audio
+   - Audio formats: `.ogg`, `.mp3`, `.wav`, `.flac`, `.m4a`, `.aac` (case-insensitive detection)
    - Recommended: 100+ charts for initial training, 500+ for quality
    - Cover variety of styles, BPMs, difficulties
    - Sources: ADOFAI Workshop, community chart collections, custom levels
 
-2. **Metadata** (extracted from `level.adofai`):
-   - BPM, offset (from settings)
-   - Tile angles, actions (from angleData/actions)
+2. **Audio detection** (robust):
+   - Checks `songFilename` from `level.adofai` first
+   - Falls back to scanning directory for audio files (case-insensitive)
    - No additional metadata files required
 
 3. **Quality filtering**:
    - Charts must have audio present
+   - UTF-8 BOM is handled automatically
    - Remove broken/corrupted files
    - Ensure charts parse correctly with `adofai.parser`
 
@@ -218,35 +221,40 @@ This will:
 
 ### Running Full Training
 
-For real training on a larger dataset:
+For real training on a larger dataset (T4 GPU-safe defaults):
 
 ```bash
 python3 -m adofai.train \
   --data_dir /path/to/workshop_charts \
   --output_dir adofai_checkpoints \
-  --batch_size 8 \
+  --batch_size 2 \
   --lr 1e-4 \
   --epochs 50 \
   --device cuda  # or cpu/mps
 ```
 
-**Note:** The current training script uses a simple LSTM model for proof-of-concept. For production quality:
-1. Integrate with osuT5 Whisper encoder architecture
-2. Use spectrogram features instead of raw audio
-3. Train on 100+ charts minimum
-4. Expected compute: 100-500 GPU hours depending on dataset size
+**T4 GPU Memory Settings:**
+- Audio: 60s max (center-cropped automatically)
+- Spectrogram: log-mel with 80 mel filterbanks
+- Batch size: 2 (default; reduce to 1 if OOM)
+- Warning printed if batch_size > 2 on CUDA
 
-### Model Retraining
+Expected compute: 100-500 GPU hours depending on dataset size.
+
+### Model Architecture (v1)
 
 The v1 training script (`adofai/train.py`) provides:
-- ✅ Dataset loading from Workshop folders
-- ✅ Event tokenization (vocab size ~2000)
-- ✅ Simple LSTM model for testing
-- ❌ **TODO:** Full Whisper encoder integration (like osuT5)
-- ❌ **TODO:** Spectrogram preprocessing
-- ❌ **TODO:** Advanced training features (checkpointing, distributed, etc.)
+- ✅ Dataset loading from Workshop folders (robust audio detection)
+- ✅ Log-mel spectrogram preprocessing (80 mels, 60s cap)
+- ✅ Event tokenization (vocab size ~2021)
+- ✅ Simple LSTM model for proof-of-concept
+- ✅ Per-epoch checkpointing (`checkpoint_epoch{N}.pt`, `tokenizer.pkl`)
+- ❌ **TODO:** Full Whisper encoder integration (like upstream osuT5)
 
-For full-scale training, integrate with `osuT5/train.py` infrastructure.
+**Current architecture:** LSTM-based encoder-decoder consuming log-mel spectrograms
+**Future architecture:** Whisper-style encoder (like upstream Mapperatorinator for osu!)
+
+For full-scale production training, integrate with `osuT5/train.py` infrastructure and Whisper encoder.
 
 ## Evaluation Ideas
 
@@ -261,19 +269,22 @@ Manual playtesting is essential — ADOFAI is very sensitive to timing precision
 
 ## Current Limitations (v1)
 
-- ❌ Model not trained on ADOFAI data (stub generation only)
+- ❌ Model NOT trained on ADOFAI data (export/inference is stub/placeholder only)
+- ❌ LSTM proof-of-concept (Whisper encoder integration TODO)
 - ❌ No camera events (MoveCamera, MoveTrack)
 - ❌ No VFX events (Flash, Bloom, ShakeScreen)
 - ❌ No decorations
 - ❌ No multi-file level support (separate audio/image files)
-- ✅ Basic playable mechanics (tiles, speed, twirl, hold)
+- ✅ Training pipeline complete (dataset, tokenizer, model, checkpoints)
+- ✅ Memory-optimized for T4 GPU (log-mel spectrograms, 60s audio cap)
+- ✅ Basic playable mechanics ready for training (tiles, speed, twirl, hold)
 
 ## Next Steps
 
-1. **Collect ADOFAI dataset** — gather charts + audio
-2. **Implement data loader** — adapt osuT5 dataset code for ADOFAI
-3. **Retrain model** — fine-tune or train from scratch on ADOFAI data
-4. **Evaluate** — playtest and iterate
+1. **Collect ADOFAI dataset** — gather 100+ Workshop charts + audio ✅ (you can start now)
+2. **Run training** — use Colab notebook or local GPU ✅ (pipeline ready)
+3. **Integrate Whisper encoder** — adapt from upstream osuT5 (future work)
+4. **Evaluate** — playtest generated charts and iterate
 5. **Extend to v2** — add camera, VFX, decorations
 
 ## References

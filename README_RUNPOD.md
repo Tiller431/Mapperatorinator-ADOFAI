@@ -1,5 +1,7 @@
 # RunPod Serverless Handler for Mapperatorinator V30
 
+> **Note:** This is upstream osu! documentation from the original Mapperatorinator. Not applicable to ADOFAI.
+
 This handler provides a serverless endpoint for generating osu! beatmaps using the Mapperatorinator V30 model.
 
 ## Features

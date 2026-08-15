@@ -4,13 +4,13 @@ import pickle
 from pathlib import Path
 from typing import Union, Optional
 
+from huggingface_hub import list_repo_files
 import numpy as np
-import pandas as pd
 from pandas import DataFrame
 from tqdm import tqdm
 from transformers.utils import PushToHubMixin, cached_file
 
-from .dataset.data_utils import load_mmrs_metadata, filter_mmrs_metadata
+from .dataset.data_utils import load_mmrs_metadata, filter_mmrs_metadata, filter_web_beatmaps
 from .event import Event, EventType, EventRange, ContextType
 from .config import TrainConfig
 
@@ -105,7 +105,7 @@ class Tokenizer(PushToHubMixin):
 
             if args.model.do_style_embed or args.data.add_style_token:
                 self._init_beatmap_idx(args)
-                self.num_classes = args.data.num_classes
+                self.num_classes = max(args.data.num_classes, len(self.beatmap_idx))
                 if args.data.add_style_token:
                     self.input_event_ranges.append(EventRange(EventType.STYLE, 0, self.num_classes))
 
@@ -157,6 +157,10 @@ class Tokenizer(PushToHubMixin):
                     y_count = y_max - y_min + 1
                     self.event_ranges.append(EventRange(EventType.POS, 0, x_count * y_count - 1))
 
+                    if args.data.position_refinement:
+                        ref_count = p // args.data.position_refinement
+                        self.event_ranges.append(EventRange(EventType.POS_REFINE, 0, ref_count * ref_count - 1))
+
             if 3 in args.data.gamemodes:
                 if args.data.add_keycount_token:
                     self.input_event_ranges.append(EventRange(EventType.MANIA_KEYCOUNT, 1, 18))
@@ -164,13 +168,98 @@ class Tokenizer(PushToHubMixin):
                     self.input_event_ranges.append(EventRange(EventType.HOLD_NOTE_RATIO, -1, 12))
                 self.event_ranges.append(EventRange(EventType.MANIA_COLUMN, 0, 17))
 
-            if 1 in args.data.gamemodes or 3 in args.data.gamemodes:
+            if 1 in args.data.gamemodes or 3 in args.data.gamemodes or args.data.add_sv:
                 if args.data.add_scroll_speed_ratio_token:
                     self.input_event_ranges.append(EventRange(EventType.SCROLL_SPEED_RATIO, -1, 12))
                 self.event_ranges.append(EventRange(EventType.SCROLL_SPEED, 0, 1000))
 
             if args.data.add_global_sv_token:
                 self.input_event_ranges.append(EventRange(EventType.GLOBAL_SV, 40, 360))
+            
+            # ADOFAI-specific event ranges
+            if args.data.dataset_type == "adofai":
+                # Tile angles (0-359) and midspin
+                self.event_ranges.append(EventRange(EventType.TILE_ANGLE, 0, 359))
+                self.event_ranges.append(EventRange(EventType.MIDSPIN, 0, 0))
+                
+                # Speed/timing events
+                self.event_ranges.append(EventRange(EventType.SET_SPEED_BPM, 40, 300))  # BPM range
+                self.event_ranges.append(EventRange(EventType.SET_SPEED_MULT, 10, 50))  # 0.1 to 5.0 in 0.1 steps
+                self.event_ranges.append(EventRange(EventType.PAUSE, 0, 100))  # Duration in 0.1 beat steps
+                self.event_ranges.append(EventRange(EventType.HOLD, 0, 100))
+                
+                # Gameplay modifiers
+                self.event_ranges.append(EventRange(EventType.TWIRL, 0, 0))
+                self.event_ranges.append(EventRange(EventType.MULTI_PLANET, 2, 10))
+                self.event_ranges.append(EventRange(EventType.CHECKPOINT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.AUTO_PLAY_TILES, 0, 1))
+                self.event_ranges.append(EventRange(EventType.SET_PLANET_ROTATION, 0, 10))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM, 0, 0))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM_TWIRL, 0, 0))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM_REMOVE, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SCALE_MARGIN, 0, 200))
+                self.event_ranges.append(EventRange(EventType.SCALE_RADIUS, 0, 200))
+                self.event_ranges.append(EventRange(EventType.MULTITAP, 1, 10))
+                self.event_ranges.append(EventRange(EventType.HIDE, 0, 1))
+                self.event_ranges.append(EventRange(EventType.KILL_PLAYER, 0, 0))
+                
+                # Track events
+                self.event_ranges.append(EventRange(EventType.POSITION_TRACK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.MOVE_TRACK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.COLOR_TRACK, 0, 10))
+                self.event_ranges.append(EventRange(EventType.ANIMATE_TRACK, 0, 10))
+                self.event_ranges.append(EventRange(EventType.MOVE_CAMERA, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CAMERA_POSITION_X, -200, 200))
+                self.event_ranges.append(EventRange(EventType.CAMERA_POSITION_Y, -200, 200))
+                self.event_ranges.append(EventRange(EventType.CAMERA_ROTATION, 0, 359))
+                self.event_ranges.append(EventRange(EventType.CAMERA_ZOOM, 0, 400))
+                self.event_ranges.append(EventRange(EventType.CAMERA_DURATION, 0, 100))
+                self.event_ranges.append(EventRange(EventType.CAMERA_EASE, 0, 40))
+                self.event_ranges.append(EventRange(EventType.CAMERA_RELATIVE, 0, 4))
+                
+                # Audio events
+                self.event_ranges.append(EventRange(EventType.SET_HITSOUND, 0, 10))
+                self.event_ranges.append(EventRange(EventType.PLAY_SOUND, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SET_HOLD_SOUND, 0, 10))
+                
+                # Control flow
+                self.event_ranges.append(EventRange(EventType.REPEAT_EVENTS, 1, 20))
+                self.event_ranges.append(EventRange(EventType.SET_CONDITIONAL_EVENTS, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SET_INPUT_EVENT, 0, 0))
+                
+                # VFX events
+                self.event_ranges.append(EventRange(EventType.FLASH, 0, 100))  # Duration in 0.1 beat steps
+                self.event_ranges.append(EventRange(EventType.BLOOM, 0, 200))  # Intensity 0-200
+                self.event_ranges.append(EventRange(EventType.SHAKE_SCREEN, 0, 200))  # Intensity
+                self.event_ranges.append(EventRange(EventType.SET_FILTER, 0, 50))
+                self.event_ranges.append(EventRange(EventType.SET_FILTER_ADVANCED, 0, 50))
+                self.event_ranges.append(EventRange(EventType.FILTER_PROPERTIES, 0, 1))
+                self.event_ranges.append(EventRange(EventType.BOOKMARK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.EDITOR_COMMENT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CALL_METHOD, 0, 0))
+                self.event_ranges.append(EventRange(EventType.ADD_COMPONENT, 0, 0))
+                self.event_ranges.append(EventRange(EventType.CHANGE_TRACK, 0, 0))
+                self.event_ranges.append(EventRange(EventType.FREE_ROAM_WARNING, 0, 0))
+                self.event_ranges.append(EventRange(EventType.PAUSE_COUNTDOWN, 0, 20))
+                self.event_ranges.append(EventRange(EventType.PAUSE_ANGLE_DIR, 0, 2))
+                self.event_ranges.append(EventRange(EventType.HOLD_DISTANCE, 0, 400))
+                self.event_ranges.append(EventRange(EventType.HOLD_LANDING, 0, 1))
+                self.event_ranges.append(EventRange(EventType.TRACK_START_TILE, 0, 519))
+                self.event_ranges.append(EventRange(EventType.TRACK_END_TILE, 0, 519))
+                self.event_ranges.append(EventRange(EventType.VFX_PLANE, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_COLOR, 0, 4095))
+                self.event_ranges.append(EventRange(EventType.VFX_OPACITY, 0, 100))
+                self.event_ranges.append(EventRange(EventType.VFX_ENABLED, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_DISABLE_OTHERS, 0, 1))
+                self.event_ranges.append(EventRange(EventType.VFX_INTENSITY, 0, 200))
+                self.event_ranges.append(EventRange(EventType.VFX_STRENGTH, 0, 200))
+                self.event_ranges.append(EventRange(EventType.VFX_THRESHOLD, 0, 100))
+                self.event_ranges.append(EventRange(EventType.ANGLE_OFFSET, -180, 180))
+                
+                # Metadata (prefix tokens)
+                self.input_event_ranges.append(EventRange(EventType.BPM, 40, 300))
+                self.input_event_ranges.append(EventRange(EventType.OFFSET, -1000, 1000))
+                self.input_event_ranges.append(EventRange(EventType.PITCH, 50, 200))
 
         self.event_ranges: list[EventRange] = self.event_ranges + [
             EventRange(EventType.NEW_COMBO, 0, 0),
@@ -198,16 +287,26 @@ class Tokenizer(PushToHubMixin):
             if args.data.add_kiai_special_token or args.data.add_kiai or any(ContextType.KIAI in c["out"] for c in args.data.context_types):
                 self.event_ranges.append(EventRange(EventType.KIAI, 0, 1))
 
+            if args.data.sustain_interval:
+                self.event_ranges.append(EventRange(EventType.SLIDER_SUSTAIN, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SLIDER_REPEAT_SUSTAIN, 0, 0))
+                self.event_ranges.append(EventRange(EventType.SPINNER_SUSTAIN, 0, 0))
+
             if 3 in args.data.gamemodes:
                 self.event_ranges.append(EventRange(EventType.HOLD_NOTE, 0, 0))
                 self.event_ranges.append(EventRange(EventType.HOLD_NOTE_END, 0, 0))
                 self.event_ranges.append(EventRange(EventType.SCROLL_SPEED_CHANGE, 0, 0))
+                if args.data.sustain_interval:
+                    self.event_ranges.append(EventRange(EventType.HOLD_NOTE_SUSTAIN, 0, 0))
 
             if 1 in args.data.gamemodes:
                 self.event_ranges.append(EventRange(EventType.DRUMROLL, 0, 0))
                 self.event_ranges.append(EventRange(EventType.DRUMROLL_END, 0, 0))
                 self.event_ranges.append(EventRange(EventType.DENDEN, 0, 0))
                 self.event_ranges.append(EventRange(EventType.DENDEN_END, 0, 0))
+                if args.data.sustain_interval:
+                    self.event_ranges.append(EventRange(EventType.DRUMROLL_SUSTAIN, 0, 0))
+                    self.event_ranges.append(EventRange(EventType.DENDEN_SUSTAIN, 0, 0))
 
         self.event_range: dict[EventType, EventRange] = {er.type: er for er in self.event_ranges} | {er.type: er for er in self.input_event_ranges}
 
@@ -463,9 +562,11 @@ class Tokenizer(PushToHubMixin):
             self._init_beatmap_idx_ors(args)
         elif args.data.dataset_type == "mmrs":
             self._init_beatmap_idx_mmrs(args)
+        elif args.data.dataset_type == "web":
+            self._init_beatmap_idx_web(args)
 
     def _init_beatmap_idx_ors(self, args: TrainConfig) -> None:
-        if args is None or "train_dataset_path" not in args.data:
+        if args is None or not getattr(args.data, "train_dataset_path", None):
             return
 
         path = Path(args.data.train_dataset_path)
@@ -494,12 +595,44 @@ class Tokenizer(PushToHubMixin):
     def _init_beatmap_idx_mmrs(self, args: TrainConfig) -> None:
         self.beatmap_idx = self.metadata.reset_index().set_index(["Id"])["BeatmapIdx"].to_dict()
 
+    def _init_beatmap_idx_web(self, args: TrainConfig) -> None:
+        from datasets import load_dataset
+        repo_id = args.data.train_dataset_path
+        dataset_start = args.data.train_dataset_start
+        dataset_end = args.data.train_dataset_end
+        all_files = [f for f in list_repo_files(repo_id, repo_type="dataset") if f.startswith("compressed/")]
+        all_files.sort()
+        files_split = all_files[dataset_start:dataset_end]
+
+        beatmap_idx = {}
+        dataset = load_dataset(repo_id, data_files=files_split, streaming=True, split="train")
+        for row in tqdm(dataset, desc="Caching web beatmap index"):
+            beatmaps = filter_web_beatmaps(
+                (row.get("json") or {}).get("beatmaps") or [],
+                gamemodes=args.data.gamemodes,
+                ranked_statuses=args.data.ranked_statuses,
+                min_year=args.data.min_year,
+                max_year=args.data.max_year,
+                min_difficulty=args.data.min_difficulty,
+                max_difficulty=args.data.max_difficulty,
+            )
+            for beatmap in beatmaps:
+                beatmap_id = beatmap.get("beatmap_id")
+                if beatmap_id is None:
+                    continue
+                beatmap_id = int(beatmap_id)
+                if beatmap_id not in beatmap_idx:
+                    beatmap_idx[beatmap_id] = len(beatmap_idx)
+
+        self.beatmap_idx = beatmap_idx
+
     def _get_metadata(self, args: TrainConfig) -> DataFrame:
         return filter_mmrs_metadata(
             load_mmrs_metadata(args.data.train_dataset_path),
             start=args.data.train_dataset_start,
             end=args.data.train_dataset_end,
             gamemodes=args.data.gamemodes,
+            ranked_statuses=args.data.ranked_statuses,
             min_year=args.data.min_year,
             max_year=args.data.max_year,
             min_difficulty=args.data.min_difficulty,
@@ -508,13 +641,13 @@ class Tokenizer(PushToHubMixin):
 
     def _init_mapper_idx(self, args):
         """Indexes beatmap mappers and mapper idx."""
-        if args.data.dataset_type == "ors":
-            self._init_mapper_idx_ors(args)
+        if args.data.dataset_type in ["ors", "web"]:
+            self._init_mapper_idx_local(args)
         elif args.data.dataset_type == "mmrs":
             self._init_mapper_idx_mmrs(args)
 
-    def _init_mapper_idx_ors(self, args):
-        if args is None or "mappers_path" not in args.data:
+    def _init_mapper_idx_local(self, args):
+        if args is None or not getattr(args.data, "mappers_path", None):
             raise ValueError("mappers_path not found in args")
 
         path = Path(args.data.mappers_path)
@@ -527,8 +660,8 @@ class Tokenizer(PushToHubMixin):
             data = json.load(file)
 
         # Populate beatmap_mapper
-        for item in data:
-            self.beatmap_mapper[item['id']] = item['user_id']
+        for beatmap_id in data:
+            self.beatmap_mapper[int(beatmap_id)] = data[beatmap_id]
 
         # Get unique user_ids from beatmap_mapper values
         unique_user_ids = list(set(self.beatmap_mapper.values()))
@@ -549,13 +682,15 @@ class Tokenizer(PushToHubMixin):
 
     def _init_descriptor_idx(self, args):
         """"Indexes beatmap descriptors and descriptor idx."""
-        if args.data.dataset_type == "ors":
-            self._init_descriptor_idx_ors(args)
+        if args.data.descriptor_source == "local" or args.data.dataset_type == "ors":
+            self._init_descriptor_idx_local(args)
+        elif args.data.descriptor_source == "web":
+            self._init_descriptor_idx_web(args)
         elif args.data.dataset_type == "mmrs":
             self._init_descriptor_idx_mmrs(args)
 
-    def _init_descriptor_idx_ors(self, args):
-        if args is None or "descriptors_path" not in args.data:
+    def _init_descriptor_idx_local(self, args):
+        if args is None or not getattr(args.data, "descriptors_path", None):
             raise ValueError("descriptors_path not found in args")
 
         path = Path(args.data.descriptors_path)
@@ -586,16 +721,69 @@ class Tokenizer(PushToHubMixin):
         self.num_descriptor_classes = len(self.descriptor_idx)
 
     def _init_descriptor_idx_mmrs(self, args):
-        # Populate descriptor_idx
-        descriptors = self.metadata["OmdbTags"].explode().dropna().unique()
-        for descriptor_name in descriptors:
-            self.descriptor_idx[descriptor_name] = len(self.descriptor_idx)
+        if args.data.descriptor_source == "omdb":
+            # Populate descriptor_idx
+            descriptors = self.metadata["OmdbTags"].explode().dropna().unique()
+            for descriptor_name in descriptors:
+                self.descriptor_idx[descriptor_name] = len(self.descriptor_idx)
 
-        # Populate beatmap_descriptors
-        self.beatmap_descriptors = (self.metadata.reset_index().set_index(["Id"])["OmdbTags"]
-                                    .apply(lambda x: None if np.count_nonzero(x) == 0 else [self.descriptor_idx[y] for y in x]).dropna().to_dict())
+            # Populate beatmap_descriptors
+            self.beatmap_descriptors = (self.metadata.reset_index().set_index(["Id"])["OmdbTags"]
+                                        .apply(lambda x: None if np.count_nonzero(x) == 0 else [self.descriptor_idx[y] for y in x]).dropna().to_dict())
 
-        self.num_descriptor_classes = len(self.descriptor_idx)
+            self.num_descriptor_classes = len(self.descriptor_idx)
+        elif args.data.descriptor_source == "user_tags":
+            def filter_tags(row):
+                # Zip the two lists together and keep pairs where count >= 2
+                filtered_pairs = [(t, c) for t, c in zip(row['TopTagIds'], row['TopTagCounts']) if c >= args.data.min_top_tag_count]
+
+                # If no tags remain, return None (to make dropping rows easy)
+                if not filtered_pairs:
+                    return None
+
+                # Unzip the pairs back into two separate lists
+                # noinspection PyArgumentList
+                ids, _ = zip(*filtered_pairs)
+                return list(ids)
+
+            self._init_user_tag_idx(args)
+            self.beatmap_descriptors = (self.metadata.reset_index().set_index(["Id"])[["TopTagIds", "TopTagCounts"]]
+                                        .apply(filter_tags, axis=1).dropna().to_dict())
+        else:
+            raise ValueError(f"descriptor_source {args.data.descriptor_source} not supported")
+
+    def _init_descriptor_idx_web(self, args):
+        from datasets import load_dataset
+        self._init_user_tag_idx(args)
+
+        tags_ds = load_dataset(args.data.descriptors_path, split="train")
+        df = tags_ds.to_pandas()
+        id_col = df.columns[0]
+        df_long = df.melt(id_vars=[id_col], var_name='tag', value_name='votes')
+        df_filtered = df_long[df_long['votes'] >= args.data.min_top_tag_count].copy()
+        df_filtered.sort_values(by=[id_col, 'votes'], ascending=[True, False], inplace=True)
+        df_filtered["tag"] = (
+            df_filtered["tag"]
+            .map(self.descriptor_idx)  # tag name -> id
+            .fillna(self.num_descriptor_classes)  # unknown tag fallback
+            .astype(int)
+        )
+        tags_series = df_filtered.groupby(id_col)['tag'].apply(list)
+        self.beatmap_descriptors = tags_series.to_dict()
+
+    def _init_user_tag_idx(self, args):
+        path = Path(args.data.tags_metadata_path)
+
+        if not path.exists():
+            raise ValueError(f"tags_metadata_path {path} not found")
+
+        # The tags metadata file is a JSON file with the following format:
+        #  { "tags": [ { "id": tag_idx, "name": tag_name }, ... ] }
+        with open(path, 'r', encoding="utf-8") as file:
+            data = json.load(file)
+        tags = data["tags"]
+        self.descriptor_idx = {tag["name"]: tag["id"] for tag in tags}
+        self.num_descriptor_classes = max(self.descriptor_idx.values()) + 1
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """Save the tokenizer to the given directory as a JSON file."""
@@ -612,6 +800,7 @@ class Tokenizer(PushToHubMixin):
             local_files_only: bool = False,
             token: Optional[Union[str, bool]] = None,
             revision: str = "main",
+            subfolder: Optional[str] = None,
             **kwargs,
     ):
         user_agent = {"file_type": "tokenizer", "from_auto_class": False, "is_fast": False}
@@ -622,14 +811,16 @@ class Tokenizer(PushToHubMixin):
             pretrained_model_name_or_path,
             "tokenizer.json",
             cache_dir=cache_dir,
+            subfolder=subfolder,
             token=token,
             revision=revision,
             local_files_only=local_files_only,
             user_agent=user_agent,
-            _raise_exceptions_for_gated_repo=False,
-            _raise_exceptions_for_missing_entries=False,
-            _raise_exceptions_for_connection_errors=False,
         )
+
+        if resolved_config_file is None:
+            expected_tokenizer_path = f"{pretrained_model_name_or_path}/{subfolder}" if subfolder else pretrained_model_name_or_path
+            raise FileNotFoundError(f"Could not find tokenizer.json in '{expected_tokenizer_path}'")
 
         with open(resolved_config_file, encoding="utf-8") as reader:
             tokenizer_config = json.load(reader)

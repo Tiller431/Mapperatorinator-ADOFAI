@@ -27,6 +27,7 @@ class ModelConfig:
     name: str = "openai/whisper-base"  # Model name
     config_base: str = ""  # Model base for config lookup
     input_features: bool = True
+    input_raw_wave: bool = False
     project_encoder_input: bool = True
     embed_decoder_input: bool = True
     manual_norm_weights: bool = False
@@ -39,6 +40,13 @@ class ModelConfig:
     rope_type: str = "dynamic"  # RoPE type (dynamic/static)
     rope_encoder_scaling_factor: float = 1.0
     rope_decoder_scaling_factor: float = 1.0
+    rope_scaling: dict = field(default_factory=lambda: { "factor": 1.0, "rope_type": "default" })
+    deterministic_flash_attn: bool = False
+    attention_bias: bool = False
+    global_attn_every_n_layers: int = 1
+    local_attention: int = 128
+    local_rope_theta: int = 10000
+    global_rope_theta: int = 10000
     spectrogram: SpectrogramConfig = field(default_factory=SpectrogramConfig)
     overwrite: dict = field(default_factory=lambda: {})  # Overwrite model config
     add_config: dict = field(default_factory=lambda: {})  # Add to model config
@@ -46,7 +54,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    dataset_type: str = "mmrs"   # Dataset type (ors/mmrs)
+    dataset_type: str = "mmrs"   # Dataset type (ors/mmrs/adofai/web)
     train_dataset_path: str = "/workspace/datasets/MMRS39389"  # Training dataset directory
     train_dataset_start: int = 0  # Training dataset start index
     train_dataset_end: int = 38689  # Training dataset end index
@@ -129,6 +137,8 @@ class DataConfig:
     dt_augment_prob: float = 0.5  # Probability of augmenting the dataset with DT
     dt_augment_range: list[float] = field(default_factory=lambda: [1.25, 1.5])  # Range of DT augmentation
     dt_augment_sqrt: bool = False  # Sample DT augmentation from a square root distribution
+    flip_horizontal_prob: float = 0.0  # Probability of horizontally flipping beatmap positions during training
+    flip_vertical_prob: float = 0.0  # Probability of vertically flipping beatmap positions during training
     types_first: bool = True  # Put the type token at the start of the group before the timeshift token
     add_kiai: bool = True  # Add kiai times to map context
     gamemodes: list[int] = field(default_factory=lambda: [0, 1, 2, 3])  # List of gamemodes to include in the dataset
@@ -140,6 +150,24 @@ class DataConfig:
     frame_offset_augment_prob: float = 1.0  # Probability of augmenting beatmap sequences with frame offset
     normalize_audio: bool = True  # Normalize audio data
     slider_version: int = 1  # Slider version to use (1 or 2)
+    snapping_random_prob: float = 0.0  # Probability of randomizing hit object snapping in the dataset
+    sustain_interval: Optional[int] = None
+    position_refinement: Optional[int] = None
+    descriptor_source: str = 'omdb'
+    min_top_tag_count: int = 2
+    tags_metadata_path: str = ''
+    ranked_statuses: list[int] = field(default_factory=lambda: [1, 2])
+    dataset_subset: Optional[str] = None
+    train_dataset_streaming: bool = True  # Use streaming mode for training dataset
+    test_dataset_streaming: bool = False  # Use streaming mode for testing/validation dataset
+    # ADOFAI lossless augmentation (continuous uniform, independent; not locked grids)
+    adofai_rotate_prob: float = 1.0
+    adofai_reflect_prob: float = 0.5
+    adofai_pitch_prob: float = 0.5
+    adofai_pitch_range: list[float] = field(default_factory=lambda: [80.0, 120.0])
+    adofai_rate_prob: float = 0.5
+    adofai_rate_range: list[float] = field(default_factory=lambda: [0.85, 1.25])
+    adofai_default_difficulty: float = 5.0  # Proxy when settings.difficulty and index JSON are missing (1–10 scale)
 
 
 @dataclass
@@ -147,6 +175,8 @@ class DataloaderConfig:
     num_workers: int = 8
     pin_memory: bool = True
     drop_last: bool = False
+    balancer_buffer_size: int = 0
+    balancer_prefetch_factor: float = 0.5
 
 
 @dataclass
@@ -174,6 +204,9 @@ class EvalConfig:
 @dataclass
 class CheckpointConfig:
     every_steps: int = 5000
+    local_total_limit: int = 2
+    cleanup_wandb_cache_before_save: bool = True
+    wandb_cache_cleanup_size: str = "1GB"
 
 
 @dataclass
@@ -183,6 +216,7 @@ class LoggingConfig:
     grad_l2: bool = True
     weights_l2: bool = True
     mode: str = 'online'
+    run_name: Optional[str] = None  # Custom run name for the wandb tracker
 
 
 @dataclass
@@ -196,15 +230,25 @@ class ProfileConfig:
 
 
 @dataclass
+class LoraMetadataConfig:
+    ckpt_subfolders: Optional[list[str]] = None  # Compatible checkpoint subfolders, e.g. ["gamemode=0"] or ["", "gamemode=0"]. None means unrestricted.
+
+
+@dataclass
 class TrainConfig:
     compile: bool = True
     device: str = "gpu"
-    precision: str = "bf16"
+    mixed_precision: Optional[str] = "bf16"
+    precision: Optional[str] = None
+    attn_implementation: str = "sdpa"
     seed: int = 42
-    flash_attention: bool = False
     checkpoint_path: str = ""
     pretrained_path: str = ""
+    pretrained_gamemode: Optional[int] = None
     pretrained_t5_compat: bool = False
+    enable_lora: bool = False
+    lora: dict = field(default_factory=lambda: {})
+    lora_metadata: LoraMetadataConfig = field(default_factory=LoraMetadataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     data: DataConfig = field(default_factory=DataConfig)
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)

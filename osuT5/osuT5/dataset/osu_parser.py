@@ -29,14 +29,22 @@ class OsuParser:
         self.mania_bpm_normalized_scroll_speed = args.data.mania_bpm_normalized_scroll_speed
         self.position_precision = args.data.position_precision
         self.position_split_axes = args.data.position_split_axes
+        self.position_refinement = args.data.position_refinement
         self.x_min, self.x_max, self.y_min, self.y_max = args.data.position_range
         if self.add_distances:
             dist_range = tokenizer.event_range[EventType.DISTANCE]
             self.dist_min = dist_range.min_value
             self.dist_max = dist_range.max_value
         self.slider_version = args.data.slider_version
+        self.sustain_interval = args.data.sustain_interval
 
-    def parse(self, beatmap: Beatmap, speed: float = 1.0, song_length: Optional[float] = None) -> tuple[list[Event], list[int]]:
+    def parse(
+            self,
+            beatmap: Beatmap,
+            speed: float = 1.0,
+            song_length: Optional[float] = None,
+            flip: tuple[bool, bool] = (False, False),
+    ) -> tuple[list[Event], list[int]]:
         # noinspection PyUnresolvedReferences
         """Parse an .osu beatmap.
 
@@ -47,6 +55,7 @@ class OsuParser:
             beatmap: Beatmap object parsed from an .osu file.
             speed: Speed multiplier for the beatmap.
             song_length: Length of the song in milliseconds. If not provided, it will be calculated from the beatmap.
+            flip: Horizontal and vertical flip to apply to position coordinates.
 
         Returns:
             events: List of Event object lists.
@@ -76,22 +85,23 @@ class OsuParser:
 
         for hit_object in hit_objects:
             if isinstance(hit_object, Circle):
-                last_pos = self._parse_circle(hit_object, events, event_times, last_pos, beatmap)
+                last_pos = self._parse_circle(hit_object, events, event_times, last_pos, beatmap, flip)
             elif isinstance(hit_object, Slider):
                 if beatmap.mode == 1:
                     self._parse_drumroll(hit_object, events, event_times, beatmap)
                 else:
-                    last_pos = self._parse_slider(hit_object, events, event_times, last_pos, beatmap)
+                    last_pos = self._parse_slider(hit_object, events, event_times, last_pos, beatmap, flip)
             elif isinstance(hit_object, Spinner):
                 if beatmap.mode == 1:
                     self._parse_denden(hit_object, events, event_times, beatmap)
                 else:
                     last_pos = self._parse_spinner(hit_object, events, event_times, beatmap)
             elif isinstance(hit_object, HoldNote):
-                last_pos = self._parse_hold_note(hit_object, events, event_times, beatmap)
+                last_pos = self._parse_hold_note(hit_object, events, event_times, beatmap, flip)
 
         # Sort events by time
         if len(events) > 0:
+            # noinspection PyArgumentList
             events, event_times = zip(*sorted(zip(events, event_times), key=lambda x: x[1]))
         result = list(events), list(event_times)
 
@@ -131,7 +141,7 @@ class OsuParser:
             if i == len(beatmap.timing_points) - 1 or beatmap.timing_points[i + 1].offset > tp.offset:
                 normalized_scroll_speed = scroll_speed * median_mpb / mpb if normalized else scroll_speed
 
-                if normalized_scroll_speed != last_normalized_scroll_speed or last_normalized_scroll_speed == -1:
+                if abs(normalized_scroll_speed - last_normalized_scroll_speed) > 1e-3 or last_normalized_scroll_speed == -1:
                     self._add_group(
                         EventType.SCROLL_SPEED_CHANGE,
                         tp.offset,
@@ -279,12 +289,15 @@ class OsuParser:
         if not self.add_hitsounds:
             return
 
+        def valid_addition(i: int) -> bool:
+            return len(addition_split) > i and addition_split[i] and addition_split[i] != '0'
+
         tp = self.hitsound_point_at(time, beatmap)
         tp_sample_set = tp.sample_type if tp.sample_type != 0 else 2  # Inherit to soft sample set
         addition_split = addition.split(":")
-        sample_set = int(addition_split[0]) if addition_split[0] != "0" else tp_sample_set
-        addition_set = int(addition_split[1]) if addition_split[1] != "0" else sample_set
-        volume = int(addition_split[3]) if len(addition_split) > 3 and addition_split[3] != "0" else tp.volume
+        sample_set = int(addition_split[0]) if valid_addition(0) else tp_sample_set
+        addition_set = int(addition_split[1]) if valid_addition(1) else sample_set
+        volume = int(addition_split[3]) if valid_addition(3) else tp.volume
 
         sample_set = sample_set if 0 < sample_set < 4 else 1  # Overflow default to normal sample set
         addition_set = addition_set if 0 < addition_set < 4 else 1  # Overflow default to normal sample set
@@ -298,7 +311,7 @@ class OsuParser:
         event_times.append(group_time)
         event_times.append(group_time)
 
-    def _clip_dist(self, dist: int) -> int:
+    def _clip_dist(self, dist) -> int:
         """Clip distance to valid range."""
         return int(np.clip(dist, self.dist_min, self.dist_max))
 
@@ -329,6 +342,12 @@ class OsuParser:
                                     ))
                 event_times.append(time_ms)
 
+                if self.position_refinement:
+                    refinement_range = self.position_precision // self.position_refinement
+                    p_ref = np.clip((pos % self.position_precision) // self.position_refinement, 0, refinement_range - 1)
+                    events.append(Event(EventType.POS_REFINE, int(p_ref[0] + p_ref[1] * refinement_range)))
+                    event_times.append(time_ms)
+
         return pos
 
     def _add_mania_column_event(self, pos: npt.NDArray, columns: int, time: timedelta, events: list[Event], event_times: list[int]) -> None:
@@ -336,6 +355,18 @@ class OsuParser:
         column = int(np.clip(pos[0] / 512 * columns, 0, columns - 1))
         events.append(Event(EventType.MANIA_COLUMN, column))
         event_times.append(time_ms)
+
+    def _flip_pos(self, pos: npt.NDArray, flip: tuple[bool, bool]) -> npt.NDArray:
+        horizontal, vertical = flip
+        if not horizontal and not vertical:
+            return pos
+
+        pos = np.array(pos, copy=True)
+        if horizontal:
+            pos[0] = 512 - pos[0]
+        if vertical:
+            pos[1] = 384 - pos[1]
+        return pos
 
     def _add_group(
             self,
@@ -346,7 +377,7 @@ class OsuParser:
             beatmap: Beatmap,
             *,
             time_event: bool = False,
-            add_snap=True,
+            add_snap: bool=True,
             pos: npt.NDArray = None,
             last_pos: npt.NDArray = None,
             new_combo: bool = False,
@@ -354,6 +385,7 @@ class OsuParser:
             hitsounds: list[int] = None,
             additions: list[str] = None,
             scroll_speed: Optional[float] = None,
+            flip: tuple[bool, bool] = (False, False),
     ) -> npt.NDArray:
         """Add a group of events to the event list."""
         time_ms = int(time.total_seconds() * 1000 + 1e-5) if time is not None else None
@@ -367,6 +399,7 @@ class OsuParser:
         if time_event:
             self._add_time_event(time, beatmap, events, event_times, add_snap)
         if pos is not None:
+            pos = self._flip_pos(pos, flip)
             if beatmap.mode in [0, 2]:
                 last_pos = self._add_position_event(pos, last_pos, time, events, event_times)
             elif beatmap.mode == 3:
@@ -386,7 +419,23 @@ class OsuParser:
 
         return last_pos
 
-    def _parse_circle(self, circle: Circle, events: list[Event], event_times: list[int], last_pos: npt.NDArray, beatmap: Beatmap) -> npt.NDArray:
+    def _add_sustain_groups(self, start_time: timedelta, end_time: timedelta, add_group_kwargs):
+        if not self.sustain_interval:
+            return
+
+        # Adds sustain groups every sustain_interval after start_time until end_time
+        interval = timedelta(milliseconds=self.sustain_interval)
+        time = start_time + interval
+        while time < end_time - timedelta(milliseconds=10):
+            self._add_group(
+                time=time,
+                time_event=True,
+                add_snap=False,
+                **add_group_kwargs,
+            )
+            time += interval
+
+    def _parse_circle(self, circle: Circle, events: list[Event], event_times: list[int], last_pos: npt.NDArray, beatmap: Beatmap, flip: tuple[bool, bool]) -> npt.NDArray:
         """Parse a circle hit object.
 
         Args:
@@ -411,9 +460,10 @@ class OsuParser:
             hitsounds=[circle.hitsound],
             additions=[circle.addition],
             scroll_speed=self.scroll_speed_at(circle.time, beatmap) if beatmap.mode == 1 else None,
+            flip=flip,
         )
 
-    def _parse_slider(self, slider: Slider, events: list[Event], event_times: list[int], last_pos: npt.NDArray, beatmap: Beatmap) -> npt.NDArray:
+    def _parse_slider(self, slider: Slider, events: list[Event], event_times: list[int], last_pos: npt.NDArray, beatmap: Beatmap, flip: tuple[bool, bool]) -> npt.NDArray:
         """Parse a slider hit object.
 
         Args:
@@ -442,6 +492,7 @@ class OsuParser:
             hitsounds=[slider.edge_sounds[0] if len(slider.edge_sounds) > 0 else 0],
             additions=[slider.edge_additions[0] if len(slider.edge_additions) > 0 else '0:0'],
             scroll_speed=self.scroll_speed_at(slider.time, beatmap) if self.add_sv else None,
+            flip=flip,
         )
 
         duration: timedelta = (slider.end_time - slider.time) / slider.repeat
@@ -462,6 +513,7 @@ class OsuParser:
                 beatmap,
                 pos=np.array(slider.curve.points[i]),
                 last_pos=last_pos,
+                flip=flip,
             )
 
         if isinstance(slider.curve, Linear):
@@ -487,6 +539,18 @@ class OsuParser:
                 beatmap,
                 pos=np.array(slider.curve.points[-1]),
                 last_pos=last_pos,
+                flip=flip,
+            )
+
+            self._add_sustain_groups(
+                slider.time,
+                slider.time + duration,
+                dict(
+                    event=EventType.SLIDER_SUSTAIN,
+                    events=events,
+                    event_times=event_times,
+                    beatmap=beatmap,
+                )
             )
 
         # Add body hitsounds and remaining edge hitsounds
@@ -502,6 +566,18 @@ class OsuParser:
             hitsound_ref_times=[slider.time + timedelta(milliseconds=1)] + [slider.time + i * duration for i in range(1, slider.repeat)],
             hitsounds=[slider.hitsound] + [slider.edge_sounds[i] if len(slider.edge_sounds) > i else 0 for i in range(1, slider.repeat)],
             additions=[slider.addition] + [slider.edge_additions[i] if len(slider.edge_additions) > i else '0:0' for i in range(1, slider.repeat)],
+            flip=flip,
+        )
+
+        self._add_sustain_groups(
+            slider.time + duration,
+            slider.end_time,
+            dict(
+                event=EventType.SLIDER_REPEAT_SUSTAIN,
+                events=events,
+                event_times=event_times,
+                beatmap=beatmap,
+            )
         )
 
         return self._add_group(
@@ -516,6 +592,7 @@ class OsuParser:
             hitsound_ref_times=[slider.end_time],
             hitsounds=[slider.edge_sounds[-1] if len(slider.edge_sounds) > 0 else 0],
             additions=[slider.edge_additions[-1] if len(slider.edge_additions) > 0 else '0:0'],
+            flip=flip,
         )
 
     def _parse_spinner(self, spinner: Spinner, events: list[Event], event_times: list[int], beatmap: Beatmap) -> npt.NDArray:
@@ -537,6 +614,17 @@ class OsuParser:
             time_event=True,
         )
 
+        self._add_sustain_groups(
+            spinner.time,
+            spinner.end_time,
+            dict(
+                event=EventType.SPINNER_SUSTAIN,
+                events=events,
+                event_times=event_times,
+                beatmap=beatmap,
+            )
+        )
+
         self._add_group(
             EventType.SPINNER_END,
             spinner.end_time,
@@ -551,7 +639,7 @@ class OsuParser:
 
         return np.array((256, 192))
 
-    def _parse_hold_note(self, hold_note: HoldNote, events: list[Event], event_times: list[int], beatmap: Beatmap) -> npt.NDArray:
+    def _parse_hold_note(self, hold_note: HoldNote, events: list[Event], event_times: list[int], beatmap: Beatmap, flip: tuple[bool, bool]) -> npt.NDArray:
         """Parse a hold note hit object.
 
         Args:
@@ -574,6 +662,20 @@ class OsuParser:
             hitsound_ref_times=[hold_note.time],
             hitsounds=[hold_note.hitsound],
             additions=[hold_note.addition],
+            flip=flip,
+        )
+
+        self._add_sustain_groups(
+            hold_note.time,
+            hold_note.end_time,
+            dict(
+                event=EventType.HOLD_NOTE_SUSTAIN,
+                events=events,
+                event_times=event_times,
+                beatmap=beatmap,
+                pos=pos,
+                flip=flip,
+            )
         )
 
         self._add_group(
@@ -584,6 +686,7 @@ class OsuParser:
             beatmap,
             time_event=True,
             pos=pos,
+            flip=flip,
         )
 
         return pos
@@ -606,6 +709,17 @@ class OsuParser:
             hitsounds=[slider.hitsound],  # Edge hitsounds are not supported in drumrolls
             additions=[slider.addition],
             scroll_speed=self.scroll_speed_at(slider.time, beatmap),
+        )
+
+        self._add_sustain_groups(
+            slider.time,
+            slider.end_time,
+            dict(
+                event=EventType.DRUMROLL_SUSTAIN,
+                events=events,
+                event_times=event_times,
+                beatmap=beatmap,
+            )
         )
 
         self._add_group(
@@ -635,6 +749,17 @@ class OsuParser:
             hitsounds=[spinner.hitsound],
             additions=[spinner.addition],
             scroll_speed=self.scroll_speed_at(spinner.time, beatmap),
+        )
+
+        self._add_sustain_groups(
+            spinner.time,
+            spinner.end_time,
+            dict(
+                event=EventType.DENDEN_SUSTAIN,
+                events=events,
+                event_times=event_times,
+                beatmap=beatmap,
+            )
         )
 
         self._add_group(

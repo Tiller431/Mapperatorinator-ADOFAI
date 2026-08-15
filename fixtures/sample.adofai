@@ -1,0 +1,50 @@
+{
+    "settings": {
+        "version": 14,
+        "artist": "Test Artist",
+        "song": "Test Song",
+        "author": "Test Author",
+        "separateCountdownTime": true,
+        "previewSongStart": 0,
+        "previewSongDuration": 10,
+        "seizureWarning": false,
+        "levelDesc": "A minimal test ADOFAI level",
+        "levelTags": "test",
+        "artistPermission": "",
+        "songFilename": "test.ogg",
+        "bpm": 120,
+        "volume": 100,
+        "offset": 0,
+        "pitch": 100,
+        "hitsound": "Kick",
+        "hitsoundVolume": 100
+    },
+    "angleData": [0, 0, 90, 90, 180, 270, 0, 45, 999, 90],
+    "actions": [
+        {
+            "floor": 1,
+            "eventType": "SetSpeed",
+            "speedType": "Bpm",
+            "beatsPerMinute": 120,
+            "bpmMultiplier": 1
+        },
+        {
+            "floor": 3,
+            "eventType": "Twirl"
+        },
+        {
+            "floor": 5,
+            "eventType": "SetSpeed",
+            "speedType": "Multiplier",
+            "beatsPerMinute": 120,
+            "bpmMultiplier": 1.5
+        },
+        {
+            "floor": 7,
+            "eventType": "Hold",
+            "duration": 2,
+            "distanceMultiplier": 100
+        }
+    ],
+    "decorations": []
+}

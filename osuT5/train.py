@@ -27,6 +27,7 @@ from osuT5.utils import (
     bind_cuda_device_from_local_rank,
     configure_nccl_for_pcie_multigpu,
     ddp_reducer_named_parameters,
+    resolve_mixed_precision,
     sync_registered_modules,
 )
 
@@ -77,10 +78,16 @@ def main(args: TrainConfig):
     shared = get_shared_training_state()
     bind_cuda_device_from_local_rank()
 
+    # accelerate launch defaults --mixed_precision to 'no' (launch.py
+    # _validate_launch_command) and sets ACCELERATE_MIXED_PRECISION. Honor
+    # adofai_v31 mixed_precision: bf16 instead of that default.
+    mixed_precision = resolve_mixed_precision(args)
+    print(f"mixed_precision={mixed_precision} (train config; not accelerate launch default 'no')")
+
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         cpu=args.device == "cpu",
-        mixed_precision=args.mixed_precision,
+        mixed_precision=mixed_precision,
         gradient_accumulation_steps=args.optim.grad_acc,
         log_with=args.logging.log_with,
         project_config=ProjectConfiguration(

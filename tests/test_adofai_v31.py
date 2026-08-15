@@ -225,6 +225,107 @@ class TestLosslessAugmentation:
         assert actions[0] == {"floor": 0, "eventType": "Twirl"}
         assert actions[1]["angleOffset"] == 15
 
+    @pytest.mark.parametrize(
+        "position",
+        [
+            [None, None],
+            [None, 1],
+            [1, None],
+            None,
+        ],
+    )
+    def test_rotation_leaves_non_numeric_position_and_keeps_action(self, position):
+        """Optional/partial camera positions must not raise or drop the event."""
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
+        actions = [{
+            "floor": 3,
+            "eventType": "MoveCamera",
+            "position": position,
+            "rotation": 15,
+        }]
+        rotated_angles, rotated_actions = apply_rotation([0, 90], actions, 90.0)
+        assert rotated_angles == [90, 180]
+        assert len(rotated_actions) == 1
+        cam = rotated_actions[0]
+        assert cam["eventType"] == "MoveCamera"
+        assert cam["floor"] == 3
+        assert cam["position"] == position
+        assert abs(cam["rotation"] - 105) < 1e-6
+
+    def test_rotation_missing_position_key_does_not_raise(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
+        actions = [{"floor": 2, "eventType": "PositionTrack", "duration": 1.0}]
+        rotated_angles, rotated_actions = apply_rotation([45], actions, 90.0)
+        assert rotated_angles == [135]
+        assert len(rotated_actions) == 1
+        assert rotated_actions[0]["eventType"] == "PositionTrack"
+        assert rotated_actions[0]["floor"] == 2
+        assert "position" not in rotated_actions[0]
+
+    def test_rotation_numeric_xy_still_rotates_and_keeps_action(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
+        actions = [{
+            "floor": 1,
+            "eventType": "MoveCamera",
+            "position": [10.0, 0.0],
+        }]
+        _, rotated_actions = apply_rotation([0], actions, 90.0)
+        assert len(rotated_actions) == 1
+        assert rotated_actions[0]["eventType"] == "MoveCamera"
+        assert abs(rotated_actions[0]["position"][0] - 0.0) < 1e-6
+        assert abs(rotated_actions[0]["position"][1] - 10.0) < 1e-6
+
+    @pytest.mark.parametrize(
+        "position_offset",
+        [
+            [None, None],
+            [None, 1],
+            [1, None],
+        ],
+    )
+    def test_rotation_leaves_partial_positionOffset(self, position_offset):
+        from osuT5.osuT5.dataset.adofai_augment import apply_rotation
+
+        actions = [{"eventType": "MoveTrack", "positionOffset": position_offset}]
+        _, rotated_actions = apply_rotation([0], actions, 90.0)
+        assert len(rotated_actions) == 1
+        assert rotated_actions[0]["eventType"] == "MoveTrack"
+        assert rotated_actions[0]["positionOffset"] == position_offset
+
+    @pytest.mark.parametrize(
+        "position",
+        [
+            [None, None],
+            [None, 1],
+        ],
+    )
+    def test_reflection_leaves_non_numeric_position_and_keeps_action(self, position):
+        from osuT5.osuT5.dataset.adofai_augment import apply_reflection
+
+        actions = [{
+            "floor": 4,
+            "eventType": "MoveCamera",
+            "position": position,
+            "rotation": 30,
+        }]
+        reflected_angles, reflected_actions = apply_reflection([40], actions, "x_flip")
+        assert reflected_angles == [320]
+        cam = next(a for a in reflected_actions if a.get("eventType") == "MoveCamera")
+        assert cam["floor"] == 4
+        assert cam["position"] == position
+
+    def test_reflection_missing_position_key_does_not_raise(self):
+        from osuT5.osuT5.dataset.adofai_augment import apply_reflection
+
+        actions = [{"floor": 5, "eventType": "AnimateTrack"}]
+        _, reflected_actions = apply_reflection([10], actions, "y_flip")
+        cam = next(a for a in reflected_actions if a.get("eventType") == "AnimateTrack")
+        assert cam["floor"] == 5
+        assert "position" not in cam
+
     def test_matched_rate_scales_bpm_not_multipliers_or_beats(self):
         from osuT5.osuT5.dataset.adofai_augment import apply_matched_rate
 

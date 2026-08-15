@@ -1,8 +1,16 @@
 """
-Training script for ADOFAI chart generation model.
+DEPRECATED STUB: SimpleADOFAIModel LSTM training path.
 
-This is a minimal training loop for proof-of-concept. For full-scale training,
-integrate with the osuT5 training infrastructure.
+This file is kept for reference only and should NOT be used for production training.
+
+Production training path: python osuT5/train.py -cn adofai_v31
+    - Uses Whisper encoder-decoder (Tiger14n/ropewhisper-small)
+    - Full event vocabulary (SetSpeed, Twirl, camera, VFX, difficulty)
+    - Lossless augmentation (rotate, reflect, pitch, rate)
+    - v31 config: muon optimizer, bf16, 65536 steps
+    - See configs/train/adofai_v31.yaml
+
+This SimpleADOFAIModel is an LSTM stub and does NOT match the v31 architecture.
 """
 
 import argparse

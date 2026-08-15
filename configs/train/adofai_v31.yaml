@@ -51,7 +51,7 @@ data:                  # Data settings
   max_diff: 20                 # Max difficulty value
   
   # ---
-  timing_random_offset: 2
+  timing_random_offset: 0  # ADOFAI: no timing jitter (forbidden augmentation)
   src_seq_len: 4096            # v31: longer context (32.8s @ 16kHz, hop 128)
   tgt_seq_len: 8192            # v31: longer target
   rhythm_weight: 1.0           # v31/v29: Weight of rhythm tokens in loss

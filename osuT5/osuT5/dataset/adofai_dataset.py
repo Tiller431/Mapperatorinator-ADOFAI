@@ -15,6 +15,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torchaudio
 from torch.utils.data import IterableDataset
 
 from .data_utils import load_audio_file
@@ -154,27 +155,69 @@ class AdofaiDataset(IterableDataset):
             chart_dirs = chart_dirs[self.start:]
         
         print(f"Found {len(chart_dirs)} ADOFAI charts in {self.path}")
-        if self.apply_rotation:
-            print(f"With {len(self.rotation_angles)}x rotation augmentation = {len(chart_dirs) * len(self.rotation_angles)} variants")
+        print(f"Continuous uniform augmentation enabled (independent transforms)")
         
         return chart_dirs
     
     def _apply_rotation(
         self,
         angle_data: list[int],
+        actions: list[dict],
         rotate_deg: float
-    ) -> list[int]:
+    ) -> tuple[list[int], list[dict]]:
         """
-        Apply rotation to RAW angleData.
+        Apply rotation to RAW angleData AND camera/track world positions + rotations.
         
         Args:
             angle_data: Original angleData (0-359 or 999)
+            actions: Original actions
             rotate_deg: Rotation degrees (continuous, sampled from Uniform[0, 360))
             
         Returns:
-            Rotated angleData
+            Tuple of (rotated_angleData, rotated_actions)
         """
-        return [(int(a + rotate_deg) % 360) if a != 999 else 999 for a in angle_data]
+        # Rotate tile angles
+        rotated_angles = [(int(a + rotate_deg) % 360) if a != 999 else 999 for a in angle_data]
+        
+        # Rotate camera/track world positions and rotations
+        # angleOffset is NOT rotated (it's a floor-relative offset)
+        rotated_actions = []
+        for action in actions:
+            act = action.copy()
+            event_type = act.get('eventType', '')
+            
+            # For camera and track moves, rotate world positions and rotations
+            if event_type in ('MoveCamera', 'PositionTrack', 'AnimateTrack'):
+                # Rotate position vector (x, y) by rotate_deg
+                pos = act.get('position', [0, 0])
+                if len(pos) == 2:
+                    x, y = pos[0], pos[1]
+                    rad = rotate_deg * (3.14159265359 / 180.0)
+                    cos_r = np.cos(rad)
+                    sin_r = np.sin(rad)
+                    new_x = x * cos_r - y * sin_r
+                    new_y = x * sin_r + y * cos_r
+                    act['position'] = [new_x, new_y]
+                
+                # Rotate rotation field
+                if 'rotation' in act:
+                    act['rotation'] = (act['rotation'] + rotate_deg) % 360
+            
+            elif event_type == 'MoveTrack':
+                # MoveTrack uses positionOffset, not position
+                pos_offset = act.get('positionOffset', [0, 0])
+                if len(pos_offset) == 2:
+                    x, y = pos_offset[0], pos_offset[1]
+                    rad = rotate_deg * (3.14159265359 / 180.0)
+                    cos_r = np.cos(rad)
+                    sin_r = np.sin(rad)
+                    new_x = x * cos_r - y * sin_r
+                    new_y = x * sin_r + y * cos_r
+                    act['positionOffset'] = [new_x, new_y]
+            
+            rotated_actions.append(act)
+        
+        return rotated_angles, rotated_actions
     
     def _apply_reflection(
         self,
@@ -325,7 +368,7 @@ class AdofaiDataset(IterableDataset):
                 # 1. Rotation: with p_rotate, sample R ~ Uniform[0, 360)
                 if random.random() < self.p_rotate:
                     rotate_deg = random.uniform(0, 360)
-                    aug_angles = self._apply_rotation(aug_angles, rotate_deg)
+                    aug_angles, aug_actions = self._apply_rotation(aug_angles, aug_actions, rotate_deg)
                     transform_desc.append(f'R={rotate_deg:.1f}°')
                 
                 # 2. Reflection: with p_reflect, pick one axis
@@ -361,9 +404,48 @@ class AdofaiDataset(IterableDataset):
                 # Convert to Events
                 events, event_times = self.parser.converter.level_to_events(aug_level)
                 
-                # TODO: Apply audio transforms (pitch-shift, rate)
-                # For now, use original audio
+                # Apply audio transforms
                 aug_audio = audio
+                sample_rate = self.args.sample_rate if hasattr(self.args, 'sample_rate') else 16000
+                
+                # Apply pitch shift (same duration)
+                if aug_settings.get('pitch', 100) != 100:
+                    pitch_shift_factor = aug_settings['pitch'] / 100.0  # 80-120 → 0.8-1.2
+                    # Pitch shift using resampling: shift pitch without changing duration
+                    # This is "same-duration pitch" as required
+                    n_steps = 12 * np.log2(pitch_shift_factor)  # Convert to semitones
+                    effects = [
+                        ["pitch", str(int(n_steps * 100))],  # Pitch shift in cents
+                        ["rate", str(sample_rate)],  # Keep original sample rate
+                    ]
+                    try:
+                        aug_audio, _ = torchaudio.sox_effects.apply_effects_tensor(
+                            aug_audio.unsqueeze(0) if aug_audio.dim() == 1 else aug_audio,
+                            sample_rate,
+                            effects
+                        )
+                        aug_audio = aug_audio.squeeze(0)
+                    except Exception as e:
+                        print(f"Warning: Pitch shift failed: {e}, using original audio")
+                
+                # Apply matched-rate transform (changes duration)
+                if rate_factor != 1.0:
+                    # Time-stretch audio by factor 1/rate_factor
+                    # rate_factor=1.2 → audio becomes 1/1.2=0.833x duration (faster)
+                    # BPM is already scaled by rate_factor, so audio must be (duration / rate_factor)
+                    try:
+                        stretch_factor = 1.0 / rate_factor
+                        effects = [
+                            ["tempo", str(stretch_factor)],  # Stretch time without pitch change
+                        ]
+                        aug_audio, _ = torchaudio.sox_effects.apply_effects_tensor(
+                            aug_audio.unsqueeze(0) if aug_audio.dim() == 1 else aug_audio,
+                            sample_rate,
+                            effects
+                        )
+                        aug_audio = aug_audio.squeeze(0)
+                    except Exception as e:
+                        print(f"Warning: Rate transform failed: {e}, using original audio")
                 
                 # Yield sample
                 yield {

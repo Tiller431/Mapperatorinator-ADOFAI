@@ -108,8 +108,10 @@ class AdofaiConverter:
         # Track state for timing calculations
         current_time = offset
         current_bpm = initial_bpm
-        current_angle = 0.0  # Track cumulative angle for rotation calculations
+        current_heading = 180.0  # Game starts heading 180° (not 0°)
         twirl_clockwise = True  # Default rotation direction
+        hold_duration = 0.0  # Accumulated hold duration for next tile
+        multiplanet_count = 1  # Current planet count (1 = normal, 2/3 = multiplanet)
         
         # Build floor-to-actions mapping
         floor_actions = {}
@@ -148,16 +150,30 @@ class AdofaiConverter:
                         duration = action.get("duration", 1.0)
                         events.append(Event(EventType.PAUSE, duration))
                         event_times.append(current_time)
+                        # Pause adds extra time (duration in beats)
+                        ms_per_beat = 60000.0 / current_bpm
+                        pause_time = duration * ms_per_beat
+                        current_time += pause_time
                     
                     elif event_type == "Hold":
                         duration = action.get("duration", 1.0)
                         events.append(Event(EventType.HOLD, duration))
                         event_times.append(current_time)
+                        # Hold extends the travel time by duration beats
+                        hold_duration += duration
                     
                     elif event_type == "MultiPlanet":
-                        planets = action.get("planets", 2)
+                        planets_str = action.get("planets", "TwoPlanets")
+                        if planets_str == "TwoPlanets":
+                            planets = 2
+                        elif planets_str == "ThreePlanets":
+                            planets = 3
+                        else:
+                            planets = 2
                         events.append(Event(EventType.MULTI_PLANET, planets))
                         event_times.append(current_time)
+                        # MultiPlanet divides the travel time by planet count
+                        multiplanet_count = planets
                     
                     elif event_type == "MoveCamera":
                         # Camera movement: emit main event + parameters
@@ -199,13 +215,16 @@ class AdofaiConverter:
                         event_times.append(current_time)
                     
                     elif event_type == "MoveTrack":
+                        # SharpFAI: startTile/endTile are [offset, "ThisTile"|"Start"|"End"]
+                        # positionOffset, not position
                         events.append(Event(EventType.MOVE_TRACK, 1))
                         event_times.append(current_time)
-                        pos = action.get("position", [0, 0])
-                        events.append(Event(EventType.CAMERA_POSITION_X, int(pos[0])))
+                        pos_offset = action.get("positionOffset", [0, 0])
+                        events.append(Event(EventType.CAMERA_POSITION_X, int(pos_offset[0])))
                         event_times.append(current_time)
-                        events.append(Event(EventType.CAMERA_POSITION_Y, int(pos[1])))
+                        events.append(Event(EventType.CAMERA_POSITION_Y, int(pos_offset[1])))
                         event_times.append(current_time)
+                        # TODO: Emit startTile/endTile if needed for vocab
                     
                     # Must-have gameplay events
                     elif event_type == "Checkpoint":
@@ -361,7 +380,8 @@ class AdofaiConverter:
             if tile_angle == 999:
                 events.append(Event(EventType.MIDSPIN, 999))
                 event_times.append(current_time)
-                # Midspin doesn't advance time, planet continues from previous angle
+                # Midspin: outgoing heading = incoming heading (NOT incoming + 180)
+                # Don't update current_heading, planet continues in same direction
                 continue
             
             # Add tile angle event
@@ -371,31 +391,44 @@ class AdofaiConverter:
             events.append(Event(EventType.TILE_ANGLE, tile_angle))
             event_times.append(current_time)
             
-            # Calculate time to next tile based on angle rotation
+            # Calculate time to next tile using community formula
+            # rel = (next_angle - current_heading + 540) % 360
+            # if twirl: rel = 360 - rel
+            # if rel == 0: rel = 360  (full spin, not instant)
+            # ms = (rel / 180) * (60000 / bpm)
+            
             if floor_idx < len(level.angle_data) - 1:
-                # Calculate angle difference
-                target_angle = float(tile_angle)
-                if twirl_clockwise:
-                    angle_diff = current_angle - target_angle
-                else:
-                    angle_diff = target_angle - current_angle
+                next_angle = float(tile_angle)
                 
-                # Normalize to positive angle
-                while angle_diff < 0:
-                    angle_diff += 360
-                while angle_diff >= 360:
-                    angle_diff -= 360
+                # Calculate relative angle from current heading to next tile
+                rel = (next_angle - current_heading + 540) % 360
                 
-                # Convert angle to time: 180 degrees = 1 beat
-                beats = angle_diff / 180.0
+                # Apply twirl
+                if not twirl_clockwise:
+                    rel = 360 - rel
+                
+                # angle_diff == 0 must be 360° (full spin), not 0ms
+                if rel == 0:
+                    rel = 360
+                
+                # Convert to time: 180° = 1 beat
+                beats = rel / 180.0
+                
+                # Apply Hold: add extra beats
+                beats += hold_duration
+                hold_duration = 0.0  # Reset for next tile
+                
+                # Apply MultiPlanet: divide by planet count
+                beats /= multiplanet_count
+                multiplanet_count = 1  # Reset to normal
+                
                 ms_per_beat = 60000.0 / current_bpm
                 time_delta = beats * ms_per_beat
                 
                 current_time += time_delta
                 
-                # Update current angle for next iteration
-                # After hitting this tile, planet is at opposite side
-                current_angle = (target_angle + 180.0) % 360.0
+                # Update heading: after hitting this tile, planet heads out at tile's angle
+                current_heading = next_angle
         
         return events, event_times
     
@@ -508,11 +541,120 @@ class AdofaiConverter:
                 })
             
             elif event.type == EventType.MULTI_PLANET:
+                planets_val = int(event.value)
+                planets_str = "TwoPlanets" if planets_val == 2 else "ThreePlanets"
                 actions.append({
                     "floor": current_floor,
                     "eventType": "MultiPlanet",
-                    "planets": int(event.value)
+                    "planets": planets_str
                 })
+            
+            # Camera events
+            elif event.type == EventType.MOVE_CAMERA:
+                # MoveCamera followed by position/rotation/zoom/duration/ease/relative
+                camera_action = {
+                    "floor": current_floor,
+                    "eventType": "MoveCamera",
+                    "position": [0, 0],
+                    "rotation": 0,
+                    "zoom": 100,
+                    "duration": 1.0,
+                    "ease": "Linear",
+                    "relativeTo": "Player",
+                    "angleOffset": 0,
+                    "eventTag": ""
+                }
+                # Parse following parameter events
+                j = i + 1
+                while j < len(events) and events[j].type in (
+                    EventType.CAMERA_POSITION_X, EventType.CAMERA_POSITION_Y,
+                    EventType.CAMERA_ROTATION, EventType.CAMERA_ZOOM,
+                    EventType.CAMERA_DURATION, EventType.CAMERA_EASE,
+                    EventType.CAMERA_RELATIVE
+                ):
+                    if events[j].type == EventType.CAMERA_POSITION_X:
+                        camera_action["position"][0] = events[j].value
+                    elif events[j].type == EventType.CAMERA_POSITION_Y:
+                        camera_action["position"][1] = events[j].value
+                    elif events[j].type == EventType.CAMERA_ROTATION:
+                        camera_action["rotation"] = events[j].value
+                    elif events[j].type == EventType.CAMERA_ZOOM:
+                        camera_action["zoom"] = events[j].value
+                    elif events[j].type == EventType.CAMERA_DURATION:
+                        camera_action["duration"] = events[j].value
+                    elif events[j].type == EventType.CAMERA_EASE:
+                        camera_action["ease"] = self._id_to_ease(int(events[j].value))
+                    elif events[j].type == EventType.CAMERA_RELATIVE:
+                        camera_action["relativeTo"] = self._id_to_relative(int(events[j].value))
+                    j += 1
+                actions.append(camera_action)
+                i = j - 1  # Skip parameter events
+            
+            # Must-have gameplay events
+            elif event.type == EventType.CHECKPOINT:
+                actions.append({"floor": current_floor, "eventType": "Checkpoint"})
+            elif event.type == EventType.AUTO_PLAY_TILES:
+                enabled = "Enabled" if event.value else "Disabled"
+                actions.append({"floor": current_floor, "eventType": "AutoPlayTiles", "enabled": enabled})
+            elif event.type == EventType.SET_PLANET_ROTATION:
+                actions.append({"floor": current_floor, "eventType": "SetPlanetRotation", "easeParts": int(event.value)})
+            elif event.type == EventType.FREE_ROAM:
+                actions.append({"floor": current_floor, "eventType": "FreeRoam"})
+            elif event.type == EventType.FREE_ROAM_TWIRL:
+                actions.append({"floor": current_floor, "eventType": "FreeRoamTwirl"})
+            elif event.type == EventType.FREE_ROAM_REMOVE:
+                actions.append({"floor": current_floor, "eventType": "FreeRoamRemove"})
+            elif event.type == EventType.SCALE_MARGIN:
+                actions.append({"floor": current_floor, "eventType": "ScaleMargin", "scale": int(event.value)})
+            elif event.type == EventType.SCALE_RADIUS:
+                actions.append({"floor": current_floor, "eventType": "ScaleRadius", "scale": int(event.value)})
+            elif event.type == EventType.MULTITAP:
+                actions.append({"floor": current_floor, "eventType": "Multitap", "presses": int(event.value)})
+            elif event.type == EventType.HIDE:
+                actions.append({"floor": current_floor, "eventType": "Hide"})
+            elif event.type == EventType.KILL_PLAYER:
+                actions.append({"floor": current_floor, "eventType": "KillPlayer"})
+            
+            # Track events
+            elif event.type == EventType.POSITION_TRACK:
+                actions.append({"floor": current_floor, "eventType": "PositionTrack", "position": [0, 0]})
+            elif event.type == EventType.MOVE_TRACK:
+                actions.append({"floor": current_floor, "eventType": "MoveTrack", "positionOffset": [0, 0]})
+            elif event.type == EventType.COLOR_TRACK:
+                actions.append({"floor": current_floor, "eventType": "ColorTrack"})
+            elif event.type == EventType.ANIMATE_TRACK:
+                actions.append({"floor": current_floor, "eventType": "AnimateTrack"})
+            
+            # Audio events
+            elif event.type == EventType.SET_HITSOUND:
+                actions.append({"floor": current_floor, "eventType": "SetHitsound"})
+            elif event.type == EventType.PLAY_SOUND:
+                actions.append({"floor": current_floor, "eventType": "PlaySound"})
+            elif event.type == EventType.SET_HOLD_SOUND:
+                actions.append({"floor": current_floor, "eventType": "SetHoldSound"})
+            
+            # Event control
+            elif event.type == EventType.REPEAT_EVENTS:
+                actions.append({"floor": current_floor, "eventType": "RepeatEvents"})
+            elif event.type == EventType.SET_CONDITIONAL_EVENTS:
+                actions.append({"floor": current_floor, "eventType": "SetConditionalEvents"})
+            elif event.type == EventType.SET_INPUT_EVENT:
+                actions.append({"floor": current_floor, "eventType": "SetInputEvent"})
+            
+            # VFX events
+            elif event.type == EventType.FLASH:
+                actions.append({"floor": current_floor, "eventType": "Flash", "duration": 1.0, "plane": "Foreground", "startColor": "ffffff", "endColor": "ffffff", "startOpacity": 100, "endOpacity": 0})
+            elif event.type == EventType.BLOOM:
+                enabled_val = int(event.value) > 0
+                enabled = "Enabled" if enabled_val else "Disabled"
+                actions.append({"floor": current_floor, "eventType": "Bloom", "enabled": enabled, "threshold": 50, "intensity": int(event.value), "color": "ffffff"})
+            elif event.type == EventType.SHAKE_SCREEN:
+                actions.append({"floor": current_floor, "eventType": "ShakeScreen", "duration": 1.0, "strength": 100, "intensity": int(event.value), "fadeOut": "Enabled"})
+            elif event.type == EventType.SET_FILTER:
+                filter_id = int(event.value)
+                filter_names = ["None", "Grayscale", "Sepia", "Invert", "VHS", "EightiesTV", "FiftiesTV", "Arcade", "LED", "Rain", "Blizzard", "PixelSnow", "Compression", "Glitch", "Pixelate", "Waves", "Static", "Grain", "MotionBlur", "Fisheye", "Aberration", "Drawing", "Neon", "Handheld", "NightVision", "Funk", "Tunnel", "Weird3D", "Blur", "GaussianBlur", "Posterize"]
+                filter_name = filter_names[filter_id] if 0 <= filter_id < len(filter_names) else "None"
+                actions.append({"floor": current_floor, "eventType": "SetFilter", "filter": filter_name, "enabled": "Enabled", "intensity": 100})
             
             i += 1
         

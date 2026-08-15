@@ -377,6 +377,10 @@ def compile_adofai_args(args: InferenceConfig, verbose=True):
         "super_timing": False,
         "auto_select_gamemode_model": False,
         "snap_near_perfect_overlaps": False,
+        "descriptors": None,
+        "negative_descriptors": None,
+        "mapper_id": None,
+        "year": None,
     }
     for key, value in forced.items():
         if getattr(args, key) != value:
